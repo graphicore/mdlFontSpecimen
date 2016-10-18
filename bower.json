@@ -1,0 +1,21 @@
+{
+  "name": "mdlFontSpecimen",
+  "version": "0.0.0",
+  "homepage": "https://github.com/graphicore/mdlFontSpecimen",
+  "authors": [
+    "Lasse Fister <commander@graphicore.de>"
+  ],
+  "description": "Font specimen for the web based on Material Design Lite.",
+  "moduleType": [
+    "amd"
+  ],
+  "license": "Apache2.0",
+  "ignore": [
+    "**/.*",
+    "node_modules",
+    "bower_components",
+    "lib/bower_components",
+    "test",
+    "tests"
+  ]
+}
