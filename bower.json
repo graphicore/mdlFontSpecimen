@@ -19,6 +19,7 @@
     "tests"
   ],
   "dependencies": {
-    "material-design-lite": "~1.2.1"
+    "material-design-lite": "~1.2.1",
+    "specimenTools": "graphicore/specimenTools"
   }
 }

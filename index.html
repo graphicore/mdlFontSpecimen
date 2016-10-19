@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>mdl Font Specimen mdlfs</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="./lib/bower_components/material-design-lite/material.css">
+    <script defer src="./lib/bower_components/material-design-lite/material.js"></script>
+
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+
+
+    fontFiles = [
+        './lib/bower_components/specimenTools/assets/fonts/Jura-Medium.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/MontserratAlternates-Bold.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/MontserratAlternates-ExtraBold.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/MontserratAlternates-ExtraLight.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Montserrat-Thin.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Quicksand-Bold.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Quicksand-Light.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Quicksand-Medium.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Quicksand-Regular.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/Pacifico-Regular.ttf'
+      , './lib/bower_components/specimenTools/assets/fonts/VT323-Regular.ttf'
+    ];
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(require) {
+        require(['specimenTools/glyphTable/main'], function(main) {
+            main(document, fontFiles);
+        });
+    });
+    </script>
+<style>
+.mdl-cell{
+    background-color: cadetblue; min-height: 200px
+}
+
+.mdlfs-content{
+    width: 100%;
+    max-width: 1248px; /* what actually? */
+    margin: 0 auto;
+
+}
+
+</style>
+
+</head>
+<body>
+
+
+
+
+<div class="mdl-layout mdl-js-layout">
+
+  <header class="mdl-layout__header">
+    <div class="mdl-layout-icon"></div>
+    <div class="mdl-layout__header-row">
+      <span class="mdl-layout__title">Simple Layout</span>
+      <div class="mdl-layout-spacer"></div>
+      <nav class="mdl-navigation">
+        <a class="mdl-navigation__link" href="#">Nav link 1</a>
+        <a class="mdl-navigation__link" href="#">Nav link 2</a>
+        <a class="mdl-navigation__link" href="#">Nav link 3</a>
+      </nav>
+    </div>
+  </header>
+
+<div class="mdlfs-content">
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--6-col">a surfers first choice</div>
+  <div class="mdl-cell mdl-cell--6-col">fun in the sun</div>
+</div>
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--6-col">a mood image</div>
+  <div class="mdl-cell mdl-cell--6-col">contextual alternates demo</div>
+</div>
+
+
+<div class="mdl-grid">
+    <div class="mdl-cell mdl-cell--12-col">live type tester</div>
+</div>
+
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--6-col">CS 6</div>
+  <div class="mdl-cell mdl-cell--4-col">CS 4</div>
+  <div class="mdl-cell mdl-cell--2-col">CS 2</div>
+</div>
+
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--4-col">smallcaps</div>
+  <div class="mdl-cell mdl-cell--4-col">oldstyle</div>
+  <div class="mdl-cell mdl-cell--4-col">ligatures</div>
+
+  <div class="mdl-cell mdl-cell--4-col">list of languages</div>
+  <div class="mdl-cell mdl-cell--4-col">size of glyph set</div>
+  <div class="mdl-cell mdl-cell--4-col">another big number</div>
+
+  <div class="mdl-cell mdl-cell--4-col">detailed language support</div>
+  <div class="mdl-cell mdl-cell--4-col">4</div>
+  <div class="mdl-cell mdl-cell--4-col">4</div>
+</div>
+
+<div>{ glyph table }</div>
+
+</div>
+</div>
+</body>
+</html>
