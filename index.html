@@ -5,6 +5,7 @@
     <title>mdl Font Specimen mdlfs</title>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
     <link rel="stylesheet" href="./lib/bower_components/material-design-lite/material.css">
+    <link rel="stylesheet" href="./lib/css/main.css">
     <script defer src="./lib/bower_components/material-design-lite/material.js"></script>
 
     <script src="../lib/bower_components/requirejs/require.js"></script>
@@ -27,7 +28,7 @@
 
     require.config({baseUrl: '../lib'});
     require(['bootstrap'], function(require) {
-        require(['specimenTools/glyphTable/main'], function(main) {
+        require(['main'], function(main) {
             main(document, fontFiles);
         });
     });
@@ -106,7 +107,10 @@
   <div class="mdl-cell mdl-cell--4-col">4</div>
 </div>
 
-<div>{ glyph table }</div>
+<div class="mdl-grid">
+    <div class="mdl-cell mdl-cell--12-col mdlfs-family-switcher"></div>
+    <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
+</div>
 
 </div>
 </div>

@@ -1,0 +1,54 @@
+.mdl-cell{
+    /* FIXME: this is just for initial development, remove!*/
+    background-color: cadetblue;
+    min-height: 200px
+}
+
+.mdlfs-content{
+    width: 100%;
+    max-width: 1248px; /* FIXME: what actually? */
+    margin: 0 auto;
+
+}
+
+.mdlfs-glyph-table__glyph {
+    box-sizing: border-box;
+    display: inline-block;
+}
+
+.mdlfs-glyph-table__glyph svg {
+    width: 100%;
+    display: block;
+    overflow: visible;
+}
+
+/* FIXME: glyph table column setup was not a design choice, just made for development */
+/* default-widest 16 items */
+.mdlfs-glyph-table__glyph {
+    width: calc(100% / 16);
+}
+@media (max-width: 700px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 12);
+    }
+}
+@media (max-width: 600px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 10);
+    }
+}
+@media (max-width: 500px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 8);
+    }
+}
+@media (max-width: 400px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 6);
+    }
+}
+@media (max-width: 300px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 4);
+    }
+}
