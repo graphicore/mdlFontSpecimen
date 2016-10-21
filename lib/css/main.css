@@ -11,6 +11,13 @@
 
 }
 
+.mdlfs-family-switcher__button {
+    margin-right: .5em;
+}
+.mdlfs-family-switcher__button:last-child {
+    margin-right: 0;
+}
+
 .mdlfs-glyph-table__glyph {
     box-sizing: border-box;
     display: inline-block;
