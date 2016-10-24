@@ -1,6 +1,4 @@
 .mdl-cell{
-    /* FIXME: this is just for initial development, remove!*/
-    background-color: cadetblue;
     min-height: 200px
 }
 
@@ -11,8 +9,13 @@
 
 }
 
+.mdlfs-family-switcher__italic-switch {
+    margin-bottom: .5em;
+}
+
 .mdlfs-family-switcher__button {
     margin-right: .5em;
+    margin-bottom: .5em;
 }
 .mdlfs-family-switcher__button:last-child {
     margin-right: 0;
