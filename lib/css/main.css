@@ -9,6 +9,15 @@
 
 }
 
+
+.mdlfs-font-data--big-fact {
+    text-align: center;
+    font-size: 10em;
+    line-height: 1em;
+    display: block;
+    width: 100%;
+}
+
 .mdlfs-family-switcher__italic-switch {
     margin-bottom: .5em;
 }
