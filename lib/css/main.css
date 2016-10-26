@@ -18,6 +18,11 @@
     width: 100%;
 }
 
+.mdlfs-current-font {
+    font-size: 1.6em;
+    line-height: normal;
+}
+
 .mdlfs-family-switcher__italic-switch {
     margin-bottom: .5em;
 }
