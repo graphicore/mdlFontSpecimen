@@ -45,9 +45,6 @@
 </head>
 <body>
 
-
-
-
 <div class="mdl-layout mdl-js-layout">
   <header class="mdl-layout__header">
     <div class="mdl-layout-icon"></div>
@@ -87,6 +84,7 @@
 </div>
 
 
+
 <div class="mdl-grid">
   <div class="mdl-cell mdl-cell--4-col">smallcaps</div>
   <div class="mdl-cell mdl-cell--4-col">oldstyle</div>
@@ -123,11 +121,35 @@
     ></div>
   </div>
 
-  <div class="mdl-cell mdl-cell--12-col mdlfs-type-tester">
-    <div class="mdlfs-type-tester__font-size"></div>
+  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col">
+    <div class="mdl-card__title mdl-color--accent mdl-color-text--accent-contrast">
+     <h2 class="mdl-card__title-text">Choose a Font</h2>
+    </div>
+    <div class="mdl-card__actions  mdlfs-family-switcher"></div>
+  </div>
 
-    <div class="mdlfs-type-tester__features"></div>
-    <span class="mdlfs-current-font mdlfs-type-tester__content" contenteditable="true">
+  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col mdlfs-type-tester">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+     <h2 class="mdl-card__title-text">Test the Font</h2>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Default Features</h5>
+      <div class="mdlfs-type-tester__features--default"></div>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Optional Features</h5>
+      <div class="mdlfs-type-tester__features--optional"></div>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Font size: <span class="mdlfs-type-tester__font-size-indicator"></span></h5>
+      <div class="mdlfs-type-tester__font-size"></div>
+    </div>
+
+    <span class="mdl-card__supporting-text mdlfs-current-font mdlfs-type-tester__content" contenteditable="true">
+    TYPE HERE …<br />
     Web typography refers to the use of fonts on the World Wide Web. When
     HTML was first created, font faces and styles were controlled exclusively
     by the settings of each Web browser. There was no mechanism for individual
@@ -138,23 +160,9 @@
     monospace font, would be used. The first Cascading Style Sheets specification
     was published in 1996 and provided the same capabilities.
     </span>
-    <div class="mdlfs-type-tester__font-size"></div>
+    <small class="mdl-card__supporting-text"><a href="https://en.wikipedia.org/wiki/Web_typography">Source: Wikipedia</a></small>
   </div>
-</div>
 
-<div class="mdl-grid">
-
-
-
-</div>
-
-<div class="mdl-grid">
-  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col">
-    <div class="mdl-card__title mdl-color--accent mdl-color-text--accent-contrast">
-     <h2 class="mdl-card__title-text">Switch Fonts</h2>
-    </div>
-    <div class="mdl-card__actions  mdlfs-family-switcher"></div>
-  </div>
   <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
 </div>
 
