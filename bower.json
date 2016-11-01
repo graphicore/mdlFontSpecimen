@@ -1,5 +1,5 @@
 {
-  "name": "mdlFontSpecimen",
+  "name": "mdl-font-specimen",
   "version": "0.0.0",
   "homepage": "https://github.com/graphicore/mdlFontSpecimen",
   "authors": [
@@ -20,7 +20,7 @@
   ],
   "dependencies": {
     "material-design-lite": "~1.2.1",
-    "specimenTools": "graphicore/specimenTools",
+    "specimen-tools": "graphicore/specimenTools",
     "Atem-RequireJS-Config": "https://github.com/graphicore/Atem-RequireJS-Config.git"
   }
 }
