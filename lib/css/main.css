@@ -18,6 +18,32 @@
     width: 100%;
 }
 
+.mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__after,
+.mdlfs-feature-display__item__change-indicator {
+    text-align: center;
+    display: block;
+}
+
+.mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__after {
+    font-size: 2.5em;
+}
+
+.mdlfs-feature-display__item__change-indicator {
+    font-size: 1.5em;
+    font-weight: normal;
+}
+
+.mdlfs-feature-display .mdl-card__title-text {
+    display: block;
+    width: 100%;
+}
+.mdlfs-feature-display .mdl-card__title-text h2{
+    font-size: inherit;
+    margin: inherit;
+}
+
 .mdlfs-current-font {
     font-size: 1.6em;
     line-height: normal;
