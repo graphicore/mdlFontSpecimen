@@ -5,7 +5,7 @@
   "authors": [
     "Lasse Fister <commander@graphicore.de>"
   ],
-  "description": "Font specimen for the web based on Material Design Lite.",
+  "description": "Font specimen widgets for Material Design Lite.",
   "moduleType": [
     "amd"
   ],
@@ -20,6 +20,7 @@
   ],
   "dependencies": {
     "material-design-lite": "~1.2.1",
-    "specimenTools": "graphicore/specimenTools"
+    "specimenTools": "graphicore/specimenTools",
+    "Atem-RequireJS-Config": "https://github.com/graphicore/Atem-RequireJS-Config.git"
   }
 }
