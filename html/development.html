@@ -2,29 +2,46 @@
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>MDL Font Specimen</title>
+    <title>MDL Font Specimen | for development</title>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
-    <link rel="stylesheet" href="lib/bower_components/material-design-lite/material.css">
-    <link rel="stylesheet" href="dist/mdl-font-specimen.css">
-    <script defer src="lib/bower_components/material-design-lite/material.js"></script>
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link rel="stylesheet" href="../lib/css/main.css">
+    <script defer src="../lib/bower_components/material-design-lite/material.js"></script>
 
+    <script src="../lib/bower_components/requirejs/require.js"></script>
     <script>
     fontSpecimenConfig = {}
     fontSpecimenConfig.fontFiles = [
-        'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-ThinItalic.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Thin.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-SemiBoldItalic.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Regular.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-LightItalic.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Light.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Italic.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-BoldItalic.ttf'
-      , 'lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Bold.ttf'
+        '../lib/bower_components/specimen-tools/assets/fonts/Jura-Medium.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-Bold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-ExtraBold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-ExtraLight.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Montserrat-Thin.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Bold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Light.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Medium.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Pacifico-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/VT323-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-ThinItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Thin.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-SemiBoldItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-LightItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Light.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Italic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-BoldItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Bold.ttf'
     ];
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['main'], function(main) {
+            main();
+        });
+    });
     </script>
-    <script src="dist/mdl-font-specimen.js"></script>
-
-
 </head>
 <body>
 
@@ -45,13 +62,6 @@
 <div class="mdlfs-content">
 
 <div class="mdl-grid mdlfs-feature-display">
-
-  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col">
-    <div class="mdl-card__title mdl-color--accent mdl-color-text--accent-contrast">
-     <h2 class="mdl-card__title-text">Choose a Font</h2>
-    </div>
-    <div class="mdl-card__actions  mdlfs-family-switcher"></div>
-  </div>
 
   <div class="mdl-card mdl-cell mdl-cell--4-col mdl-shadow--2dp">
     <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
@@ -95,6 +105,13 @@
       </div>
     </div>
     <div class="mdl-card__supporting-text mdlfs-feature-display__item__friendly-name"></div>
+  </div>
+
+  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col">
+    <div class="mdl-card__title mdl-color--accent mdl-color-text--accent-contrast">
+     <h2 class="mdl-card__title-text">Choose a Font</h2>
+    </div>
+    <div class="mdl-card__actions  mdlfs-family-switcher"></div>
   </div>
 
   <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col mdlfs-type-tester">
