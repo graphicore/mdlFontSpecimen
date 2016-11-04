@@ -1,0 +1,65 @@
+@import './mdlfs-glyph-table.css';
+
+html * {
+    font-family: 'Roboto Mono', monospace;
+}
+
+
+.mdlfs-main-title{
+    font-size: 12em;
+}
+
+
+
+/* only if we use mdlfs-load-progress */
+.mdlfs-load-progress .mdlfs-load-progress__load-indicator {
+    display: none;
+}
+.mdlfs-load-progress_loading .mdlfs-load-progress__load-indicator {
+    display: block;
+}
+
+.mdlfs-load-progress_loading .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-load-progress__screen {
+    display: none;
+}
+
+.mdlfs-load-progress .mdlfs-main {
+    display: none;
+}
+.mdlfs-load-progress_loaded .mdlfs-main {
+    display: block;
+}
+
+.mdlfs-load-progress__screen {
+    width: 75%;
+    max-width: 500px;
+    margin: 5em auto 0 auto;
+
+}
+
+.mdlfs-fonts-drop {
+    background-color: #EEE;
+    padding: .5em;
+    cursor: pointer;
+    width: 100%;
+}
+
+.mdlfs-load-progress__task{
+    font-size: 1.5em;
+    margin: 1em 0;
+}
+.mdlfs-load-progress__task {
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.mdlfs-fonts-drop:hover {
+    box-shadow: 0 8px 10px 1px rgba(0, 0, 0, 0.14), 0 3px 14px 2px rgba(0, 0, 0, 0.12), 0 5px 5px -3px rgba(0, 0, 0, 0.2);
+    -webkit-transition: box-shadow .5s;
+    transition: box-shadow .5s;
+    transition-timing-function: easeOutCirc;
+    -webkit-transition-timing-function: easeOutCirc;
+
+}

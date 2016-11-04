@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MDL Font Specimen | for development</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
+    <link rel="stylesheet" href="../lib/css/main.css">
+    <script src="../lib/bower_components/material-design-lite/material.js"></script>
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+    fontSpecimenConfig = {}
+    fontSpecimenConfig.fontFiles = [
+          '../html/assets/worksans/WorkSans-Black.ttf'
+        , '../html/assets/worksans/WorkSans-Bold.ttf'
+        , '../html/assets/worksans/WorkSans-Light.ttf'
+        , '../html/assets/worksans/WorkSans-SemiBold.ttf'
+        , '../html/assets/worksans/WorkSans-ExtraBold.ttf'
+        , '../html/assets/worksans/WorkSans-ExtraLight.ttf'
+        , '../html/assets/worksans/WorkSans-Regular.ttf'
+        , '../html/assets/worksans/WorkSans-Medium.ttf'
+        , '../html/assets/worksans/WorkSans-Thin.ttf'
+    ];
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['main'], function(main) {
+            main();
+        });
+    });
+    </script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdlfs-content">
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--3-col">
+    Typeface /<br />
+    <span class="mdlfs-font-data" data-getter="FamilyName"></span>
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    First Release /<br />
+    June 2014<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Latest Release /<br />
+    June 2016<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Links /<br />
+    <a href="#">Google Fonts Specimen</a><br />
+    <a href="#">Github Page</a>
+  </div>
+</div>
+
+<h1 class="mdlfs-main-title mdlfs-current-font">#WorkSans<br />2014—&#xf8ff;&#x2780;&#x2b0c;&#x2782;&#x25aa;</h1>
+
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
+</div>
+
+</div>
+</body>
+</html>
