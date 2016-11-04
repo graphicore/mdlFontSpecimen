@@ -43,9 +43,17 @@
     });
     </script>
 </head>
-<body>
+<body class="mdlfs-load-progress">
 
-<div class="mdl-layout mdl-js-layout">
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdl-layout mdl-js-layout mdlfs-main">
   <header class="mdl-layout__header">
     <div class="mdl-layout-icon"></div>
     <div class="mdl-layout__header-row">

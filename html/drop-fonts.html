@@ -2,49 +2,32 @@
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>MDL Font Specimen</title>
+    <title>MDL Font Specimen | drop fonts</title>
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
-    <link rel="stylesheet" href="lib/bower_components/material-design-lite/material.css">
-    <link rel="stylesheet" href="dist/mdl-font-specimen.css">
-    <script defer src="lib/bower_components/material-design-lite/material.js"></script>
-
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link rel="stylesheet" href="../lib/css/main.css">
+    <script defer src="../lib/bower_components/material-design-lite/material.js"></script>
     <script>
-    fontSpecimenConfig = {}
-    fontSpecimenConfig.fontFiles = [
-          'html/assets/raleway/Raleway-Regular.ttf'
-        , 'html/assets/raleway/Raleway-Italic.ttf'
-        , 'html/assets/raleway/Raleway-BlackItalic.ttf'
-        , 'html/assets/raleway/Raleway-Black.ttf'
-        , 'html/assets/raleway/Raleway-BoldItalic.ttf'
-        , 'html/assets/raleway/Raleway-Bold.ttf'
-        , 'html/assets/raleway/Raleway-ExtraBoldItalic.ttf'
-        , 'html/assets/raleway/Raleway-ExtraBold.ttf'
-        , 'html/assets/raleway/Raleway-ExtraLightItalic.ttf'
-        , 'html/assets/raleway/Raleway-ExtraLight.ttf'
-        , 'html/assets/raleway/Raleway-LightItalic.ttf'
-        , 'html/assets/raleway/Raleway-Light.ttf'
-        , 'html/assets/raleway/Raleway-MediumItalic.ttf'
-        , 'html/assets/raleway/Raleway-Medium.ttf'
-        , 'html/assets/raleway/Raleway-SemiBoldItalic.ttf'
-        , 'html/assets/raleway/Raleway-SemiBold.ttf'
-        , 'html/assets/raleway/Raleway-ThinItalic.ttf'
-        , 'html/assets/raleway/Raleway-Thin.ttf'
-    ];
+    fontSpecimenConfig = {
+        loadFromFileInput: true
+    };
     </script>
-    <script src="dist/mdl-font-specimen.js"></script>
-
-
+    <script src="../dist/mdl-font-specimen.js"></script>
 </head>
 <body class="mdlfs-load-progress">
 
 <div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-fonts-drop">
+      <h3>Drop font files here or click.</h3>
+      <p>The fonts will stay on your computer and are processed locally in the browser.</p>
+      <p><strong>They will NOT be uploaded to any server or be send away otherwise.</strong></p>
+    </div>
     <div class="mdlfs-load-progress__load-indicator">
         <p class="mdlfs-load-progress__task"></p>
         <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
         <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
     </div>
 </div>
-
 <div class="mdl-layout mdl-js-layout mdlfs-main">
   <header class="mdl-layout__header">
     <div class="mdl-layout-icon"></div>
