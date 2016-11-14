@@ -5,10 +5,110 @@ html * {
 }
 
 
-.mdlfs-main-title{
-    font-size: 12em;
+/* only if we use mdlfs-load-progress */
+.mdlfs-load-progress .mdlfs-load-progress__load-indicator {
+    display: none;
+}
+.mdlfs-load-progress_loading .mdlfs-load-progress__load-indicator {
+    display: block;
 }
 
+.mdlfs-load-progress_loaded .mdlfs-load-progress__screen {
+    display: none;
+}
+
+.mdlfs-load-progress .mdlfs-main {
+    display: none;
+}
+.mdlfs-load-progress_loaded .mdlfs-main {
+    display: block;
+}
+
+.mdlfs-load-progress__screen {
+    width: 75%;
+    max-width: 500px;
+    margin: 5em auto 0 auto;
+
+}
+
+
+.mdlfs-content {
+    margin: 0 3em;
+}
+
+.mdlfs-main-title {
+    font-size: 14em;
+}
+
+.mdlfs-diagram__glyph_normal {
+    fill: black;
+    stroke: none;
+    opacity: .8;
+}
+
+.mdlfs-diagram__glyph_highlighted {
+    fill: #ff5252;
+    stroke: none;
+}
+.mdlfs-diagram__glyph_muted {
+    fill: none;
+    stroke: black;
+    stroke-width: 4;
+    opacity: .8;
+}
+
+.mdlfs-diagram__yline{
+    stroke-width: 4;
+}
+
+.mdlfs-diagram__yline_normal {
+    stroke: black;
+    opacity: .8;
+}
+
+.mdlfs-diagram__yline_highlighted {
+    stroke: #ff5252;
+}
+
+.mdlfs-section__separator {
+    border-top: 5px dotted black;
+    position: relative;
+    text-align: center;
+}
+.mdlfs-section__title {
+    background: white none repeat scroll 0 0;
+    display: inline-block;
+    font-size: 1.5em;
+    margin: 0;
+    padding: 0 1em;
+    position: relative;
+    top: -1.2em;
+    line-height: 2em;
+    text-transform: uppercase;
+}
+
+.mdlfs-card__title {
+    font-size: 1.5em;
+}
+
+.mdlfs-styles-list {
+    font-size: 4em;
+    line-height: 1.1em;
+    list-style: none;
+    padding: 0;
+}
+
+.mdlfs-currency-symbols * {
+    font-family: inherit;
+}
+
+.mdlfs-currency-symbols {
+    font-size: 5em;
+    line-height: normal;
+}
+.mdlfs-currency-symbols__sample-symbol {
+    color:  #ff5252;
+}
 
 
 /* only if we use mdlfs-load-progress */

@@ -12,13 +12,13 @@
     <script>
     fontSpecimenConfig = {}
     fontSpecimenConfig.fontFiles = [
-          '../html/assets/worksans/WorkSans-Black.ttf'
+         '../html/assets/worksans/WorkSans-Regular.ttf'
+        , '../html/assets/worksans/WorkSans-Black.ttf'
         , '../html/assets/worksans/WorkSans-Bold.ttf'
         , '../html/assets/worksans/WorkSans-Light.ttf'
         , '../html/assets/worksans/WorkSans-SemiBold.ttf'
         , '../html/assets/worksans/WorkSans-ExtraBold.ttf'
         , '../html/assets/worksans/WorkSans-ExtraLight.ttf'
-        , '../html/assets/worksans/WorkSans-Regular.ttf'
         , '../html/assets/worksans/WorkSans-Medium.ttf'
         , '../html/assets/worksans/WorkSans-Thin.ttf'
     ];
@@ -42,12 +42,13 @@
     </div>
 </div>
 
-<div class="mdlfs-content">
+<div class="mdlfs-content mdlfs-main">
 
 <div class="mdl-grid">
   <div class="mdl-cell mdl-cell--3-col">
     Typeface /<br />
-    <span class="mdlfs-font-data" data-getter="FamilyName"></span>
+    <!--<span class="mdlfs-font-data" data-getter="FamilyName"></span>-->
+    <div class="mdlfs-font-select"></div>
   </div>
 
   <div class="mdl-cell mdl-cell--3-col">
@@ -69,10 +70,118 @@
   </div>
 </div>
 
-<h1 class="mdlfs-main-title mdlfs-current-font">#WorkSans<br />2014—&#xf8ff;&#x2780;&#x2b0c;&#x2782;&#x25aa;</h1>
-
+<h1 class="mdlfs-main-title mdlfs-current-font">#WorkSans<br />2014—&#xf8ff;&#x2194;&#x2782;&#x25c7;</h1>
 
 <div class="mdl-grid">
+
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title"><span class="mdlfs-font-data" data-getter="StyleName"></span> 60pt/72pt</h3>
+    <p class="mdlfs-current-font"
+       style="font-size: 60pt; line-height: 72pt;">
+    ABCDEFGHIJKLMNOPQRSTUVWXYZ<br />
+    abcdefghijklmnopqrstuvwxyz<br />
+    0123456789</p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">x-height</h3>
+    <div class="mdlfs-diagram" data-diagram-name="xHeight" data-diagram-ascent="800"></div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">Styles</h3>
+    <ul class="mdlfs-styles-list mdlfs-per-font">
+          <li class="mdlfs-per-font__item-blueprint" style="display:none">
+          <span class="mdlfs-per-font__current-font mdlfs-per-font__data" data-getter="StyleName"></span>
+      </li>
+    </ul>
+  </div>
+
+</div>
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">OpenType Features</h2>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">Stylistic Alternates</h3>
+    <div class="mdlfs-diagram" data-diagram-name="stylisticSets" data-diagram-ascent="800"></div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">Currencies</h3>
+    <div class="mdlfs-currency-symbols mdlfs-current-font"></div>
+  </div>
+
+</div>
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Paragraph</h2>
+  </div>
+  <div class="mdl-cell mdl-cell--12-col">
+      <h3 class="mdlfs-card__title">45pt / 48pt</h3>
+      <p class="mdlfs-current-font"
+        style="font-size:45pt; line-height:48pt; max-width: 70%">
+      <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+      As I went on, still gaining velocity, the
+      palpitation of night and day merged
+      into one continuous greyness; the sky
+      took on a wonderful deepness of blue,
+      a splendid luminous color like that of
+      early twilight; the jerking sun became
+      </p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+      <h3 class="mdlfs-card__title">34pt / 48pt</h3>
+      <p class="mdlfs-current-font"
+        style="font-size:34pt; line-height:48pt; max-width: 53%">
+      <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+      As I went on, still gaining velocity, the
+      palpitation of night and day merged
+      into one continuous greyness; the sky
+      took on a wonderful deepness of blue,
+      a splendid luminous color like that of
+      early twilight; the jerking sun became
+      </p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+      <h3 class="mdlfs-card__title">24pt / 32pt</h3>
+      <p class="mdlfs-current-font"
+        style="font-size:24pt; line-height:32pt; max-width: 45%">
+      <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+      As I went on, still gaining velocity, the
+      palpitation of night and day merged
+      into one continuous greyness; the sky
+      took on a wonderful deepness of blue,
+      a splendid luminous color like that of
+      early twilight; the jerking sun became
+      </p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+      <h3 class="mdlfs-card__title">14pt / 24pt</h3>
+      <p class="mdlfs-current-font"
+        style="font-size:14pt ;line-height:24pt; max-width: 27%">
+      <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+      As I went on, still gaining velocity, the
+      palpitation of night and day merged
+      into one continuous greyness; the sky
+      took on a wonderful deepness of blue,
+      a splendid luminous color like that of
+      early twilight; the jerking sun became
+      </p>
+  </div>
+
+</div>
+
+<div class="mdl-grid">
+    <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Glyph Table</h2>
+  </div>
   <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
 </div>
 
