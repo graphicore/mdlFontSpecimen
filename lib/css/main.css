@@ -40,16 +40,24 @@ html * {
     font-size: 14em;
 }
 
+.mdlfs-diagram svg{
+    overflow: visible;
+}
+
+.mdlfs-diagram__text_normal,
 .mdlfs-diagram__glyph_normal {
     fill: black;
     stroke: none;
     opacity: .8;
 }
 
+.mdlfs-diagram__text_highlighted,
 .mdlfs-diagram__glyph_highlighted {
     fill: #ff5252;
     stroke: none;
 }
+
+.mdlfs-diagram__text_muted,
 .mdlfs-diagram__glyph_muted {
     fill: none;
     stroke: black;
