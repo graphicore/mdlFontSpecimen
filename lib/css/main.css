@@ -45,25 +45,73 @@ html * {
 }
 
 .mdlfs-diagram__text_normal,
-.mdlfs-diagram__glyph_normal {
+.mdlfs-diagram__glyph_normal,
+.mdlfs-feature-display__content-stacked__text_normal,
+.mdlfs-feature-display__content-stacked__glyph_normal {
     fill: black;
     stroke: none;
     opacity: .8;
 }
 
 .mdlfs-diagram__text_highlighted,
-.mdlfs-diagram__glyph_highlighted {
+.mdlfs-diagram__glyph_highlighted,
+.mdlfs-feature-display__content-stacked__text_highlighted,
+.mdlfs-feature-display__content-stacked__glyph_highlighted {
     fill: #ff5252;
     stroke: none;
 }
 
 .mdlfs-diagram__text_muted,
-.mdlfs-diagram__glyph_muted {
+.mdlfs-diagram__glyph_muted,
+.mdlfs-feature-display__content-stacked__text_muted,
+.mdlfs-feature-display__content-stacked__glyph_muted {
     fill: none;
     stroke: black;
     stroke-width: 4;
     opacity: .8;
 }
+
+.mdlfs-feature-display__item__content-text {
+    font-size: 3em;
+    line-height: normal;
+}
+
+.mdlfs-feature-display__item_highlight,
+.mdlfs-feature-display__item_tabular {
+    font: inherit;
+}
+.mdlfs-feature-display__item__applied .mdlfs-feature-display__item_highlight {
+    color: #ff5252;
+}
+.mdlfs-feature-display__item_tabular {
+    display: inline-block;
+    border-right: 2px solid #ff5252;
+    margin-right: -2px;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__content {
+    display: inline;
+    margin-right: .5em;
+}
+
+.mdlfs-feature-display__item__content_inline-no-gap
+            .mdlfs-feature-display__item__content {
+    margin-right: 0;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__applied {
+    display: inline;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__change-indicator {
+    display: none;
+}
+
 
 .mdlfs-diagram__yline{
     stroke-width: 4;
@@ -114,6 +162,7 @@ html * {
     font-size: 5em;
     line-height: normal;
 }
+
 .mdlfs-currency-symbols__sample-symbol {
     color:  #ff5252;
 }

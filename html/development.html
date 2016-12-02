@@ -7,6 +7,14 @@
     <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
     <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
     <link rel="stylesheet" href="../lib/css/main.css">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-sham.min.js"></script> -->
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/json3/3.3.2/json3.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-sham.min.js"></script> -->
+
+
     <script src="../lib/bower_components/material-design-lite/material.js"></script>
     <script src="../lib/bower_components/requirejs/require.js"></script>
     <script>
@@ -104,7 +112,7 @@
 
 </div>
 
-<div class="mdl-grid">
+<div class="mdl-grid mdlfs-feature-display">
   <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
       <h2 class="mdlfs-section__title">OpenType Features</h2>
   </div>
@@ -118,6 +126,32 @@
     <h3 class="mdlfs-card__title">Currencies</h3>
     <div class="mdlfs-currency-symbols mdlfs-current-font"></div>
   </div>
+
+
+  <div class="mdl-cell mdl-cell--4-col
+              mdlfs-feature-display__item-blueprint
+              mdlfs-feature-display__item"
+       style="display:none">
+    <h3 class="mdlfs-card__title mdlfs-feature-display__item__friendly-name"></h3>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-text"><!--
+        no whitespace
+        BEGIN: removed if not in `show-before` mode
+        --><div class="mdlfs-feature-display__item__before"></div><!--
+
+        --><div class="material-icons
+                    mdlfs-feature-display__item__change-indicator">arrow_downward</div><!--
+        no whitespace
+        END: removed
+        --><div class="mdlfs-feature-display__item__applied"></div><!--
+        no whitespace
+    --></div>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-stacked"></div>
+
+    <!-- contents -->
+  </div>
+
 
 </div>
 
