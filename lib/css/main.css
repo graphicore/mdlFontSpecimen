@@ -61,6 +61,12 @@ html * {
     }
 }
 
+.mdlfs-alphabet-sample * {
+    font:inherit;
+    /*so it breaks at each glyph if needed*/
+    display: inline-block;
+}
+
 
 .mdlfs-drag-scroll {
     overflow: hidden; /* could also be scroll */
