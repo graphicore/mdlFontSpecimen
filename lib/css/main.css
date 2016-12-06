@@ -40,8 +40,54 @@ html * {
     font-size: 14em;
 }
 
-.mdlfs-diagram svg{
-    overflow: visible;
+.mdlfs-header-diagram {
+   margin-left: -3em;
+   overflow: hidden;
+   /* .mdlfs-content has 3em margin to each side, thus 6 em here */
+   width: calc(100% + 6em);
+   /* show the decender line */
+   padding-bottom: 3px;
+   /* now element.scrollLeft = 100 can be set on mouse moves, to move the svg*/
+}
+.mdlfs-diagram svg {
+    overflow: visible
+}
+
+@media (max-width: 1024px) {
+    .mdlfs-x-height-diagram {
+        /* Here the mdl-cell adds 16px margin on each side and the grid as well*/
+        margin-left: calc( -3em - 16px);
+        width: calc(100% + 6em + 32px);
+    }
+}
+
+
+.mdlfs-drag-scroll {
+    overflow: hidden; /* could also be scroll */
+}
+
+.mdlfs-drag-scroll_running_text > * {
+    min-width: 1700px;
+}
+@media (max-width: 1699px) {
+    .mdlfs-drag-scroll {
+         cursor: move;
+        -webkit-touch-callout: none; /* iOS Safari */
+          -webkit-user-select: none; /* Chrome/Safari/Opera */
+           -khtml-user-select: none; /* Konqueror */
+             -moz-user-select: none; /* Firefox */
+              -ms-user-select: none; /* Internet Explorer/Edge */
+                  user-select: none; /* Non-prefixed version, currently
+                                        not supported by any browser */
+    }
+
+    .mdlfs-header-diagram svg {
+        /*
+        Using just "min-height: 350px" failed in Chrome, but with the
+        media query we are coming close to that effect
+        */
+        height: 350px;
+    }
 }
 
 .mdlfs-diagram__text_normal,
@@ -219,4 +265,19 @@ html * {
     transition-timing-function: easeOutCirc;
     -webkit-transition-timing-function: easeOutCirc;
 
+}
+
+/* some grid overrides, but kept minimal, only for classes used by us */
+@media (min-width: 840px) and (max-width: 1024px) {
+  .mdl-cell--4-col,
+  .mdl-cell--4-col-desktop.mdl-cell--4-col-desktop {
+     width: calc(50% - 16px); }
+  .mdl-cell--6-col,
+  .mdl-cell--6-col-desktop.mdl-cell--6-col-desktop {
+     width: calc(100% - 16px) }
+}
+
+@media (min-width: 480px) and (max-width: 730px) {
+  .mdl-cell--4-col-tablet.mdl-cell--4-col-tablet {
+     width: calc(100% - 16px) }
 }

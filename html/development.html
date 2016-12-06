@@ -55,8 +55,8 @@
 <div class="mdl-grid">
   <div class="mdl-cell mdl-cell--3-col">
     Typeface /<br />
-    <!--<span class="mdlfs-font-data" data-getter="FamilyName"></span>-->
-    <div class="mdlfs-font-select"></div>
+    <span class="mdlfs-font-data" data-getter="FamilyName"></span>
+    <!--<div class="mdlfs-font-select"></div>-->
   </div>
 
   <div class="mdl-cell mdl-cell--3-col">
@@ -78,27 +78,34 @@
   </div>
 </div>
 
-<h1 class="mdlfs-main-title mdlfs-current-font">#WorkSans<br />2014—&#xf8ff;&#x2194;&#x2782;&#x25c7;</h1>
+<div
+    class="mdlfs-header-diagram
+           mdlfs-diagram
+           mdlfs-drag-scroll"
+    data-diagram-name="basicLines"
+    data-text-content="Hamburger"
+    data-diagram-ascent="800"
+    ></div>
 
 <div class="mdl-grid">
-
-  <div class="mdl-cell mdl-cell--12-col">
-    <h3 class="mdlfs-card__title">SVG Text tests</h3>
-    <div class="mdlfs-diagram" data-diagram-name="testText" data-diagram-ascent="800"></div>
-  </div>
-
   <div class="mdl-cell mdl-cell--12-col">
     <h3 class="mdlfs-card__title"><span class="mdlfs-font-data" data-getter="StyleName"></span> 60pt/72pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
     <p class="mdlfs-current-font"
        style="font-size: 60pt; line-height: 72pt;">
     ABCDEFGHIJKLMNOPQRSTUVWXYZ<br />
     abcdefghijklmnopqrstuvwxyz<br />
     0123456789</p>
+    </div>
   </div>
 
-  <div class="mdl-cell mdl-cell--6-col">
+  <div class="mdl-cell mdl-cell--6-col mdl-cell--12-col-tablet">
     <h3 class="mdlfs-card__title">x-height</h3>
-    <div class="mdlfs-diagram" data-diagram-name="xHeight" data-diagram-ascent="800"></div>
+    <div class="mdlfs-x-height-diagram mdlfs-diagram"
+         data-diagram-name="xHeight"
+         data-diagram-ascent="800"
+         data-diagram-descent="5"
+         ></div>
   </div>
 
   <div class="mdl-cell mdl-cell--6-col">
@@ -117,18 +124,18 @@
       <h2 class="mdlfs-section__title">OpenType Features</h2>
   </div>
 
-  <div class="mdl-cell mdl-cell--6-col">
-    <h3 class="mdlfs-card__title">Stylistic Alternates</h3>
-    <div class="mdlfs-diagram" data-diagram-name="stylisticSets" data-diagram-ascent="800"></div>
-  </div>
-
-  <div class="mdl-cell mdl-cell--6-col">
+  <div class="mdl-cell mdl-cell--6-col
+              mdl-cell--12-col-tablet
+              mdl-cell--order-2">
     <h3 class="mdlfs-card__title">Currencies</h3>
     <div class="mdlfs-currency-symbols mdlfs-current-font"></div>
   </div>
 
 
-  <div class="mdl-cell mdl-cell--4-col
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--order-3
+              mdl-cell--4-col-tablet
               mdlfs-feature-display__item-blueprint
               mdlfs-feature-display__item"
        style="display:none">
@@ -162,7 +169,8 @@
 
   <div class="mdl-cell mdl-cell--12-col">
     <h3 class="mdlfs-card__title">45pt / 48pt</h3>
-    <p style="font-size:45pt ;line-height:48pt;">
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
+    <p style="font-size:45pt ;line-height:48pt">
       <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
             style="display:none"
             data-per-font-rotate
@@ -180,10 +188,12 @@
         space; the moon a fainter fluctuating band;
       </span>
     </p>
+    </div>
   </div>
 
   <div class="mdl-cell mdl-cell--12-col">
     <h3 class="mdlfs-card__title">24pt / 32pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
     <p style="font-size:24pt ;line-height:32pt;">
       <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
             style="display:none"
@@ -202,9 +212,13 @@
         space; the moon a fainter fluctuating band;
       </span>
     </p>
+    </div>
   </div>
 
-  <div class="mdl-cell mdl-cell--4-col mdlfs-per-font__item-blueprint"
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--7-col-tablet
+              mdlfs-per-font__item-blueprint"
        style="display:none"
        data-reverse-font-order>
     <h3 class="mdlfs-card__title">
@@ -225,13 +239,6 @@
     </p>
   </div>
 
-</div>
-
-<div class="mdl-grid">
-    <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
-      <h2 class="mdlfs-section__title">Glyph Table</h2>
-  </div>
-  <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
 </div>
 
 </div>
