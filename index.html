@@ -1,0 +1,238 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MDL Font Specimen | for development</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="./lib/bower_components/material-design-lite/material.min.css">
+    <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
+    <link rel="stylesheet" href="./lib/css/main.css">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-sham.min.js"></script> -->
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/json3/3.3.2/json3.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-sham.min.js"></script> -->
+
+
+    <script src="./lib/bower_components/material-design-lite/material.min.js"></script>
+    <script>
+    fontSpecimenConfig = {}
+    fontSpecimenConfig.fontFiles = [
+         './html/assets/worksans/WorkSans-Regular.ttf'
+        , './html/assets/worksans/WorkSans-Black.ttf'
+        , './html/assets/worksans/WorkSans-Bold.ttf'
+        , './html/assets/worksans/WorkSans-Light.ttf'
+        , './html/assets/worksans/WorkSans-SemiBold.ttf'
+        , './html/assets/worksans/WorkSans-ExtraBold.ttf'
+        , './html/assets/worksans/WorkSans-ExtraLight.ttf'
+        , './html/assets/worksans/WorkSans-Medium.ttf'
+        , './html/assets/worksans/WorkSans-Thin.ttf'
+    ];
+    </script>
+    <script src="./dist/mdl-font-specimen.js"></script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdlfs-content mdlfs-main">
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--3-col">
+    Typeface /<br />
+    <span class="mdlfs-font-data" data-getter="FamilyName"></span>
+    <!--<div class="mdlfs-font-select"></div>-->
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    First Release /<br />
+    June 2014<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Latest Release /<br />
+    June 2016<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Links /<br />
+    <a href="#">Google Fonts Specimen</a><br />
+    <a href="#">Github Page</a>
+  </div>
+</div>
+
+<div
+    class="mdlfs-header-diagram
+           mdlfs-diagram
+           mdlfs-drag-scroll"
+    data-diagram-name="basicLines"
+    data-text-content="Hamburger"
+    data-diagram-ascent="800"
+    ></div>
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title"><span class="mdlfs-font-data" data-getter="StyleName"></span> 60pt/72pt</h3>
+    <p class="mdlfs-current-font mdlfs-alphabet-sample"
+       style="font-size: 60pt; line-height: 72pt;">
+    <span>ABCDE</span><span>FGHIJ</span><span>KLMNO</span><span>PQRST</span><span>UVWXYZ</span><br />
+    <span>abcde</span><span>fghij</span><span>klmno</span><span>pqrst</span><span>uvwxyz</span><br />
+    <span>01234</span><span>56789</span></p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col mdl-cell--12-col-tablet">
+    <h3 class="mdlfs-card__title">x-height</h3>
+    <div class="mdlfs-x-height-diagram mdlfs-diagram"
+         data-diagram-name="xHeight"
+         data-diagram-ascent="800"
+         data-diagram-descent="5"
+         ></div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">Styles</h3>
+    <ul class="mdlfs-styles-list mdlfs-per-font">
+          <li class="mdlfs-per-font__item-blueprint" style="display:none">
+          <span class="mdlfs-per-font__current-font mdlfs-per-font__data" data-getter="StyleName"></span>
+      </li>
+    </ul>
+  </div>
+
+</div>
+
+<div class="mdl-grid mdlfs-feature-display">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">OpenType Features</h2>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col
+              mdl-cell--12-col-tablet
+              mdl-cell--order-2">
+    <h3 class="mdlfs-card__title">Currencies</h3>
+    <div class="mdlfs-currency-symbols mdlfs-current-font"></div>
+  </div>
+
+
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--order-3
+              mdl-cell--4-col-tablet
+              mdlfs-feature-display__item-blueprint
+              mdlfs-feature-display__item
+              mdlfs-feature-display__item-content-container
+              "
+       style="display:none">
+    <h3 class="mdlfs-card__title mdlfs-feature-display__item__friendly-name"></h3>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-text"><!--
+        no whitespace
+        BEGIN: removed if not in `show-before` mode
+        --><div class="mdlfs-feature-display__item__before"></div><!--
+
+        --><div class="material-icons
+                    mdlfs-feature-display__item__change-indicator">arrow_downward</div><!--
+        no whitespace
+        END: removed
+        --><div class="mdlfs-feature-display__item__applied"></div><!--
+        no whitespace
+    --></div>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-stacked"></div>
+
+    <!-- contents -->
+  </div>
+
+
+</div>
+
+<div class="mdl-grid mdlfs-per-font">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Paragraph</h2>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title">45pt / 48pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
+    <p style="font-size:45pt ;line-height:48pt">
+      <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
+            style="display:none"
+            data-per-font-rotate
+            data-reverse-font-order>
+        As I went on, still gaining velocity, the
+        palpitation of night and day merged
+        into one continuous greyness;
+        <!-- rotate -->
+        the sky took on a wonderful deepness of blue,
+        a splendid luminous color like that of
+        early twilight;
+        <!-- rotate -->
+        the jerking sun became
+        a streak of fire, a brilliant arch, in
+        space; the moon a fainter fluctuating band;
+      </span>
+    </p>
+    </div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title">24pt / 32pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
+    <p style="font-size:24pt ;line-height:32pt;">
+      <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
+            style="display:none"
+            data-per-font-rotate
+            data-reverse-font-order>
+        As I went on, still gaining velocity, the
+        palpitation of night and day merged
+        into one continuous greyness;
+        <!-- rotate -->
+        the sky took on a wonderful deepness of blue,
+        a splendid luminous color like that of
+        early twilight;
+        <!-- rotate -->
+        the jerking sun became
+        a streak of fire, a brilliant arch, in
+        space; the moon a fainter fluctuating band;
+      </span>
+    </p>
+    </div>
+  </div>
+
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--7-col-tablet
+              mdlfs-per-font__item-blueprint"
+       style="display:none"
+       data-reverse-font-order>
+    <h3 class="mdlfs-card__title">
+        <span class="mdlfs-per-font__data"
+              data-getter="StyleName"></span>, 14pt / 24pt
+    </h3>
+    <p class="mdlfs-per-font__current-font"
+      style="font-size:14pt ;line-height:24pt;">
+    <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+    As I went on, still gaining velocity, the
+    palpitation of night and day merged
+    into one continuous greyness; the sky
+    took on a wonderful deepness of blue,
+    a splendid luminous color like that of
+    early twilight; the jerking sun became
+    a streak of fire, a brilliant arch, in
+    space; the moon a fainter fluctuating band;
+    </p>
+  </div>
+
+</div>
+
+</div>
+</body>
+</html>
