@@ -101,14 +101,32 @@
     ></div>
   </div>
 
-  <div class="mdlfs-feature-display__item-blueprint mdlfs-feature-display__item mdl-card mdl-cell mdl-cell--4-col mdl-shadow--2dp"
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdlfs-feature-display__item-blueprint
+              mdlfs-feature-display__item"
        style="display:none">
     <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
-      <div class="mdl-card__title-text">
+      <div class="mdl-card__title-text mdlfs-feature-display__item-content-container">
         <h2>Feature: <span class="mdlfs-feature-display__item__tag-name"></span></h2>
-        <div class="mdlfs-feature-display__item__before"></div>
-        <div class="material-icons mdlfs-feature-display__item__change-indicator">arrow_downward</div>
-        <div class="mdlfs-feature-display__item__after"></div>
+
+        <div class="mdlfs-feature-display__item__content
+                    mdlfs-feature-display__item__content-text"><!--
+            no whitespace
+            BEGIN: removed if not in `show-before` mode
+            --><div class="mdlfs-feature-display__item__before"></div><!--
+
+            --><div class="material-icons
+                        mdlfs-feature-display__item__change-indicator">arrow_downward</div><!--
+            no whitespace
+            END: removed
+            --><div class="mdlfs-feature-display__item__applied"></div><!--
+            no whitespace
+        --></div>
+        <div class="mdlfs-feature-display__item__content
+                  mdlfs-feature-display__item__content-stacked"></div>
+
+        <!-- contents -->
       </div>
     </div>
     <div class="mdl-card__supporting-text mdlfs-feature-display__item__friendly-name"></div>
