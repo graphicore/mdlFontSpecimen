@@ -11,23 +11,24 @@ if (require.main === module) {
 var requirejs = require('requirejs')
   , path = require('path')
   , program = require('commander')
-  ,fs = require('fs')
   ;
 
 program._name = path.basename(process.argv[1]).replace('-', ' ');
 program.arguments(exports.command.arguments)
     .description(exports.command.description);
 
-program.action(function (libdir, outDir) {
-    outDir += outDir.slice(-1) === '/' ? '' : '/';
-    libdir += libdir.slice(-1) === '/' ? '' : '/';
-    var baseUrl = path.resolve(process.cwd(), libdir)
-      , outFile = outDir + 'mdl-font-specimen.js'
-      , cssSourceFile = libdir + 'css/main.css'
-      , cssOutFile = outDir + 'mdl-font-specimen.css'
+program.action(function (infile, outFile) {
+    var libdir
+      , baseUrl
       , copySetup
       , bootstrap
+      , mainModule = path.basename(infile)
       ;
+    libdir = path.dirname(infile) + '/';
+    baseUrl = path.resolve(process.cwd(), libdir);
+    if(mainModule.indexOf('.js') === mainModule.length -3)
+        mainModule = mainModule.slice(0,-3);
+
     requirejs.config({
         baseUrl: baseUrl
     });
@@ -37,6 +38,7 @@ program.action(function (libdir, outDir) {
             baseUrl: baseUrl
           , paths: {
                 almond: '../node_modules/almond/almond'
+              , main: mainModule
             }
           , include: ['almond', 'main']
           , name: 'init'// <== see rawText
@@ -68,11 +70,6 @@ program.action(function (libdir, outDir) {
         throw err;
     });
 
-
-
-    // CSS: no build step needed yet
-    fs.createReadStream(cssSourceFile)
-      .pipe(fs.createWriteStream(cssOutFile));
 });
 program.parse(process.argv);
 }
