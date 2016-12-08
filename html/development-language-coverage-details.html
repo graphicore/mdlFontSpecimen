@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MDL Font Specimen | drop fonts</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+        <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
+    <link rel="stylesheet" href="../lib/css/main.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-sham.min.js"></script> -->
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/json3/3.3.2/json3.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-sham.min.js"></script> -->
+
+    <script src="../lib/bower_components/material-design-lite/material.js"></script>
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+    fontSpecimenConfig = {
+        loadFromFileInput: true
+    };
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['inspect-main'], function(main) {
+            main();
+        });
+    });
+    </script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-fonts-drop">
+      <h3>Drop font files here or click.</h3>
+      <p>The fonts will stay on your computer and are processed locally in the browser.</p>
+      <p><strong>They will NOT be uploaded to any server or be send away otherwise.</strong></p>
+    </div>
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdlfs-main mdlfs-content">
+
+  <div class="mdlfs-font-select"></div>
+    <p>
+    <em>Size of Glyph-Set</em>
+    <strong class="mdlfs-font-data"
+         data-getter="NumberGlyphs"></strong>
+  </p>
+
+  <p>
+    <em># Supported Languages</em>
+    <strong class="mdlfs-font-data"
+         data-getter="NumberSupportedLanguages"></strong> (laxly)
+  </p>
+
+  <p>
+    <em>All (laxly) Supported Languages</em>
+    <strong class="mdlfs-font-data"
+         data-getter="SupportedLanguages"></strong>
+  </p>
+
+  <div class="mdlfs-language-info" data-coverage-lax>
+    <h3>Lax CLDR</h3></div>
+
+  <div class="mdlfs-language-info">
+    <h3>Strict CLDR</h3></div>
+
+</div>
+</body>
+</html>
