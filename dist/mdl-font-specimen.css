@@ -33,7 +33,9 @@ html * {
 
 
 .mdlfs-content {
-    margin: 0 3em;
+    margin: 0 auto;
+    width: calc(100% - 6em);
+    max-width: 1900px;
 }
 
 .mdlfs-main-title {
@@ -58,6 +60,21 @@ html * {
         /* Here the mdl-cell adds 16px margin on each side and the grid as well*/
         margin-left: calc( -3em - 16px);
         width: calc(100% + 6em + 32px);
+    }
+}
+
+@media (max-width: 480px) {
+    .mdlfs-content {
+        width: calc(100% - 2em);
+    }
+    .mdlfs-header-diagram {
+        margin-left: -1em;
+        width: calc(100% + 2em);
+    }
+    .mdlfs-x-height-diagram {
+        /* Here the mdl-cell adds 16px margin on each side and the grid as well*/
+        margin-left: calc( -1em - 16px);
+        width: calc(100% + 2em + 32px);
     }
 }
 
@@ -214,7 +231,11 @@ html * {
     font-size: 5em;
     line-height: normal;
 }
-
+@media (max-width: 730px) {
+    .mdlfs-currency-symbols {
+        font-size: 3em;
+    }
+}
 .mdlfs-currency-symbols__sample-symbol {
     color:  #ff5252;
 }
