@@ -2,6 +2,438 @@
  * @license almond 0.3.3 Copyright jQuery Foundation and other contributors.
  * Released under MIT license, http://github.com/requirejs/almond/LICENSE
  */
+//Going sloppy to avoid 'use strict' string cost, but strict practices should
+//be followed.
+/*global setTimeout: false */
+
+var requirejs, require, define;
+(function (undef) {
+    var main, req, makeMap, handlers,
+        defined = {},
+        waiting = {},
+        config = {},
+        defining = {},
+        hasOwn = Object.prototype.hasOwnProperty,
+        aps = [].slice,
+        jsSuffixRegExp = /\.js$/;
+
+    function hasProp(obj, prop) {
+        return hasOwn.call(obj, prop);
+    }
+
+    /**
+     * Given a relative module name, like ./something, normalize it to
+     * a real name that can be mapped to a path.
+     * @param {String} name the relative name
+     * @param {String} baseName a real name that the name arg is relative
+     * to.
+     * @returns {String} normalized name
+     */
+    function normalize(name, baseName) {
+        var nameParts, nameSegment, mapValue, foundMap, lastIndex,
+            foundI, foundStarMap, starI, i, j, part, normalizedBaseParts,
+            baseParts = baseName && baseName.split("/"),
+            map = config.map,
+            starMap = (map && map['*']) || {};
+
+        //Adjust any relative paths.
+        if (name) {
+            name = name.split('/');
+            lastIndex = name.length - 1;
+
+            // If wanting node ID compatibility, strip .js from end
+            // of IDs. Have to do this here, and not in nameToUrl
+            // because node allows either .js or non .js to map
+            // to same file.
+            if (config.nodeIdCompat && jsSuffixRegExp.test(name[lastIndex])) {
+                name[lastIndex] = name[lastIndex].replace(jsSuffixRegExp, '');
+            }
+
+            // Starts with a '.' so need the baseName
+            if (name[0].charAt(0) === '.' && baseParts) {
+                //Convert baseName to array, and lop off the last part,
+                //so that . matches that 'directory' and not name of the baseName's
+                //module. For instance, baseName of 'one/two/three', maps to
+                //'one/two/three.js', but we want the directory, 'one/two' for
+                //this normalization.
+                normalizedBaseParts = baseParts.slice(0, baseParts.length - 1);
+                name = normalizedBaseParts.concat(name);
+            }
+
+            //start trimDots
+            for (i = 0; i < name.length; i++) {
+                part = name[i];
+                if (part === '.') {
+                    name.splice(i, 1);
+                    i -= 1;
+                } else if (part === '..') {
+                    // If at the start, or previous value is still ..,
+                    // keep them so that when converted to a path it may
+                    // still work when converted to a path, even though
+                    // as an ID it is less than ideal. In larger point
+                    // releases, may be better to just kick out an error.
+                    if (i === 0 || (i === 1 && name[2] === '..') || name[i - 1] === '..') {
+                        continue;
+                    } else if (i > 0) {
+                        name.splice(i - 1, 2);
+                        i -= 2;
+                    }
+                }
+            }
+            //end trimDots
+
+            name = name.join('/');
+        }
+
+        //Apply map config if available.
+        if ((baseParts || starMap) && map) {
+            nameParts = name.split('/');
+
+            for (i = nameParts.length; i > 0; i -= 1) {
+                nameSegment = nameParts.slice(0, i).join("/");
+
+                if (baseParts) {
+                    //Find the longest baseName segment match in the config.
+                    //So, do joins on the biggest to smallest lengths of baseParts.
+                    for (j = baseParts.length; j > 0; j -= 1) {
+                        mapValue = map[baseParts.slice(0, j).join('/')];
+
+                        //baseName segment has  config, find if it has one for
+                        //this name.
+                        if (mapValue) {
+                            mapValue = mapValue[nameSegment];
+                            if (mapValue) {
+                                //Match, update name to the new value.
+                                foundMap = mapValue;
+                                foundI = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (foundMap) {
+                    break;
+                }
+
+                //Check for a star map match, but just hold on to it,
+                //if there is a shorter segment match later in a matching
+                //config, then favor over this star map.
+                if (!foundStarMap && starMap && starMap[nameSegment]) {
+                    foundStarMap = starMap[nameSegment];
+                    starI = i;
+                }
+            }
+
+            if (!foundMap && foundStarMap) {
+                foundMap = foundStarMap;
+                foundI = starI;
+            }
+
+            if (foundMap) {
+                nameParts.splice(0, foundI, foundMap);
+                name = nameParts.join('/');
+            }
+        }
+
+        return name;
+    }
+
+    function makeRequire(relName, forceSync) {
+        return function () {
+            //A version of a require function that passes a moduleName
+            //value for items that may need to
+            //look up paths relative to the moduleName
+            var args = aps.call(arguments, 0);
+
+            //If first arg is not require('string'), and there is only
+            //one arg, it is the array form without a callback. Insert
+            //a null so that the following concat is correct.
+            if (typeof args[0] !== 'string' && args.length === 1) {
+                args.push(null);
+            }
+            return req.apply(undef, args.concat([relName, forceSync]));
+        };
+    }
+
+    function makeNormalize(relName) {
+        return function (name) {
+            return normalize(name, relName);
+        };
+    }
+
+    function makeLoad(depName) {
+        return function (value) {
+            defined[depName] = value;
+        };
+    }
+
+    function callDep(name) {
+        if (hasProp(waiting, name)) {
+            var args = waiting[name];
+            delete waiting[name];
+            defining[name] = true;
+            main.apply(undef, args);
+        }
+
+        if (!hasProp(defined, name) && !hasProp(defining, name)) {
+            throw new Error('No ' + name);
+        }
+        return defined[name];
+    }
+
+    //Turns a plugin!resource to [plugin, resource]
+    //with the plugin being undefined if the name
+    //did not have a plugin prefix.
+    function splitPrefix(name) {
+        var prefix,
+            index = name ? name.indexOf('!') : -1;
+        if (index > -1) {
+            prefix = name.substring(0, index);
+            name = name.substring(index + 1, name.length);
+        }
+        return [prefix, name];
+    }
+
+    //Creates a parts array for a relName where first part is plugin ID,
+    //second part is resource ID. Assumes relName has already been normalized.
+    function makeRelParts(relName) {
+        return relName ? splitPrefix(relName) : [];
+    }
+
+    /**
+     * Makes a name map, normalizing the name, and using a plugin
+     * for normalization if necessary. Grabs a ref to plugin
+     * too, as an optimization.
+     */
+    makeMap = function (name, relParts) {
+        var plugin,
+            parts = splitPrefix(name),
+            prefix = parts[0],
+            relResourceName = relParts[1];
+
+        name = parts[1];
+
+        if (prefix) {
+            prefix = normalize(prefix, relResourceName);
+            plugin = callDep(prefix);
+        }
+
+        //Normalize according
+        if (prefix) {
+            if (plugin && plugin.normalize) {
+                name = plugin.normalize(name, makeNormalize(relResourceName));
+            } else {
+                name = normalize(name, relResourceName);
+            }
+        } else {
+            name = normalize(name, relResourceName);
+            parts = splitPrefix(name);
+            prefix = parts[0];
+            name = parts[1];
+            if (prefix) {
+                plugin = callDep(prefix);
+            }
+        }
+
+        //Using ridiculous property names for space reasons
+        return {
+            f: prefix ? prefix + '!' + name : name, //fullName
+            n: name,
+            pr: prefix,
+            p: plugin
+        };
+    };
+
+    function makeConfig(name) {
+        return function () {
+            return (config && config.config && config.config[name]) || {};
+        };
+    }
+
+    handlers = {
+        require: function (name) {
+            return makeRequire(name);
+        },
+        exports: function (name) {
+            var e = defined[name];
+            if (typeof e !== 'undefined') {
+                return e;
+            } else {
+                return (defined[name] = {});
+            }
+        },
+        module: function (name) {
+            return {
+                id: name,
+                uri: '',
+                exports: defined[name],
+                config: makeConfig(name)
+            };
+        }
+    };
+
+    main = function (name, deps, callback, relName) {
+        var cjsModule, depName, ret, map, i, relParts,
+            args = [],
+            callbackType = typeof callback,
+            usingExports;
+
+        //Use name if no relName
+        relName = relName || name;
+        relParts = makeRelParts(relName);
+
+        //Call the callback to define the module, if necessary.
+        if (callbackType === 'undefined' || callbackType === 'function') {
+            //Pull out the defined dependencies and pass the ordered
+            //values to the callback.
+            //Default to [require, exports, module] if no deps
+            deps = !deps.length && callback.length ? ['require', 'exports', 'module'] : deps;
+            for (i = 0; i < deps.length; i += 1) {
+                map = makeMap(deps[i], relParts);
+                depName = map.f;
+
+                //Fast path CommonJS standard dependencies.
+                if (depName === "require") {
+                    args[i] = handlers.require(name);
+                } else if (depName === "exports") {
+                    //CommonJS module spec 1.1
+                    args[i] = handlers.exports(name);
+                    usingExports = true;
+                } else if (depName === "module") {
+                    //CommonJS module spec 1.1
+                    cjsModule = args[i] = handlers.module(name);
+                } else if (hasProp(defined, depName) ||
+                           hasProp(waiting, depName) ||
+                           hasProp(defining, depName)) {
+                    args[i] = callDep(depName);
+                } else if (map.p) {
+                    map.p.load(map.n, makeRequire(relName, true), makeLoad(depName), {});
+                    args[i] = defined[depName];
+                } else {
+                    throw new Error(name + ' missing ' + depName);
+                }
+            }
+
+            ret = callback ? callback.apply(defined[name], args) : undefined;
+
+            if (name) {
+                //If setting exports via "module" is in play,
+                //favor that over return value and exports. After that,
+                //favor a non-undefined return value over exports use.
+                if (cjsModule && cjsModule.exports !== undef &&
+                        cjsModule.exports !== defined[name]) {
+                    defined[name] = cjsModule.exports;
+                } else if (ret !== undef || !usingExports) {
+                    //Use the return value from the function.
+                    defined[name] = ret;
+                }
+            }
+        } else if (name) {
+            //May just be an object definition for the module. Only
+            //worry about defining if have a module name.
+            defined[name] = callback;
+        }
+    };
+
+    requirejs = require = req = function (deps, callback, relName, forceSync, alt) {
+        if (typeof deps === "string") {
+            if (handlers[deps]) {
+                //callback in this case is really relName
+                return handlers[deps](callback);
+            }
+            //Just return the module wanted. In this scenario, the
+            //deps arg is the module name, and second arg (if passed)
+            //is just the relName.
+            //Normalize module name, if it contains . or ..
+            return callDep(makeMap(deps, makeRelParts(callback)).f);
+        } else if (!deps.splice) {
+            //deps is a config object, not an array.
+            config = deps;
+            if (config.deps) {
+                req(config.deps, config.callback);
+            }
+            if (!callback) {
+                return;
+            }
+
+            if (callback.splice) {
+                //callback is an array, which means it is a dependency list.
+                //Adjust args if there are dependencies
+                deps = callback;
+                callback = relName;
+                relName = null;
+            } else {
+                deps = undef;
+            }
+        }
+
+        //Support require(['a'])
+        callback = callback || function () {};
+
+        //If relName is a function, it is an errback handler,
+        //so remove it.
+        if (typeof relName === 'function') {
+            relName = forceSync;
+            forceSync = alt;
+        }
+
+        //Simulate async callback;
+        if (forceSync) {
+            main(undef, deps, callback, relName);
+        } else {
+            //Using a non-zero value because of concern for what old browsers
+            //do, and latest browsers "upgrade" to 4 if lower value is used:
+            //http://www.whatwg.org/specs/web-apps/current-work/multipage/timers.html#dom-windowtimers-settimeout:
+            //If want a value immediately, use require('id') instead -- something
+            //that works in almond on the global level, but not guaranteed and
+            //unlikely to work in other AMD implementations.
+            setTimeout(function () {
+                main(undef, deps, callback, relName);
+            }, 4);
+        }
+
+        return req;
+    };
+
+    /**
+     * Just drops the config on the floor, but returns req in case
+     * the config return value is used.
+     */
+    req.config = function (cfg) {
+        return req(cfg);
+    };
+
+    /**
+     * Expose module registry for debugging and tooling
+     */
+    requirejs._defined = defined;
+
+    define = function (name, deps, callback) {
+        if (typeof name !== 'string') {
+            throw new Error('See almond README: incorrect module build, no module name');
+        }
+
+        //This module may not have dependencies
+        if (!deps.splice) {
+            //deps is not an array, so probably means
+            //an object literal or factory function for
+            //the value. Adjust args.
+            callback = deps;
+            deps = [];
+        }
+
+        if (!hasProp(defined, name) && !hasProp(waiting, name)) {
+            waiting[name] = [name, deps, callback];
+        }
+    };
+
+    define.amd = {
+        jQuery: true
+    };
+}());
+
+define("almond", function(){});
 
 /**
  * Modules in this bundle
@@ -10,7 +442,7 @@
  * opentype.js:
  *   license: MIT (http://opensource.org/licenses/MIT)
  *   author: Frederik De Bleser <frederik@debleser.be>
- *   version: 0.6.6
+ *   version: 0.6.9
  *
  * tiny-inflate:
  *   license: MIT (http://opensource.org/licenses/MIT)
@@ -21,6 +453,875 @@
  *
  * This header is generated by licensify (https://github.com/twada/licensify)
  */
+(function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define('opentype',[],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.opentype = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+var TINF_OK = 0;
+var TINF_DATA_ERROR = -3;
+
+function Tree() {
+  this.table = new Uint16Array(16);   /* table of code length counts */
+  this.trans = new Uint16Array(288);  /* code -> symbol translation table */
+}
+
+function Data(source, dest) {
+  this.source = source;
+  this.sourceIndex = 0;
+  this.tag = 0;
+  this.bitcount = 0;
+  
+  this.dest = dest;
+  this.destLen = 0;
+  
+  this.ltree = new Tree();  /* dynamic length/symbol tree */
+  this.dtree = new Tree();  /* dynamic distance tree */
+}
+
+/* --------------------------------------------------- *
+ * -- uninitialized global data (static structures) -- *
+ * --------------------------------------------------- */
+
+var sltree = new Tree();
+var sdtree = new Tree();
+
+/* extra bits and base tables for length codes */
+var length_bits = new Uint8Array(30);
+var length_base = new Uint16Array(30);
+
+/* extra bits and base tables for distance codes */
+var dist_bits = new Uint8Array(30);
+var dist_base = new Uint16Array(30);
+
+/* special ordering of code length codes */
+var clcidx = new Uint8Array([
+  16, 17, 18, 0, 8, 7, 9, 6,
+  10, 5, 11, 4, 12, 3, 13, 2,
+  14, 1, 15
+]);
+
+/* used by tinf_decode_trees, avoids allocations every call */
+var code_tree = new Tree();
+var lengths = new Uint8Array(288 + 32);
+
+/* ----------------------- *
+ * -- utility functions -- *
+ * ----------------------- */
+
+/* build extra bits and base tables */
+function tinf_build_bits_base(bits, base, delta, first) {
+  var i, sum;
+
+  /* build bits table */
+  for (i = 0; i < delta; ++i) bits[i] = 0;
+  for (i = 0; i < 30 - delta; ++i) bits[i + delta] = i / delta | 0;
+
+  /* build base table */
+  for (sum = first, i = 0; i < 30; ++i) {
+    base[i] = sum;
+    sum += 1 << bits[i];
+  }
+}
+
+/* build the fixed huffman trees */
+function tinf_build_fixed_trees(lt, dt) {
+  var i;
+
+  /* build fixed length tree */
+  for (i = 0; i < 7; ++i) lt.table[i] = 0;
+
+  lt.table[7] = 24;
+  lt.table[8] = 152;
+  lt.table[9] = 112;
+
+  for (i = 0; i < 24; ++i) lt.trans[i] = 256 + i;
+  for (i = 0; i < 144; ++i) lt.trans[24 + i] = i;
+  for (i = 0; i < 8; ++i) lt.trans[24 + 144 + i] = 280 + i;
+  for (i = 0; i < 112; ++i) lt.trans[24 + 144 + 8 + i] = 144 + i;
+
+  /* build fixed distance tree */
+  for (i = 0; i < 5; ++i) dt.table[i] = 0;
+
+  dt.table[5] = 32;
+
+  for (i = 0; i < 32; ++i) dt.trans[i] = i;
+}
+
+/* given an array of code lengths, build a tree */
+var offs = new Uint16Array(16);
+
+function tinf_build_tree(t, lengths, off, num) {
+  var i, sum;
+
+  /* clear code length count table */
+  for (i = 0; i < 16; ++i) t.table[i] = 0;
+
+  /* scan symbol lengths, and sum code length counts */
+  for (i = 0; i < num; ++i) t.table[lengths[off + i]]++;
+
+  t.table[0] = 0;
+
+  /* compute offset table for distribution sort */
+  for (sum = 0, i = 0; i < 16; ++i) {
+    offs[i] = sum;
+    sum += t.table[i];
+  }
+
+  /* create code->symbol translation table (symbols sorted by code) */
+  for (i = 0; i < num; ++i) {
+    if (lengths[off + i]) t.trans[offs[lengths[off + i]]++] = i;
+  }
+}
+
+/* ---------------------- *
+ * -- decode functions -- *
+ * ---------------------- */
+
+/* get one bit from source stream */
+function tinf_getbit(d) {
+  /* check if tag is empty */
+  if (!d.bitcount--) {
+    /* load next tag */
+    d.tag = d.source[d.sourceIndex++];
+    d.bitcount = 7;
+  }
+
+  /* shift bit out of tag */
+  var bit = d.tag & 1;
+  d.tag >>>= 1;
+
+  return bit;
+}
+
+/* read a num bit value from a stream and add base */
+function tinf_read_bits(d, num, base) {
+  if (!num)
+    return base;
+
+  while (d.bitcount < 24) {
+    d.tag |= d.source[d.sourceIndex++] << d.bitcount;
+    d.bitcount += 8;
+  }
+
+  var val = d.tag & (0xffff >>> (16 - num));
+  d.tag >>>= num;
+  d.bitcount -= num;
+  return val + base;
+}
+
+/* given a data stream and a tree, decode a symbol */
+function tinf_decode_symbol(d, t) {
+  while (d.bitcount < 24) {
+    d.tag |= d.source[d.sourceIndex++] << d.bitcount;
+    d.bitcount += 8;
+  }
+  
+  var sum = 0, cur = 0, len = 0;
+  var tag = d.tag;
+
+  /* get more bits while code value is above sum */
+  do {
+    cur = 2 * cur + (tag & 1);
+    tag >>>= 1;
+    ++len;
+
+    sum += t.table[len];
+    cur -= t.table[len];
+  } while (cur >= 0);
+  
+  d.tag = tag;
+  d.bitcount -= len;
+
+  return t.trans[sum + cur];
+}
+
+/* given a data stream, decode dynamic trees from it */
+function tinf_decode_trees(d, lt, dt) {
+  var hlit, hdist, hclen;
+  var i, num, length;
+
+  /* get 5 bits HLIT (257-286) */
+  hlit = tinf_read_bits(d, 5, 257);
+
+  /* get 5 bits HDIST (1-32) */
+  hdist = tinf_read_bits(d, 5, 1);
+
+  /* get 4 bits HCLEN (4-19) */
+  hclen = tinf_read_bits(d, 4, 4);
+
+  for (i = 0; i < 19; ++i) lengths[i] = 0;
+
+  /* read code lengths for code length alphabet */
+  for (i = 0; i < hclen; ++i) {
+    /* get 3 bits code length (0-7) */
+    var clen = tinf_read_bits(d, 3, 0);
+    lengths[clcidx[i]] = clen;
+  }
+
+  /* build code length tree */
+  tinf_build_tree(code_tree, lengths, 0, 19);
+
+  /* decode code lengths for the dynamic trees */
+  for (num = 0; num < hlit + hdist;) {
+    var sym = tinf_decode_symbol(d, code_tree);
+
+    switch (sym) {
+      case 16:
+        /* copy previous code length 3-6 times (read 2 bits) */
+        var prev = lengths[num - 1];
+        for (length = tinf_read_bits(d, 2, 3); length; --length) {
+          lengths[num++] = prev;
+        }
+        break;
+      case 17:
+        /* repeat code length 0 for 3-10 times (read 3 bits) */
+        for (length = tinf_read_bits(d, 3, 3); length; --length) {
+          lengths[num++] = 0;
+        }
+        break;
+      case 18:
+        /* repeat code length 0 for 11-138 times (read 7 bits) */
+        for (length = tinf_read_bits(d, 7, 11); length; --length) {
+          lengths[num++] = 0;
+        }
+        break;
+      default:
+        /* values 0-15 represent the actual code lengths */
+        lengths[num++] = sym;
+        break;
+    }
+  }
+
+  /* build dynamic trees */
+  tinf_build_tree(lt, lengths, 0, hlit);
+  tinf_build_tree(dt, lengths, hlit, hdist);
+}
+
+/* ----------------------------- *
+ * -- block inflate functions -- *
+ * ----------------------------- */
+
+/* given a stream and two trees, inflate a block of data */
+function tinf_inflate_block_data(d, lt, dt) {
+  while (1) {
+    var sym = tinf_decode_symbol(d, lt);
+
+    /* check for end of block */
+    if (sym === 256) {
+      return TINF_OK;
+    }
+
+    if (sym < 256) {
+      d.dest[d.destLen++] = sym;
+    } else {
+      var length, dist, offs;
+      var i;
+
+      sym -= 257;
+
+      /* possibly get more bits from length code */
+      length = tinf_read_bits(d, length_bits[sym], length_base[sym]);
+
+      dist = tinf_decode_symbol(d, dt);
+
+      /* possibly get more bits from distance code */
+      offs = d.destLen - tinf_read_bits(d, dist_bits[dist], dist_base[dist]);
+
+      /* copy match */
+      for (i = offs; i < offs + length; ++i) {
+        d.dest[d.destLen++] = d.dest[i];
+      }
+    }
+  }
+}
+
+/* inflate an uncompressed block of data */
+function tinf_inflate_uncompressed_block(d) {
+  var length, invlength;
+  var i;
+  
+  /* unread from bitbuffer */
+  while (d.bitcount > 8) {
+    d.sourceIndex--;
+    d.bitcount -= 8;
+  }
+
+  /* get length */
+  length = d.source[d.sourceIndex + 1];
+  length = 256 * length + d.source[d.sourceIndex];
+
+  /* get one's complement of length */
+  invlength = d.source[d.sourceIndex + 3];
+  invlength = 256 * invlength + d.source[d.sourceIndex + 2];
+
+  /* check length */
+  if (length !== (~invlength & 0x0000ffff))
+    return TINF_DATA_ERROR;
+
+  d.sourceIndex += 4;
+
+  /* copy block */
+  for (i = length; i; --i)
+    d.dest[d.destLen++] = d.source[d.sourceIndex++];
+
+  /* make sure we start next block on a byte boundary */
+  d.bitcount = 0;
+
+  return TINF_OK;
+}
+
+/* inflate stream from source to dest */
+function tinf_uncompress(source, dest) {
+  var d = new Data(source, dest);
+  var bfinal, btype, res;
+
+  do {
+    /* read final block flag */
+    bfinal = tinf_getbit(d);
+
+    /* read block type (2 bits) */
+    btype = tinf_read_bits(d, 2, 0);
+
+    /* decompress block */
+    switch (btype) {
+      case 0:
+        /* decompress uncompressed block */
+        res = tinf_inflate_uncompressed_block(d);
+        break;
+      case 1:
+        /* decompress block with fixed huffman trees */
+        res = tinf_inflate_block_data(d, sltree, sdtree);
+        break;
+      case 2:
+        /* decompress block with dynamic huffman trees */
+        tinf_decode_trees(d, d.ltree, d.dtree);
+        res = tinf_inflate_block_data(d, d.ltree, d.dtree);
+        break;
+      default:
+        res = TINF_DATA_ERROR;
+    }
+
+    if (res !== TINF_OK)
+      throw new Error('Data error');
+
+  } while (!bfinal);
+
+  if (d.destLen < d.dest.length) {
+    if (typeof d.dest.slice === 'function')
+      return d.dest.slice(0, d.destLen);
+    else
+      return d.dest.subarray(0, d.destLen);
+  }
+  
+  return d.dest;
+}
+
+/* -------------------- *
+ * -- initialization -- *
+ * -------------------- */
+
+/* build fixed huffman trees */
+tinf_build_fixed_trees(sltree, sdtree);
+
+/* build extra bits and base tables */
+tinf_build_bits_base(length_bits, length_base, 4, 3);
+tinf_build_bits_base(dist_bits, dist_base, 2, 1);
+
+/* fix a special case */
+length_bits[28] = 0;
+length_base[28] = 258;
+
+module.exports = tinf_uncompress;
+
+},{}],2:[function(require,module,exports){
+// The Bounding Box object
+
+
+
+function derive(v0, v1, v2, v3, t) {
+    return Math.pow(1 - t, 3) * v0 +
+        3 * Math.pow(1 - t, 2) * t * v1 +
+        3 * (1 - t) * Math.pow(t, 2) * v2 +
+        Math.pow(t, 3) * v3;
+}
+/**
+ * A bounding box is an enclosing box that describes the smallest measure within which all the points lie.
+ * It is used to calculate the bounding box of a glyph or text path.
+ *
+ * On initialization, x1/y1/x2/y2 will be NaN. Check if the bounding box is empty using `isEmpty()`.
+ *
+ * @exports opentype.BoundingBox
+ * @class
+ * @constructor
+ */
+function BoundingBox() {
+    this.x1 = Number.NaN;
+    this.y1 = Number.NaN;
+    this.x2 = Number.NaN;
+    this.y2 = Number.NaN;
+}
+
+/**
+ * Returns true if the bounding box is empty, that is, no points have been added to the box yet.
+ */
+BoundingBox.prototype.isEmpty = function() {
+    return isNaN(this.x1) || isNaN(this.y1) || isNaN(this.x2) || isNaN(this.y2);
+};
+
+/**
+ * Add the point to the bounding box.
+ * The x1/y1/x2/y2 coordinates of the bounding box will now encompass the given point.
+ * @param {number} x - The X coordinate of the point.
+ * @param {number} y - The Y coordinate of the point.
+ */
+BoundingBox.prototype.addPoint = function(x, y) {
+    if (typeof x === 'number') {
+        if (isNaN(this.x1) || isNaN(this.x2)) {
+            this.x1 = x;
+            this.x2 = x;
+        }
+        if (x < this.x1) {
+            this.x1 = x;
+        }
+        if (x > this.x2) {
+            this.x2 = x;
+        }
+    }
+    if (typeof y === 'number') {
+        if (isNaN(this.y1) || isNaN(this.y2)) {
+            this.y1 = y;
+            this.y2 = y;
+        }
+        if (y < this.y1) {
+            this.y1 = y;
+        }
+        if (y > this.y2) {
+            this.y2 = y;
+        }
+    }
+};
+
+/**
+ * Add a X coordinate to the bounding box.
+ * This extends the bounding box to include the X coordinate.
+ * This function is used internally inside of addBezier.
+ * @param {number} x - The X coordinate of the point.
+ */
+BoundingBox.prototype.addX = function(x) {
+    this.addPoint(x, null);
+};
+
+/**
+ * Add a Y coordinate to the bounding box.
+ * This extends the bounding box to include the Y coordinate.
+ * This function is used internally inside of addBezier.
+ * @param {number} y - The Y coordinate of the point.
+ */
+BoundingBox.prototype.addY = function(y) {
+    this.addPoint(null, y);
+};
+
+/**
+ * Add a Bézier curve to the bounding box.
+ * This extends the bounding box to include the entire Bézier.
+ * @param {number} x0 - The starting X coordinate.
+ * @param {number} y0 - The starting Y coordinate.
+ * @param {number} x1 - The X coordinate of the first control point.
+ * @param {number} y1 - The Y coordinate of the first control point.
+ * @param {number} x2 - The X coordinate of the second control point.
+ * @param {number} y2 - The Y coordinate of the second control point.
+ * @param {number} x - The ending X coordinate.
+ * @param {number} y - The ending Y coordinate.
+ */
+BoundingBox.prototype.addBezier = function(x0, y0, x1, y1, x2, y2, x, y) {
+    // This code is based on http://nishiohirokazu.blogspot.com/2009/06/how-to-calculate-bezier-curves-bounding.html
+    // and https://github.com/icons8/svg-path-bounding-box
+
+    var p0 = [x0, y0];
+    var p1 = [x1, y1];
+    var p2 = [x2, y2];
+    var p3 = [x, y];
+
+    this.addPoint(x0, y0);
+    this.addPoint(x, y);
+
+    for (var i = 0; i <= 1; i++) {
+        var b = 6 * p0[i] - 12 * p1[i] + 6 * p2[i];
+        var a = -3 * p0[i] + 9 * p1[i] - 9 * p2[i] + 3 * p3[i];
+        var c = 3 * p1[i] - 3 * p0[i];
+
+        if (a === 0) {
+            if (b === 0) continue;
+            var t = -c / b;
+            if (0 < t && t < 1) {
+                if (i === 0) this.addX(derive(p0[i], p1[i], p2[i], p3[i], t));
+                if (i === 1) this.addY(derive(p0[i], p1[i], p2[i], p3[i], t));
+            }
+            continue;
+        }
+
+        var b2ac = Math.pow(b, 2) - 4 * c * a;
+        if (b2ac < 0) continue;
+        var t1 = (-b + Math.sqrt(b2ac)) / (2 * a);
+        if (0 < t1 && t1 < 1) {
+            if (i === 0) this.addX(derive(p0[i], p1[i], p2[i], p3[i], t1));
+            if (i === 1) this.addY(derive(p0[i], p1[i], p2[i], p3[i], t1));
+        }
+        var t2 = (-b - Math.sqrt(b2ac)) / (2 * a);
+        if (0 < t2 && t2 < 1) {
+            if (i === 0) this.addX(derive(p0[i], p1[i], p2[i], p3[i], t2));
+            if (i === 1) this.addY(derive(p0[i], p1[i], p2[i], p3[i], t2));
+        }
+    }
+};
+
+/**
+ * Add a quadratic curve to the bounding box.
+ * This extends the bounding box to include the entire quadratic curve.
+ * @param {number} x0 - The starting X coordinate.
+ * @param {number} y0 - The starting Y coordinate.
+ * @param {number} x1 - The X coordinate of the control point.
+ * @param {number} y1 - The Y coordinate of the control point.
+ * @param {number} x - The ending X coordinate.
+ * @param {number} y - The ending Y coordinate.
+ */
+BoundingBox.prototype.addQuad = function(x0, y0, x1, y1, x, y) {
+    var cp1x = x0 + 2 / 3 * (x1 - x0);
+    var cp1y = y0 + 2 / 3 * (y1 - y0);
+    var cp2x = cp1x + 1 / 3 * (x - x0);
+    var cp2y = cp1y + 1 / 3 * (y - y0);
+    this.addBezier(x0, y0, cp1x, cp1y, cp2x, cp2y, x, y);
+};
+
+exports.BoundingBox = BoundingBox;
+
+},{}],3:[function(require,module,exports){
+// Run-time checking of preconditions.
+
+
+
+exports.fail = function(message) {
+    throw new Error(message);
+};
+
+// Precondition function that checks if the given predicate is true.
+// If not, it will throw an error.
+exports.argument = function(predicate, message) {
+    if (!predicate) {
+        exports.fail(message);
+    }
+};
+
+// Precondition function that checks if the given assertion is true.
+// If not, it will throw an error.
+exports.assert = exports.argument;
+
+},{}],4:[function(require,module,exports){
+// Drawing utility functions.
+
+
+
+// Draw a line on the given context from point `x1,y1` to point `x2,y2`.
+function line(ctx, x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+}
+
+exports.line = line;
+
+},{}],5:[function(require,module,exports){
+// Glyph encoding
+
+
+
+var cffStandardStrings = [
+    '.notdef', 'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent', 'ampersand', 'quoteright',
+    'parenleft', 'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash', 'zero', 'one', 'two',
+    'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon', 'less', 'equal', 'greater',
+    'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+    'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright', 'asciicircum', 'underscore',
+    'quoteleft', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+    'u', 'v', 'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde', 'exclamdown', 'cent', 'sterling',
+    'fraction', 'yen', 'florin', 'section', 'currency', 'quotesingle', 'quotedblleft', 'guillemotleft',
+    'guilsinglleft', 'guilsinglright', 'fi', 'fl', 'endash', 'dagger', 'daggerdbl', 'periodcentered', 'paragraph',
+    'bullet', 'quotesinglbase', 'quotedblbase', 'quotedblright', 'guillemotright', 'ellipsis', 'perthousand',
+    'questiondown', 'grave', 'acute', 'circumflex', 'tilde', 'macron', 'breve', 'dotaccent', 'dieresis', 'ring',
+    'cedilla', 'hungarumlaut', 'ogonek', 'caron', 'emdash', 'AE', 'ordfeminine', 'Lslash', 'Oslash', 'OE',
+    'ordmasculine', 'ae', 'dotlessi', 'lslash', 'oslash', 'oe', 'germandbls', 'onesuperior', 'logicalnot', 'mu',
+    'trademark', 'Eth', 'onehalf', 'plusminus', 'Thorn', 'onequarter', 'divide', 'brokenbar', 'degree', 'thorn',
+    'threequarters', 'twosuperior', 'registered', 'minus', 'eth', 'multiply', 'threesuperior', 'copyright',
+    'Aacute', 'Acircumflex', 'Adieresis', 'Agrave', 'Aring', 'Atilde', 'Ccedilla', 'Eacute', 'Ecircumflex',
+    'Edieresis', 'Egrave', 'Iacute', 'Icircumflex', 'Idieresis', 'Igrave', 'Ntilde', 'Oacute', 'Ocircumflex',
+    'Odieresis', 'Ograve', 'Otilde', 'Scaron', 'Uacute', 'Ucircumflex', 'Udieresis', 'Ugrave', 'Yacute',
+    'Ydieresis', 'Zcaron', 'aacute', 'acircumflex', 'adieresis', 'agrave', 'aring', 'atilde', 'ccedilla', 'eacute',
+    'ecircumflex', 'edieresis', 'egrave', 'iacute', 'icircumflex', 'idieresis', 'igrave', 'ntilde', 'oacute',
+    'ocircumflex', 'odieresis', 'ograve', 'otilde', 'scaron', 'uacute', 'ucircumflex', 'udieresis', 'ugrave',
+    'yacute', 'ydieresis', 'zcaron', 'exclamsmall', 'Hungarumlautsmall', 'dollaroldstyle', 'dollarsuperior',
+    'ampersandsmall', 'Acutesmall', 'parenleftsuperior', 'parenrightsuperior', '266 ff', 'onedotenleader',
+    'zerooldstyle', 'oneoldstyle', 'twooldstyle', 'threeoldstyle', 'fouroldstyle', 'fiveoldstyle', 'sixoldstyle',
+    'sevenoldstyle', 'eightoldstyle', 'nineoldstyle', 'commasuperior', 'threequartersemdash', 'periodsuperior',
+    'questionsmall', 'asuperior', 'bsuperior', 'centsuperior', 'dsuperior', 'esuperior', 'isuperior', 'lsuperior',
+    'msuperior', 'nsuperior', 'osuperior', 'rsuperior', 'ssuperior', 'tsuperior', 'ff', 'ffi', 'ffl',
+    'parenleftinferior', 'parenrightinferior', 'Circumflexsmall', 'hyphensuperior', 'Gravesmall', 'Asmall',
+    'Bsmall', 'Csmall', 'Dsmall', 'Esmall', 'Fsmall', 'Gsmall', 'Hsmall', 'Ismall', 'Jsmall', 'Ksmall', 'Lsmall',
+    'Msmall', 'Nsmall', 'Osmall', 'Psmall', 'Qsmall', 'Rsmall', 'Ssmall', 'Tsmall', 'Usmall', 'Vsmall', 'Wsmall',
+    'Xsmall', 'Ysmall', 'Zsmall', 'colonmonetary', 'onefitted', 'rupiah', 'Tildesmall', 'exclamdownsmall',
+    'centoldstyle', 'Lslashsmall', 'Scaronsmall', 'Zcaronsmall', 'Dieresissmall', 'Brevesmall', 'Caronsmall',
+    'Dotaccentsmall', 'Macronsmall', 'figuredash', 'hypheninferior', 'Ogoneksmall', 'Ringsmall', 'Cedillasmall',
+    'questiondownsmall', 'oneeighth', 'threeeighths', 'fiveeighths', 'seveneighths', 'onethird', 'twothirds',
+    'zerosuperior', 'foursuperior', 'fivesuperior', 'sixsuperior', 'sevensuperior', 'eightsuperior', 'ninesuperior',
+    'zeroinferior', 'oneinferior', 'twoinferior', 'threeinferior', 'fourinferior', 'fiveinferior', 'sixinferior',
+    'seveninferior', 'eightinferior', 'nineinferior', 'centinferior', 'dollarinferior', 'periodinferior',
+    'commainferior', 'Agravesmall', 'Aacutesmall', 'Acircumflexsmall', 'Atildesmall', 'Adieresissmall',
+    'Aringsmall', 'AEsmall', 'Ccedillasmall', 'Egravesmall', 'Eacutesmall', 'Ecircumflexsmall', 'Edieresissmall',
+    'Igravesmall', 'Iacutesmall', 'Icircumflexsmall', 'Idieresissmall', 'Ethsmall', 'Ntildesmall', 'Ogravesmall',
+    'Oacutesmall', 'Ocircumflexsmall', 'Otildesmall', 'Odieresissmall', 'OEsmall', 'Oslashsmall', 'Ugravesmall',
+    'Uacutesmall', 'Ucircumflexsmall', 'Udieresissmall', 'Yacutesmall', 'Thornsmall', 'Ydieresissmall', '001.000',
+    '001.001', '001.002', '001.003', 'Black', 'Bold', 'Book', 'Light', 'Medium', 'Regular', 'Roman', 'Semibold'];
+
+var cffStandardEncoding = [
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', 'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent', 'ampersand', 'quoteright',
+    'parenleft', 'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash', 'zero', 'one', 'two',
+    'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon', 'less', 'equal', 'greater',
+    'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+    'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright', 'asciicircum', 'underscore',
+    'quoteleft', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+    'u', 'v', 'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'exclamdown', 'cent', 'sterling', 'fraction', 'yen', 'florin', 'section', 'currency', 'quotesingle',
+    'quotedblleft', 'guillemotleft', 'guilsinglleft', 'guilsinglright', 'fi', 'fl', '', 'endash', 'dagger',
+    'daggerdbl', 'periodcentered', '', 'paragraph', 'bullet', 'quotesinglbase', 'quotedblbase', 'quotedblright',
+    'guillemotright', 'ellipsis', 'perthousand', '', 'questiondown', '', 'grave', 'acute', 'circumflex', 'tilde',
+    'macron', 'breve', 'dotaccent', 'dieresis', '', 'ring', 'cedilla', '', 'hungarumlaut', 'ogonek', 'caron',
+    'emdash', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'AE', '', 'ordfeminine', '', '', '',
+    '', 'Lslash', 'Oslash', 'OE', 'ordmasculine', '', '', '', '', '', 'ae', '', '', '', 'dotlessi', '', '',
+    'lslash', 'oslash', 'oe', 'germandbls'];
+
+var cffExpertEncoding = [
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', 'space', 'exclamsmall', 'Hungarumlautsmall', '', 'dollaroldstyle', 'dollarsuperior',
+    'ampersandsmall', 'Acutesmall', 'parenleftsuperior', 'parenrightsuperior', 'twodotenleader', 'onedotenleader',
+    'comma', 'hyphen', 'period', 'fraction', 'zerooldstyle', 'oneoldstyle', 'twooldstyle', 'threeoldstyle',
+    'fouroldstyle', 'fiveoldstyle', 'sixoldstyle', 'sevenoldstyle', 'eightoldstyle', 'nineoldstyle', 'colon',
+    'semicolon', 'commasuperior', 'threequartersemdash', 'periodsuperior', 'questionsmall', '', 'asuperior',
+    'bsuperior', 'centsuperior', 'dsuperior', 'esuperior', '', '', 'isuperior', '', '', 'lsuperior', 'msuperior',
+    'nsuperior', 'osuperior', '', '', 'rsuperior', 'ssuperior', 'tsuperior', '', 'ff', 'fi', 'fl', 'ffi', 'ffl',
+    'parenleftinferior', '', 'parenrightinferior', 'Circumflexsmall', 'hyphensuperior', 'Gravesmall', 'Asmall',
+    'Bsmall', 'Csmall', 'Dsmall', 'Esmall', 'Fsmall', 'Gsmall', 'Hsmall', 'Ismall', 'Jsmall', 'Ksmall', 'Lsmall',
+    'Msmall', 'Nsmall', 'Osmall', 'Psmall', 'Qsmall', 'Rsmall', 'Ssmall', 'Tsmall', 'Usmall', 'Vsmall', 'Wsmall',
+    'Xsmall', 'Ysmall', 'Zsmall', 'colonmonetary', 'onefitted', 'rupiah', 'Tildesmall', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'exclamdownsmall', 'centoldstyle', 'Lslashsmall', '', '', 'Scaronsmall', 'Zcaronsmall', 'Dieresissmall',
+    'Brevesmall', 'Caronsmall', '', 'Dotaccentsmall', '', '', 'Macronsmall', '', '', 'figuredash', 'hypheninferior',
+    '', '', 'Ogoneksmall', 'Ringsmall', 'Cedillasmall', '', '', '', 'onequarter', 'onehalf', 'threequarters',
+    'questiondownsmall', 'oneeighth', 'threeeighths', 'fiveeighths', 'seveneighths', 'onethird', 'twothirds', '',
+    '', 'zerosuperior', 'onesuperior', 'twosuperior', 'threesuperior', 'foursuperior', 'fivesuperior',
+    'sixsuperior', 'sevensuperior', 'eightsuperior', 'ninesuperior', 'zeroinferior', 'oneinferior', 'twoinferior',
+    'threeinferior', 'fourinferior', 'fiveinferior', 'sixinferior', 'seveninferior', 'eightinferior',
+    'nineinferior', 'centinferior', 'dollarinferior', 'periodinferior', 'commainferior', 'Agravesmall',
+    'Aacutesmall', 'Acircumflexsmall', 'Atildesmall', 'Adieresissmall', 'Aringsmall', 'AEsmall', 'Ccedillasmall',
+    'Egravesmall', 'Eacutesmall', 'Ecircumflexsmall', 'Edieresissmall', 'Igravesmall', 'Iacutesmall',
+    'Icircumflexsmall', 'Idieresissmall', 'Ethsmall', 'Ntildesmall', 'Ogravesmall', 'Oacutesmall',
+    'Ocircumflexsmall', 'Otildesmall', 'Odieresissmall', 'OEsmall', 'Oslashsmall', 'Ugravesmall', 'Uacutesmall',
+    'Ucircumflexsmall', 'Udieresissmall', 'Yacutesmall', 'Thornsmall', 'Ydieresissmall'];
+
+var standardNames = [
+    '.notdef', '.null', 'nonmarkingreturn', 'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent',
+    'ampersand', 'quotesingle', 'parenleft', 'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash',
+    'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon', 'less',
+    'equal', 'greater', 'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright',
+    'asciicircum', 'underscore', 'grave', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde',
+    'Adieresis', 'Aring', 'Ccedilla', 'Eacute', 'Ntilde', 'Odieresis', 'Udieresis', 'aacute', 'agrave',
+    'acircumflex', 'adieresis', 'atilde', 'aring', 'ccedilla', 'eacute', 'egrave', 'ecircumflex', 'edieresis',
+    'iacute', 'igrave', 'icircumflex', 'idieresis', 'ntilde', 'oacute', 'ograve', 'ocircumflex', 'odieresis',
+    'otilde', 'uacute', 'ugrave', 'ucircumflex', 'udieresis', 'dagger', 'degree', 'cent', 'sterling', 'section',
+    'bullet', 'paragraph', 'germandbls', 'registered', 'copyright', 'trademark', 'acute', 'dieresis', 'notequal',
+    'AE', 'Oslash', 'infinity', 'plusminus', 'lessequal', 'greaterequal', 'yen', 'mu', 'partialdiff', 'summation',
+    'product', 'pi', 'integral', 'ordfeminine', 'ordmasculine', 'Omega', 'ae', 'oslash', 'questiondown',
+    'exclamdown', 'logicalnot', 'radical', 'florin', 'approxequal', 'Delta', 'guillemotleft', 'guillemotright',
+    'ellipsis', 'nonbreakingspace', 'Agrave', 'Atilde', 'Otilde', 'OE', 'oe', 'endash', 'emdash', 'quotedblleft',
+    'quotedblright', 'quoteleft', 'quoteright', 'divide', 'lozenge', 'ydieresis', 'Ydieresis', 'fraction',
+    'currency', 'guilsinglleft', 'guilsinglright', 'fi', 'fl', 'daggerdbl', 'periodcentered', 'quotesinglbase',
+    'quotedblbase', 'perthousand', 'Acircumflex', 'Ecircumflex', 'Aacute', 'Edieresis', 'Egrave', 'Iacute',
+    'Icircumflex', 'Idieresis', 'Igrave', 'Oacute', 'Ocircumflex', 'apple', 'Ograve', 'Uacute', 'Ucircumflex',
+    'Ugrave', 'dotlessi', 'circumflex', 'tilde', 'macron', 'breve', 'dotaccent', 'ring', 'cedilla', 'hungarumlaut',
+    'ogonek', 'caron', 'Lslash', 'lslash', 'Scaron', 'scaron', 'Zcaron', 'zcaron', 'brokenbar', 'Eth', 'eth',
+    'Yacute', 'yacute', 'Thorn', 'thorn', 'minus', 'multiply', 'onesuperior', 'twosuperior', 'threesuperior',
+    'onehalf', 'onequarter', 'threequarters', 'franc', 'Gbreve', 'gbreve', 'Idotaccent', 'Scedilla', 'scedilla',
+    'Cacute', 'cacute', 'Ccaron', 'ccaron', 'dcroat'];
+
+/**
+ * This is the encoding used for fonts created from scratch.
+ * It loops through all glyphs and finds the appropriate unicode value.
+ * Since it's linear time, other encodings will be faster.
+ * @exports opentype.DefaultEncoding
+ * @class
+ * @constructor
+ * @param {opentype.Font}
+ */
+function DefaultEncoding(font) {
+    this.font = font;
+}
+
+DefaultEncoding.prototype.charToGlyphIndex = function(c) {
+    var code = c.charCodeAt(0);
+    var glyphs = this.font.glyphs;
+    if (glyphs) {
+        for (var i = 0; i < glyphs.length; i += 1) {
+            var glyph = glyphs.get(i);
+            for (var j = 0; j < glyph.unicodes.length; j += 1) {
+                if (glyph.unicodes[j] === code) {
+                    return i;
+                }
+            }
+        }
+    } else {
+        return null;
+    }
+};
+
+/**
+ * @exports opentype.CmapEncoding
+ * @class
+ * @constructor
+ * @param {Object} cmap - a object with the cmap encoded data
+ */
+function CmapEncoding(cmap) {
+    this.cmap = cmap;
+}
+
+/**
+ * @param  {string} c - the character
+ * @return {number} The glyph index.
+ */
+CmapEncoding.prototype.charToGlyphIndex = function(c) {
+    return this.cmap.glyphIndexMap[c.charCodeAt(0)] || 0;
+};
+
+/**
+ * @exports opentype.CffEncoding
+ * @class
+ * @constructor
+ * @param {string} encoding - The encoding
+ * @param {Array} charset - The charcater set.
+ */
+function CffEncoding(encoding, charset) {
+    this.encoding = encoding;
+    this.charset = charset;
+}
+
+/**
+ * @param  {string} s - The character
+ * @return {number} The index.
+ */
+CffEncoding.prototype.charToGlyphIndex = function(s) {
+    var code = s.charCodeAt(0);
+    var charName = this.encoding[code];
+    return this.charset.indexOf(charName);
+};
+
+/**
+ * @exports opentype.GlyphNames
+ * @class
+ * @constructor
+ * @param {Object} post
+ */
+function GlyphNames(post) {
+    var i;
+    switch (post.version) {
+        case 1:
+            this.names = exports.standardNames.slice();
+            break;
+        case 2:
+            this.names = new Array(post.numberOfGlyphs);
+            for (i = 0; i < post.numberOfGlyphs; i++) {
+                if (post.glyphNameIndex[i] < exports.standardNames.length) {
+                    this.names[i] = exports.standardNames[post.glyphNameIndex[i]];
+                } else {
+                    this.names[i] = post.names[post.glyphNameIndex[i] - exports.standardNames.length];
+                }
+            }
+
+            break;
+        case 2.5:
+            this.names = new Array(post.numberOfGlyphs);
+            for (i = 0; i < post.numberOfGlyphs; i++) {
+                this.names[i] = exports.standardNames[i + post.glyphNameIndex[i]];
+            }
+
+            break;
+        case 3:
+            this.names = [];
+            break;
+    }
+}
+
+/**
+ * Gets the index of a glyph by name.
+ * @param  {string} name - The glyph name
+ * @return {number} The index
+ */
+GlyphNames.prototype.nameToGlyphIndex = function(name) {
+    return this.names.indexOf(name);
+};
+
+/**
+ * @param  {number} gid
+ * @return {string}
+ */
+GlyphNames.prototype.glyphIndexToName = function(gid) {
+    return this.names[gid];
+};
+
+/**
+ * @alias opentype.addGlyphNames
+ * @param {opentype.Font}
+ */
+function addGlyphNames(font) {
+    var glyph;
+    var glyphIndexMap = font.tables.cmap.glyphIndexMap;
+    var charCodes = Object.keys(glyphIndexMap);
+
+    for (var i = 0; i < charCodes.length; i += 1) {
+        var c = charCodes[i];
+        var glyphIndex = glyphIndexMap[c];
+        glyph = font.glyphs.get(glyphIndex);
+        glyph.addUnicode(parseInt(c));
+    }
+
+    for (i = 0; i < font.glyphs.length; i += 1) {
+        glyph = font.glyphs.get(i);
+        if (font.cffEncoding) {
+            glyph.name = font.cffEncoding.charset[i];
+        } else if (font.glyphNames.names) {
+            glyph.name = font.glyphNames.glyphIndexToName(i);
+        }
+    }
+}
+
+exports.cffStandardStrings = cffStandardStrings;
+exports.cffStandardEncoding = cffStandardEncoding;
+exports.cffExpertEncoding = cffExpertEncoding;
+exports.standardNames = standardNames;
+exports.DefaultEncoding = DefaultEncoding;
+exports.CmapEncoding = CmapEncoding;
+exports.CffEncoding = CffEncoding;
+exports.GlyphNames = GlyphNames;
+exports.addGlyphNames = addGlyphNames;
+
+},{}],6:[function(require,module,exports){
+// The Font object
+
+
+
+var path = require('./path');
+var sfnt = require('./tables/sfnt');
+var encoding = require('./encoding');
+var glyphset = require('./glyphset');
+var Substitution = require('./substitution');
+var util = require('./util');
 
 /**
  * @typedef FontOptions
@@ -49,10 +1350,7599 @@
  * @property {string=} fsSelection
  */
 
+/**
+ * A Font represents a loaded OpenType font file.
+ * It contains a set of glyphs and methods to draw text on a drawing context,
+ * or to get a path representing the text.
+ * @exports opentype.Font
+ * @class
+ * @param {FontOptions}
+ * @constructor
+ */
+function Font(options) {
+    options = options || {};
+
+    if (!options.empty) {
+        // Check that we've provided the minimum set of names.
+        util.checkArgument(options.familyName, 'When creating a new Font object, familyName is required.');
+        util.checkArgument(options.styleName, 'When creating a new Font object, styleName is required.');
+        util.checkArgument(options.unitsPerEm, 'When creating a new Font object, unitsPerEm is required.');
+        util.checkArgument(options.ascender, 'When creating a new Font object, ascender is required.');
+        util.checkArgument(options.descender, 'When creating a new Font object, descender is required.');
+        util.checkArgument(options.descender < 0, 'Descender should be negative (e.g. -512).');
+
+        // OS X will complain if the names are empty, so we put a single space everywhere by default.
+        this.names = {
+            fontFamily: {en: options.familyName || ' '},
+            fontSubfamily: {en: options.styleName || ' '},
+            fullName: {en: options.fullName || options.familyName + ' ' + options.styleName},
+            postScriptName: {en: options.postScriptName || options.familyName + options.styleName},
+            designer: {en: options.designer || ' '},
+            designerURL: {en: options.designerURL || ' '},
+            manufacturer: {en: options.manufacturer || ' '},
+            manufacturerURL: {en: options.manufacturerURL || ' '},
+            license: {en: options.license || ' '},
+            licenseURL: {en: options.licenseURL || ' '},
+            version: {en: options.version || 'Version 0.1'},
+            description: {en: options.description || ' '},
+            copyright: {en: options.copyright || ' '},
+            trademark: {en: options.trademark || ' '}
+        };
+        this.unitsPerEm = options.unitsPerEm || 1000;
+        this.ascender = options.ascender;
+        this.descender = options.descender;
+        this.createdTimestamp = options.createdTimestamp;
+        this.tables = { os2: {
+            usWeightClass: options.weightClass || this.usWeightClasses.MEDIUM,
+            usWidthClass: options.widthClass || this.usWidthClasses.MEDIUM,
+            fsSelection: options.fsSelection || this.fsSelectionValues.REGULAR
+        } };
+    }
+
+    this.supported = true; // Deprecated: parseBuffer will throw an error if font is not supported.
+    this.glyphs = new glyphset.GlyphSet(this, options.glyphs || []);
+    this.encoding = new encoding.DefaultEncoding(this);
+    this.substitution = new Substitution(this);
+    this.tables = this.tables || {};
+}
+
+/**
+ * Check if the font has a glyph for the given character.
+ * @param  {string}
+ * @return {Boolean}
+ */
+Font.prototype.hasChar = function(c) {
+    return this.encoding.charToGlyphIndex(c) !== null;
+};
+
+/**
+ * Convert the given character to a single glyph index.
+ * Note that this function assumes that there is a one-to-one mapping between
+ * the given character and a glyph; for complex scripts this might not be the case.
+ * @param  {string}
+ * @return {Number}
+ */
+Font.prototype.charToGlyphIndex = function(s) {
+    return this.encoding.charToGlyphIndex(s);
+};
+
+/**
+ * Convert the given character to a single Glyph object.
+ * Note that this function assumes that there is a one-to-one mapping between
+ * the given character and a glyph; for complex scripts this might not be the case.
+ * @param  {string}
+ * @return {opentype.Glyph}
+ */
+Font.prototype.charToGlyph = function(c) {
+    var glyphIndex = this.charToGlyphIndex(c);
+    var glyph = this.glyphs.get(glyphIndex);
+    if (!glyph) {
+        // .notdef
+        glyph = this.glyphs.get(0);
+    }
+
+    return glyph;
+};
+
+/**
+ * Convert the given text to a list of Glyph objects.
+ * Note that there is no strict one-to-one mapping between characters and
+ * glyphs, so the list of returned glyphs can be larger or smaller than the
+ * length of the given string.
+ * @param  {string}
+ * @param  {GlyphRenderOptions} [options]
+ * @return {opentype.Glyph[]}
+ */
+Font.prototype.stringToGlyphs = function(s, options) {
+    options = options || this.defaultRenderOptions;
+    var i;
+    // Get glyph indexes
+    var indexes = [];
+    for (i = 0; i < s.length; i += 1) {
+        var c = s[i];
+        indexes.push(this.charToGlyphIndex(c));
+    }
+    var length = indexes.length;
+
+    // Apply substitutions on glyph indexes
+    if (options.features) {
+        var script = options.script || this.substitution.getDefaultScriptName();
+        var manyToOne = [];
+        if (options.features.liga) manyToOne = manyToOne.concat(this.substitution.getFeature('liga', script, options.language));
+        if (options.features.rlig) manyToOne = manyToOne.concat(this.substitution.getFeature('rlig', script, options.language));
+        for (i = 0; i < length; i += 1) {
+            for (var j = 0; j < manyToOne.length; j++) {
+                var ligature = manyToOne[j];
+                var components = ligature.sub;
+                var compCount = components.length;
+                var k = 0;
+                while (k < compCount && components[k] === indexes[i + k]) k++;
+                if (k === compCount) {
+                    indexes.splice(i, compCount, ligature.by);
+                    length = length - compCount + 1;
+                }
+            }
+        }
+    }
+
+    // convert glyph indexes to glyph objects
+    var glyphs = new Array(length);
+    var notdef = this.glyphs.get(0);
+    for (i = 0; i < length; i += 1) {
+        glyphs[i] = this.glyphs.get(indexes[i]) || notdef;
+    }
+    return glyphs;
+};
+
+/**
+ * @param  {string}
+ * @return {Number}
+ */
+Font.prototype.nameToGlyphIndex = function(name) {
+    return this.glyphNames.nameToGlyphIndex(name);
+};
+
+/**
+ * @param  {string}
+ * @return {opentype.Glyph}
+ */
+Font.prototype.nameToGlyph = function(name) {
+    var glyphIndex = this.nameToGlyphIndex(name);
+    var glyph = this.glyphs.get(glyphIndex);
+    if (!glyph) {
+        // .notdef
+        glyph = this.glyphs.get(0);
+    }
+
+    return glyph;
+};
+
+/**
+ * @param  {Number}
+ * @return {String}
+ */
+Font.prototype.glyphIndexToName = function(gid) {
+    if (!this.glyphNames.glyphIndexToName) {
+        return '';
+    }
+
+    return this.glyphNames.glyphIndexToName(gid);
+};
+
+/**
+ * Retrieve the value of the kerning pair between the left glyph (or its index)
+ * and the right glyph (or its index). If no kerning pair is found, return 0.
+ * The kerning value gets added to the advance width when calculating the spacing
+ * between glyphs.
+ * @param  {opentype.Glyph} leftGlyph
+ * @param  {opentype.Glyph} rightGlyph
+ * @return {Number}
+ */
+Font.prototype.getKerningValue = function(leftGlyph, rightGlyph) {
+    leftGlyph = leftGlyph.index || leftGlyph;
+    rightGlyph = rightGlyph.index || rightGlyph;
+    var gposKerning = this.getGposKerningValue;
+    return gposKerning ? gposKerning(leftGlyph, rightGlyph) :
+        (this.kerningPairs[leftGlyph + ',' + rightGlyph] || 0);
+};
+
+/**
+ * @typedef GlyphRenderOptions
+ * @type Object
+ * @property {string} [script] - script used to determine which features to apply. By default, 'DFLT' or 'latn' is used.
+ *                               See https://www.microsoft.com/typography/otspec/scripttags.htm
+ * @property {string} [language='dflt'] - language system used to determine which features to apply.
+ *                                        See https://www.microsoft.com/typography/developers/opentype/languagetags.aspx
+ * @property {boolean} [kerning=true] - whether to include kerning values
+ * @property {object} [features] - OpenType Layout feature tags. Used to enable or disable the features of the given script/language system.
+ *                                 See https://www.microsoft.com/typography/otspec/featuretags.htm
+ */
+Font.prototype.defaultRenderOptions = {
+    kerning: true,
+    features: {
+        liga: true,
+        rlig: true
+    }
+};
+
+/**
+ * Helper function that invokes the given callback for each glyph in the given text.
+ * The callback gets `(glyph, x, y, fontSize, options)`.* @param  {string} text
+ * @param {string} text - The text to apply.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {GlyphRenderOptions=} options
+ * @param  {Function} callback
+ */
+Font.prototype.forEachGlyph = function(text, x, y, fontSize, options, callback) {
+    x = x !== undefined ? x : 0;
+    y = y !== undefined ? y : 0;
+    fontSize = fontSize !== undefined ? fontSize : 72;
+    options = options || this.defaultRenderOptions;
+    var fontScale = 1 / this.unitsPerEm * fontSize;
+    var glyphs = this.stringToGlyphs(text, options);
+    for (var i = 0; i < glyphs.length; i += 1) {
+        var glyph = glyphs[i];
+        callback(glyph, x, y, fontSize, options);
+        if (glyph.advanceWidth) {
+            x += glyph.advanceWidth * fontScale;
+        }
+
+        if (options.kerning && i < glyphs.length - 1) {
+            var kerningValue = this.getKerningValue(glyph, glyphs[i + 1]);
+            x += kerningValue * fontScale;
+        }
+
+        if (options.letterSpacing) {
+            x += options.letterSpacing * fontSize;
+        } else if (options.tracking) {
+            x += (options.tracking / 1000) * fontSize;
+        }
+    }
+};
+
+/**
+ * Create a Path object that represents the given text.
+ * @param  {string} text - The text to create.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {GlyphRenderOptions=} options
+ * @return {opentype.Path}
+ */
+Font.prototype.getPath = function(text, x, y, fontSize, options) {
+    var fullPath = new path.Path();
+    this.forEachGlyph(text, x, y, fontSize, options, function(glyph, gX, gY, gFontSize) {
+        var glyphPath = glyph.getPath(gX, gY, gFontSize);
+        fullPath.extend(glyphPath);
+    });
+
+    return fullPath;
+};
+
+/**
+ * Create an array of Path objects that represent the glyps of a given text.
+ * @param  {string} text - The text to create.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {GlyphRenderOptions=} options
+ * @return {opentype.Path[]}
+ */
+Font.prototype.getPaths = function(text, x, y, fontSize, options) {
+    var glyphPaths = [];
+    this.forEachGlyph(text, x, y, fontSize, options, function(glyph, gX, gY, gFontSize) {
+        var glyphPath = glyph.getPath(gX, gY, gFontSize);
+        glyphPaths.push(glyphPath);
+    });
+
+    return glyphPaths;
+};
+
+/**
+ * Draw the text on the given drawing context.
+ * @param  {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param  {string} text - The text to create.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {GlyphRenderOptions=} options
+ */
+Font.prototype.draw = function(ctx, text, x, y, fontSize, options) {
+    this.getPath(text, x, y, fontSize, options).draw(ctx);
+};
+
+/**
+ * Draw the points of all glyphs in the text.
+ * On-curve points will be drawn in blue, off-curve points will be drawn in red.
+ * @param {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param {string} text - The text to create.
+ * @param {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param {GlyphRenderOptions=} options
+ */
+Font.prototype.drawPoints = function(ctx, text, x, y, fontSize, options) {
+    this.forEachGlyph(text, x, y, fontSize, options, function(glyph, gX, gY, gFontSize) {
+        glyph.drawPoints(ctx, gX, gY, gFontSize);
+    });
+};
+
+/**
+ * Draw lines indicating important font measurements for all glyphs in the text.
+ * Black lines indicate the origin of the coordinate system (point 0,0).
+ * Blue lines indicate the glyph bounding box.
+ * Green line indicates the advance width of the glyph.
+ * @param {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param {string} text - The text to create.
+ * @param {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param {GlyphRenderOptions=} options
+ */
+Font.prototype.drawMetrics = function(ctx, text, x, y, fontSize, options) {
+    this.forEachGlyph(text, x, y, fontSize, options, function(glyph, gX, gY, gFontSize) {
+        glyph.drawMetrics(ctx, gX, gY, gFontSize);
+    });
+};
+
+/**
+ * @param  {string}
+ * @return {string}
+ */
+Font.prototype.getEnglishName = function(name) {
+    var translations = this.names[name];
+    if (translations) {
+        return translations.en;
+    }
+};
+
+/**
+ * Validate
+ */
+Font.prototype.validate = function() {
+    var warnings = [];
+    var _this = this;
+
+    function assert(predicate, message) {
+        if (!predicate) {
+            warnings.push(message);
+        }
+    }
+
+    function assertNamePresent(name) {
+        var englishName = _this.getEnglishName(name);
+        assert(englishName && englishName.trim().length > 0,
+               'No English ' + name + ' specified.');
+    }
+
+    // Identification information
+    assertNamePresent('fontFamily');
+    assertNamePresent('weightName');
+    assertNamePresent('manufacturer');
+    assertNamePresent('copyright');
+    assertNamePresent('version');
+
+    // Dimension information
+    assert(this.unitsPerEm > 0, 'No unitsPerEm specified.');
+};
+
+/**
+ * Convert the font object to a SFNT data structure.
+ * This structure contains all the necessary tables and metadata to create a binary OTF file.
+ * @return {opentype.Table}
+ */
+Font.prototype.toTables = function() {
+    return sfnt.fontToTable(this);
+};
+/**
+ * @deprecated Font.toBuffer is deprecated. Use Font.toArrayBuffer instead.
+ */
+Font.prototype.toBuffer = function() {
+    console.warn('Font.toBuffer is deprecated. Use Font.toArrayBuffer instead.');
+    return this.toArrayBuffer();
+};
+/**
+ * Converts a `opentype.Font` into an `ArrayBuffer`
+ * @return {ArrayBuffer}
+ */
+Font.prototype.toArrayBuffer = function() {
+    var sfntTable = this.toTables();
+    var bytes = sfntTable.encode();
+    var buffer = new ArrayBuffer(bytes.length);
+    var intArray = new Uint8Array(buffer);
+    for (var i = 0; i < bytes.length; i++) {
+        intArray[i] = bytes[i];
+    }
+
+    return buffer;
+};
+
+/**
+ * Initiate a download of the OpenType font.
+ */
+Font.prototype.download = function(fileName) {
+    var familyName = this.getEnglishName('fontFamily');
+    var styleName = this.getEnglishName('fontSubfamily');
+    fileName = fileName || familyName.replace(/\s/g, '') + '-' + styleName + '.otf';
+    var arrayBuffer = this.toArrayBuffer();
+
+    if (util.isBrowser()) {
+        window.requestFileSystem = window.requestFileSystem || window.webkitRequestFileSystem;
+        window.requestFileSystem(window.TEMPORARY, arrayBuffer.byteLength, function(fs) {
+            fs.root.getFile(fileName, {create: true}, function(fileEntry) {
+                fileEntry.createWriter(function(writer) {
+                    var dataView = new DataView(arrayBuffer);
+                    var blob = new Blob([dataView], {type: 'font/opentype'});
+                    writer.write(blob);
+
+                    writer.addEventListener('writeend', function() {
+                        // Navigating to the file will download it.
+                        location.href = fileEntry.toURL();
+                    }, false);
+                });
+            });
+        },
+        function(err) {
+            throw new Error(err.name + ': ' + err.message);
+        });
+    } else {
+        var fs = require('fs');
+        var buffer = util.arrayBufferToNodeBuffer(arrayBuffer);
+        fs.writeFileSync(fileName, buffer);
+    }
+};
+/**
+ * @private
+ */
+Font.prototype.fsSelectionValues = {
+    ITALIC:              0x001, //1
+    UNDERSCORE:          0x002, //2
+    NEGATIVE:            0x004, //4
+    OUTLINED:            0x008, //8
+    STRIKEOUT:           0x010, //16
+    BOLD:                0x020, //32
+    REGULAR:             0x040, //64
+    USER_TYPO_METRICS:   0x080, //128
+    WWS:                 0x100, //256
+    OBLIQUE:             0x200  //512
+};
+
+/**
+ * @private
+ */
+Font.prototype.usWidthClasses = {
+    ULTRA_CONDENSED: 1,
+    EXTRA_CONDENSED: 2,
+    CONDENSED: 3,
+    SEMI_CONDENSED: 4,
+    MEDIUM: 5,
+    SEMI_EXPANDED: 6,
+    EXPANDED: 7,
+    EXTRA_EXPANDED: 8,
+    ULTRA_EXPANDED: 9
+};
+
+/**
+ * @private
+ */
+Font.prototype.usWeightClasses = {
+    THIN: 100,
+    EXTRA_LIGHT: 200,
+    LIGHT: 300,
+    NORMAL: 400,
+    MEDIUM: 500,
+    SEMI_BOLD: 600,
+    BOLD: 700,
+    EXTRA_BOLD: 800,
+    BLACK:    900
+};
+
+exports.Font = Font;
+
+},{"./encoding":5,"./glyphset":8,"./path":12,"./substitution":13,"./tables/sfnt":32,"./util":34,"fs":undefined}],7:[function(require,module,exports){
+// The Glyph object
+
+
+
+var check = require('./check');
+var draw = require('./draw');
+var path = require('./path');
+
+function getPathDefinition(glyph, path) {
+    var _path = path || { commands: [] };
+    return {
+        configurable: true,
+
+        get: function() {
+            if (typeof _path === 'function') {
+                _path = _path();
+            }
+
+            return _path;
+        },
+
+        set: function(p) {
+            _path = p;
+        }
+    };
+}
+/**
+ * @typedef GlyphOptions
+ * @type Object
+ * @property {string} [name] - The glyph name
+ * @property {number} [unicode]
+ * @property {Array} [unicodes]
+ * @property {number} [xMin]
+ * @property {number} [yMin]
+ * @property {number} [xMax]
+ * @property {number} [yMax]
+ * @property {number} [advanceWidth]
+ */
+
+// A Glyph is an individual mark that often corresponds to a character.
+// Some glyphs, such as ligatures, are a combination of many characters.
+// Glyphs are the basic building blocks of a font.
+//
+// The `Glyph` class contains utility methods for drawing the path and its points.
+/**
+ * @exports opentype.Glyph
+ * @class
+ * @param {GlyphOptions}
+ * @constructor
+ */
+function Glyph(options) {
+    // By putting all the code on a prototype function (which is only declared once)
+    // we reduce the memory requirements for larger fonts by some 2%
+    this.bindConstructorValues(options);
+}
+
+/**
+ * @param  {GlyphOptions}
+ */
+Glyph.prototype.bindConstructorValues = function(options) {
+    this.index = options.index || 0;
+
+    // These three values cannnot be deferred for memory optimization:
+    this.name = options.name || null;
+    this.unicode = options.unicode || undefined;
+    this.unicodes = options.unicodes || options.unicode !== undefined ? [options.unicode] : [];
+
+    // But by binding these values only when necessary, we reduce can
+    // the memory requirements by almost 3% for larger fonts.
+    if (options.xMin) {
+        this.xMin = options.xMin;
+    }
+
+    if (options.yMin) {
+        this.yMin = options.yMin;
+    }
+
+    if (options.xMax) {
+        this.xMax = options.xMax;
+    }
+
+    if (options.yMax) {
+        this.yMax = options.yMax;
+    }
+
+    if (options.advanceWidth) {
+        this.advanceWidth = options.advanceWidth;
+    }
+
+    // The path for a glyph is the most memory intensive, and is bound as a value
+    // with a getter/setter to ensure we actually do path parsing only once the
+    // path is actually needed by anything.
+    Object.defineProperty(this, 'path', getPathDefinition(this, options.path));
+};
+
+/**
+ * @param {number}
+ */
+Glyph.prototype.addUnicode = function(unicode) {
+    if (this.unicodes.length === 0) {
+        this.unicode = unicode;
+    }
+
+    this.unicodes.push(unicode);
+};
+
+/**
+ * Calculate the minimum bounding box for this glyph.
+ * @return {opentype.BoundingBox}
+ */
+Glyph.prototype.getBoundingBox = function() {
+    return this.path.getBoundingBox();
+};
+
+/**
+ * Convert the glyph to a Path we can draw on a drawing context.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {Object=} options - xScale, yScale to strech the glyph.
+ * @return {opentype.Path}
+ */
+Glyph.prototype.getPath = function(x, y, fontSize, options) {
+    x = x !== undefined ? x : 0;
+    y = y !== undefined ? y : 0;
+    options = options !== undefined ? options : {xScale: 1.0, yScale: 1.0};
+    fontSize = fontSize !== undefined ? fontSize : 72;
+    var scale = 1 / this.path.unitsPerEm * fontSize;
+    var xScale = options.xScale * scale;
+    var yScale = options.yScale * scale;
+
+    var p = new path.Path();
+    var commands = this.path.commands;
+    for (var i = 0; i < commands.length; i += 1) {
+        var cmd = commands[i];
+        if (cmd.type === 'M') {
+            p.moveTo(x + (cmd.x * xScale), y + (-cmd.y * yScale));
+        } else if (cmd.type === 'L') {
+            p.lineTo(x + (cmd.x * xScale), y + (-cmd.y * yScale));
+        } else if (cmd.type === 'Q') {
+            p.quadraticCurveTo(x + (cmd.x1 * xScale), y + (-cmd.y1 * yScale),
+                               x + (cmd.x * xScale), y + (-cmd.y * yScale));
+        } else if (cmd.type === 'C') {
+            p.curveTo(x + (cmd.x1 * xScale), y + (-cmd.y1 * yScale),
+                      x + (cmd.x2 * xScale), y + (-cmd.y2 * yScale),
+                      x + (cmd.x * xScale), y + (-cmd.y * yScale));
+        } else if (cmd.type === 'Z') {
+            p.closePath();
+        }
+    }
+
+    return p;
+};
+
+/**
+ * Split the glyph into contours.
+ * This function is here for backwards compatibility, and to
+ * provide raw access to the TrueType glyph outlines.
+ * @return {Array}
+ */
+Glyph.prototype.getContours = function() {
+    if (this.points === undefined) {
+        return [];
+    }
+
+    var contours = [];
+    var currentContour = [];
+    for (var i = 0; i < this.points.length; i += 1) {
+        var pt = this.points[i];
+        currentContour.push(pt);
+        if (pt.lastPointOfContour) {
+            contours.push(currentContour);
+            currentContour = [];
+        }
+    }
+
+    check.argument(currentContour.length === 0, 'There are still points left in the current contour.');
+    return contours;
+};
+
+/**
+ * Calculate the xMin/yMin/xMax/yMax/lsb/rsb for a Glyph.
+ * @return {Object}
+ */
+Glyph.prototype.getMetrics = function() {
+    var commands = this.path.commands;
+    var xCoords = [];
+    var yCoords = [];
+    for (var i = 0; i < commands.length; i += 1) {
+        var cmd = commands[i];
+        if (cmd.type !== 'Z') {
+            xCoords.push(cmd.x);
+            yCoords.push(cmd.y);
+        }
+
+        if (cmd.type === 'Q' || cmd.type === 'C') {
+            xCoords.push(cmd.x1);
+            yCoords.push(cmd.y1);
+        }
+
+        if (cmd.type === 'C') {
+            xCoords.push(cmd.x2);
+            yCoords.push(cmd.y2);
+        }
+    }
+
+    var metrics = {
+        xMin: Math.min.apply(null, xCoords),
+        yMin: Math.min.apply(null, yCoords),
+        xMax: Math.max.apply(null, xCoords),
+        yMax: Math.max.apply(null, yCoords),
+        leftSideBearing: this.leftSideBearing
+    };
+
+    if (!isFinite(metrics.xMin)) {
+        metrics.xMin = 0;
+    }
+
+    if (!isFinite(metrics.xMax)) {
+        metrics.xMax = this.advanceWidth;
+    }
+
+    if (!isFinite(metrics.yMin)) {
+        metrics.yMin = 0;
+    }
+
+    if (!isFinite(metrics.yMax)) {
+        metrics.yMax = 0;
+    }
+
+    metrics.rightSideBearing = this.advanceWidth - metrics.leftSideBearing - (metrics.xMax - metrics.xMin);
+    return metrics;
+};
+
+/**
+ * Draw the glyph on the given context.
+ * @param  {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ * @param  {Object=} options - xScale, yScale to strech the glyph.
+ */
+Glyph.prototype.draw = function(ctx, x, y, fontSize, options) {
+    this.getPath(x, y, fontSize, options).draw(ctx);
+};
+
+/**
+ * Draw the points of the glyph.
+ * On-curve points will be drawn in blue, off-curve points will be drawn in red.
+ * @param  {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ */
+Glyph.prototype.drawPoints = function(ctx, x, y, fontSize) {
+
+    function drawCircles(l, x, y, scale) {
+        var PI_SQ = Math.PI * 2;
+        ctx.beginPath();
+        for (var j = 0; j < l.length; j += 1) {
+            ctx.moveTo(x + (l[j].x * scale), y + (l[j].y * scale));
+            ctx.arc(x + (l[j].x * scale), y + (l[j].y * scale), 2, 0, PI_SQ, false);
+        }
+
+        ctx.closePath();
+        ctx.fill();
+    }
+
+    x = x !== undefined ? x : 0;
+    y = y !== undefined ? y : 0;
+    fontSize = fontSize !== undefined ? fontSize : 24;
+    var scale = 1 / this.path.unitsPerEm * fontSize;
+
+    var blueCircles = [];
+    var redCircles = [];
+    var path = this.path;
+    for (var i = 0; i < path.commands.length; i += 1) {
+        var cmd = path.commands[i];
+        if (cmd.x !== undefined) {
+            blueCircles.push({x: cmd.x, y: -cmd.y});
+        }
+
+        if (cmd.x1 !== undefined) {
+            redCircles.push({x: cmd.x1, y: -cmd.y1});
+        }
+
+        if (cmd.x2 !== undefined) {
+            redCircles.push({x: cmd.x2, y: -cmd.y2});
+        }
+    }
+
+    ctx.fillStyle = 'blue';
+    drawCircles(blueCircles, x, y, scale);
+    ctx.fillStyle = 'red';
+    drawCircles(redCircles, x, y, scale);
+};
+
+/**
+ * Draw lines indicating important font measurements.
+ * Black lines indicate the origin of the coordinate system (point 0,0).
+ * Blue lines indicate the glyph bounding box.
+ * Green line indicates the advance width of the glyph.
+ * @param  {CanvasRenderingContext2D} ctx - A 2D drawing context, like Canvas.
+ * @param  {number} [x=0] - Horizontal position of the beginning of the text.
+ * @param  {number} [y=0] - Vertical position of the *baseline* of the text.
+ * @param  {number} [fontSize=72] - Font size in pixels. We scale the glyph units by `1 / unitsPerEm * fontSize`.
+ */
+Glyph.prototype.drawMetrics = function(ctx, x, y, fontSize) {
+    var scale;
+    x = x !== undefined ? x : 0;
+    y = y !== undefined ? y : 0;
+    fontSize = fontSize !== undefined ? fontSize : 24;
+    scale = 1 / this.path.unitsPerEm * fontSize;
+    ctx.lineWidth = 1;
+
+    // Draw the origin
+    ctx.strokeStyle = 'black';
+    draw.line(ctx, x, -10000, x, 10000);
+    draw.line(ctx, -10000, y, 10000, y);
+
+    // This code is here due to memory optimization: by not using
+    // defaults in the constructor, we save a notable amount of memory.
+    var xMin = this.xMin || 0;
+    var yMin = this.yMin || 0;
+    var xMax = this.xMax || 0;
+    var yMax = this.yMax || 0;
+    var advanceWidth = this.advanceWidth || 0;
+
+    // Draw the glyph box
+    ctx.strokeStyle = 'blue';
+    draw.line(ctx, x + (xMin * scale), -10000, x + (xMin * scale), 10000);
+    draw.line(ctx, x + (xMax * scale), -10000, x + (xMax * scale), 10000);
+    draw.line(ctx, -10000, y + (-yMin * scale), 10000, y + (-yMin * scale));
+    draw.line(ctx, -10000, y + (-yMax * scale), 10000, y + (-yMax * scale));
+
+    // Draw the advance width
+    ctx.strokeStyle = 'green';
+    draw.line(ctx, x + (advanceWidth * scale), -10000, x + (advanceWidth * scale), 10000);
+};
+
+exports.Glyph = Glyph;
+
+},{"./check":3,"./draw":4,"./path":12}],8:[function(require,module,exports){
+// The GlyphSet object
+
+
+
+var _glyph = require('./glyph');
+
+// Define a property on the glyph that depends on the path being loaded.
+function defineDependentProperty(glyph, externalName, internalName) {
+    Object.defineProperty(glyph, externalName, {
+        get: function() {
+            // Request the path property to make sure the path is loaded.
+            glyph.path; // jshint ignore:line
+            return glyph[internalName];
+        },
+        set: function(newValue) {
+            glyph[internalName] = newValue;
+        },
+        enumerable: true,
+        configurable: true
+    });
+}
+
+/**
+ * A GlyphSet represents all glyphs available in the font, but modelled using
+ * a deferred glyph loader, for retrieving glyphs only once they are absolutely
+ * necessary, to keep the memory footprint down.
+ * @exports opentype.GlyphSet
+ * @class
+ * @param {opentype.Font}
+ * @param {Array}
+ */
+function GlyphSet(font, glyphs) {
+    this.font = font;
+    this.glyphs = {};
+    if (Array.isArray(glyphs)) {
+        for (var i = 0; i < glyphs.length; i++) {
+            this.glyphs[i] = glyphs[i];
+        }
+    }
+
+    this.length = (glyphs && glyphs.length) || 0;
+}
+
+/**
+ * @param  {number} index
+ * @return {opentype.Glyph}
+ */
+GlyphSet.prototype.get = function(index) {
+    if (typeof this.glyphs[index] === 'function') {
+        this.glyphs[index] = this.glyphs[index]();
+    }
+
+    return this.glyphs[index];
+};
+
+/**
+ * @param  {number} index
+ * @param  {Object}
+ */
+GlyphSet.prototype.push = function(index, loader) {
+    this.glyphs[index] = loader;
+    this.length++;
+};
+
+/**
+ * @alias opentype.glyphLoader
+ * @param  {opentype.Font} font
+ * @param  {number} index
+ * @return {opentype.Glyph}
+ */
+function glyphLoader(font, index) {
+    return new _glyph.Glyph({index: index, font: font});
+}
+
+/**
+ * Generate a stub glyph that can be filled with all metadata *except*
+ * the "points" and "path" properties, which must be loaded only once
+ * the glyph's path is actually requested for text shaping.
+ * @alias opentype.ttfGlyphLoader
+ * @param  {opentype.Font} font
+ * @param  {number} index
+ * @param  {Function} parseGlyph
+ * @param  {Object} data
+ * @param  {number} position
+ * @param  {Function} buildPath
+ * @return {opentype.Glyph}
+ */
+function ttfGlyphLoader(font, index, parseGlyph, data, position, buildPath) {
+    return function() {
+        var glyph = new _glyph.Glyph({index: index, font: font});
+
+        glyph.path = function() {
+            parseGlyph(glyph, data, position);
+            var path = buildPath(font.glyphs, glyph);
+            path.unitsPerEm = font.unitsPerEm;
+            return path;
+        };
+
+        defineDependentProperty(glyph, 'xMin', '_xMin');
+        defineDependentProperty(glyph, 'xMax', '_xMax');
+        defineDependentProperty(glyph, 'yMin', '_yMin');
+        defineDependentProperty(glyph, 'yMax', '_yMax');
+
+        return glyph;
+    };
+}
+/**
+ * @alias opentype.cffGlyphLoader
+ * @param  {opentype.Font} font
+ * @param  {number} index
+ * @param  {Function} parseCFFCharstring
+ * @param  {string} charstring
+ * @return {opentype.Glyph}
+ */
+function cffGlyphLoader(font, index, parseCFFCharstring, charstring) {
+    return function() {
+        var glyph = new _glyph.Glyph({index: index, font: font});
+
+        glyph.path = function() {
+            var path = parseCFFCharstring(font, glyph, charstring);
+            path.unitsPerEm = font.unitsPerEm;
+            return path;
+        };
+
+        return glyph;
+    };
+}
+
+exports.GlyphSet = GlyphSet;
+exports.glyphLoader = glyphLoader;
+exports.ttfGlyphLoader = ttfGlyphLoader;
+exports.cffGlyphLoader = cffGlyphLoader;
+
+},{"./glyph":7}],9:[function(require,module,exports){
+// The Layout object is the prototype of Substition objects, and provides utility methods to manipulate
+// common layout tables (GPOS, GSUB, GDEF...)
+
+
+
+var check = require('./check');
+
+function searchTag(arr, tag) {
+    /* jshint bitwise: false */
+    var imin = 0;
+    var imax = arr.length - 1;
+    while (imin <= imax) {
+        var imid = (imin + imax) >>> 1;
+        var val = arr[imid].tag;
+        if (val === tag) {
+            return imid;
+        } else if (val < tag) {
+            imin = imid + 1;
+        } else { imax = imid - 1; }
+    }
+    // Not found: return -1-insertion point
+    return -imin - 1;
+}
+
+function binSearch(arr, value) {
+    /* jshint bitwise: false */
+    var imin = 0;
+    var imax = arr.length - 1;
+    while (imin <= imax) {
+        var imid = (imin + imax) >>> 1;
+        var val = arr[imid];
+        if (val === value) {
+            return imid;
+        } else if (val < value) {
+            imin = imid + 1;
+        } else { imax = imid - 1; }
+    }
+    // Not found: return -1-insertion point
+    return -imin - 1;
+}
+
+/**
+ * @exports opentype.Layout
+ * @class
+ */
+function Layout(font, tableName) {
+    this.font = font;
+    this.tableName = tableName;
+}
+
+Layout.prototype = {
+
+    /**
+     * Binary search an object by "tag" property
+     * @instance
+     * @function searchTag
+     * @memberof opentype.Layout
+     * @param  {Array} arr
+     * @param  {string} tag
+     * @return {number}
+     */
+    searchTag: searchTag,
+
+    /**
+     * Binary search in a list of numbers
+     * @instance
+     * @function binSearch
+     * @memberof opentype.Layout
+     * @param  {Array} arr
+     * @param  {number} value
+     * @return {number}
+     */
+    binSearch: binSearch,
+
+    /**
+     * Get or create the Layout table (GSUB, GPOS etc).
+     * @param  {boolean} create - Whether to create a new one.
+     * @return {Object} The GSUB or GPOS table.
+     */
+    getTable: function(create) {
+        var layout = this.font.tables[this.tableName];
+        if (!layout && create) {
+            layout = this.font.tables[this.tableName] = this.createDefaultTable();
+        }
+        return layout;
+    },
+
+    /**
+     * Returns all scripts in the substitution table.
+     * @instance
+     * @return {Array}
+     */
+    getScriptNames: function() {
+        var layout = this.getTable();
+        if (!layout) { return []; }
+        return layout.scripts.map(function(script) {
+            return script.tag;
+        });
+    },
+
+    /**
+     * Returns the best bet for a script name.
+     * Returns 'DFLT' if it exists.
+     * If not, returns 'latn' if it exists.
+     * If neither exist, returns undefined.
+     */
+    getDefaultScriptName: function() {
+        var layout = this.getTable();
+        if (!layout) { return; }
+        var hasLatn = false;
+        for (var i = 0; i < layout.scripts.length; i++) {
+            var name = layout.scripts[i].tag;
+            if (name === 'DFLT') return name;
+            if (name === 'latn') hasLatn = true;
+        }
+        if (hasLatn) return 'latn';
+    },
+
+    /**
+     * Returns all LangSysRecords in the given script.
+     * @instance
+     * @param {string} [script='DFLT']
+     * @param {boolean} create - forces the creation of this script table if it doesn't exist.
+     * @return {Object} An object with tag and script properties.
+     */
+    getScriptTable: function(script, create) {
+        var layout = this.getTable(create);
+        if (layout) {
+            script = script || 'DFLT';
+            var scripts = layout.scripts;
+            var pos = searchTag(layout.scripts, script);
+            if (pos >= 0) {
+                return scripts[pos].script;
+            } else if (create) {
+                var scr = {
+                    tag: script,
+                    script: {
+                        defaultLangSys: { reserved: 0, reqFeatureIndex: 0xffff, featureIndexes: [] },
+                        langSysRecords: []
+                    }
+                };
+                scripts.splice(-1 - pos, 0, scr);
+                return scr.script;
+            }
+        }
+    },
+
+    /**
+     * Returns a language system table
+     * @instance
+     * @param {string} [script='DFLT']
+     * @param {string} [language='dlft']
+     * @param {boolean} create - forces the creation of this langSysTable if it doesn't exist.
+     * @return {Object}
+     */
+    getLangSysTable: function(script, language, create) {
+        var scriptTable = this.getScriptTable(script, create);
+        if (scriptTable) {
+            if (!language || language === 'dflt' || language === 'DFLT') {
+                return scriptTable.defaultLangSys;
+            }
+            var pos = searchTag(scriptTable.langSysRecords, language);
+            if (pos >= 0) {
+                return scriptTable.langSysRecords[pos].langSys;
+            } else if (create) {
+                var langSysRecord = {
+                    tag: language,
+                    langSys: { reserved: 0, reqFeatureIndex: 0xffff, featureIndexes: [] }
+                };
+                scriptTable.langSysRecords.splice(-1 - pos, 0, langSysRecord);
+                return langSysRecord.langSys;
+            }
+        }
+    },
+
+    /**
+     * Get a specific feature table.
+     * @instance
+     * @param {string} [script='DFLT']
+     * @param {string} [language='dlft']
+     * @param {string} feature - One of the codes listed at https://www.microsoft.com/typography/OTSPEC/featurelist.htm
+     * @param {boolean} create - forces the creation of the feature table if it doesn't exist.
+     * @return {Object}
+     */
+    getFeatureTable: function(script, language, feature, create) {
+        var langSysTable = this.getLangSysTable(script, language, create);
+        if (langSysTable) {
+            var featureRecord;
+            var featIndexes = langSysTable.featureIndexes;
+            var allFeatures = this.font.tables[this.tableName].features;
+            // The FeatureIndex array of indices is in arbitrary order,
+            // even if allFeatures is sorted alphabetically by feature tag.
+            for (var i = 0; i < featIndexes.length; i++) {
+                featureRecord = allFeatures[featIndexes[i]];
+                if (featureRecord.tag === feature) {
+                    return featureRecord.feature;
+                }
+            }
+            if (create) {
+                var index = allFeatures.length;
+                // Automatic ordering of features would require to shift feature indexes in the script list.
+                check.assert(index === 0 || feature >= allFeatures[index - 1].tag, 'Features must be added in alphabetical order.');
+                featureRecord = {
+                    tag: feature,
+                    feature: { params: 0, lookupListIndexes: [] }
+                };
+                allFeatures.push(featureRecord);
+                featIndexes.push(index);
+                return featureRecord.feature;
+            }
+        }
+    },
+
+    /**
+     * Get the lookup tables of a given type for a script/language/feature.
+     * @instance
+     * @param {string} [script='DFLT']
+     * @param {string} [language='dlft']
+     * @param {string} feature - 4-letter feature code
+     * @param {number} lookupType - 1 to 8
+     * @param {boolean} create - forces the creation of the lookup table if it doesn't exist, with no subtables.
+     * @return {Object[]}
+     */
+    getLookupTables: function(script, language, feature, lookupType, create) {
+        var featureTable = this.getFeatureTable(script, language, feature, create);
+        var tables = [];
+        if (featureTable) {
+            var lookupTable;
+            var lookupListIndexes = featureTable.lookupListIndexes;
+            var allLookups = this.font.tables[this.tableName].lookups;
+            // lookupListIndexes are in no particular order, so use naïve search.
+            for (var i = 0; i < lookupListIndexes.length; i++) {
+                lookupTable = allLookups[lookupListIndexes[i]];
+                if (lookupTable.lookupType === lookupType) {
+                    tables.push(lookupTable);
+                }
+            }
+            if (tables.length === 0 && create) {
+                lookupTable = {
+                    lookupType: lookupType,
+                    lookupFlag: 0,
+                    subtables: [],
+                    markFilteringSet: undefined
+                };
+                var index = allLookups.length;
+                allLookups.push(lookupTable);
+                lookupListIndexes.push(index);
+                return [lookupTable];
+            }
+        }
+        return tables;
+    },
+
+    /**
+     * Returns the list of glyph indexes of a coverage table.
+     * Format 1: the list is stored raw
+     * Format 2: compact list as range records.
+     * @instance
+     * @param  {Object} coverageTable
+     * @return {Array}
+     */
+    expandCoverage: function(coverageTable) {
+        if (coverageTable.format === 1) {
+            return coverageTable.glyphs;
+        } else {
+            var glyphs = [];
+            var ranges = coverageTable.ranges;
+            for (var i = 0; i < ranges; i++) {
+                var range = ranges[i];
+                var start = range.start;
+                var end = range.end;
+                for (var j = start; j <= end; j++) {
+                    glyphs.push(j);
+                }
+            }
+            return glyphs;
+        }
+    }
+
+};
+
+module.exports = Layout;
+
+},{"./check":3}],10:[function(require,module,exports){
 // opentype.js
 // https://github.com/nodebox/opentype.js
 // (c) 2015 Frederik De Bleser
 // opentype.js may be freely distributed under the MIT license.
+
+/* global DataView, Uint8Array, XMLHttpRequest  */
+
+
+
+var inflate = require('tiny-inflate');
+
+var encoding = require('./encoding');
+var _font = require('./font');
+var glyph = require('./glyph');
+var parse = require('./parse');
+var bbox = require('./bbox');
+var path = require('./path');
+var util = require('./util');
+
+var cmap = require('./tables/cmap');
+var cff = require('./tables/cff');
+var fvar = require('./tables/fvar');
+var glyf = require('./tables/glyf');
+var gpos = require('./tables/gpos');
+var gsub = require('./tables/gsub');
+var head = require('./tables/head');
+var hhea = require('./tables/hhea');
+var hmtx = require('./tables/hmtx');
+var kern = require('./tables/kern');
+var ltag = require('./tables/ltag');
+var loca = require('./tables/loca');
+var maxp = require('./tables/maxp');
+var _name = require('./tables/name');
+var os2 = require('./tables/os2');
+var post = require('./tables/post');
+var meta = require('./tables/meta');
+
+/**
+ * The opentype library.
+ * @namespace opentype
+ */
+
+// File loaders /////////////////////////////////////////////////////////
+/**
+ * Loads a font from a file. The callback throws an error message as the first parameter if it fails
+ * and the font as an ArrayBuffer in the second parameter if it succeeds.
+ * @param  {string} path - The path of the file
+ * @param  {Function} callback - The function to call when the font load completes
+ */
+function loadFromFile(path, callback) {
+    var fs = require('fs');
+    fs.readFile(path, function(err, buffer) {
+        if (err) {
+            return callback(err.message);
+        }
+
+        callback(null, util.nodeBufferToArrayBuffer(buffer));
+    });
+}
+/**
+ * Loads a font from a URL. The callback throws an error message as the first parameter if it fails
+ * and the font as an ArrayBuffer in the second parameter if it succeeds.
+ * @param  {string} url - The URL of the font file.
+ * @param  {Function} callback - The function to call when the font load completes
+ */
+function loadFromUrl(url, callback) {
+    var request = new XMLHttpRequest();
+    request.open('get', url, true);
+    request.responseType = 'arraybuffer';
+    request.onload = function() {
+        if (request.status !== 200) {
+            return callback('Font could not be loaded: ' + request.statusText);
+        }
+
+        return callback(null, request.response);
+    };
+
+    request.send();
+}
+
+// Table Directory Entries //////////////////////////////////////////////
+/**
+ * Parses OpenType table entries.
+ * @param  {DataView}
+ * @param  {Number}
+ * @return {Object[]}
+ */
+function parseOpenTypeTableEntries(data, numTables) {
+    var tableEntries = [];
+    var p = 12;
+    for (var i = 0; i < numTables; i += 1) {
+        var tag = parse.getTag(data, p);
+        var checksum = parse.getULong(data, p + 4);
+        var offset = parse.getULong(data, p + 8);
+        var length = parse.getULong(data, p + 12);
+        tableEntries.push({tag: tag, checksum: checksum, offset: offset, length: length, compression: false});
+        p += 16;
+    }
+
+    return tableEntries;
+}
+
+/**
+ * Parses WOFF table entries.
+ * @param  {DataView}
+ * @param  {Number}
+ * @return {Object[]}
+ */
+function parseWOFFTableEntries(data, numTables) {
+    var tableEntries = [];
+    var p = 44; // offset to the first table directory entry.
+    for (var i = 0; i < numTables; i += 1) {
+        var tag = parse.getTag(data, p);
+        var offset = parse.getULong(data, p + 4);
+        var compLength = parse.getULong(data, p + 8);
+        var origLength = parse.getULong(data, p + 12);
+        var compression;
+        if (compLength < origLength) {
+            compression = 'WOFF';
+        } else {
+            compression = false;
+        }
+
+        tableEntries.push({tag: tag, offset: offset, compression: compression,
+            compressedLength: compLength, originalLength: origLength});
+        p += 20;
+    }
+
+    return tableEntries;
+}
+
+/**
+ * @typedef TableData
+ * @type Object
+ * @property {DataView} data - The DataView
+ * @property {number} offset - The data offset.
+ */
+
+/**
+ * @param  {DataView}
+ * @param  {Object}
+ * @return {TableData}
+ */
+function uncompressTable(data, tableEntry) {
+    if (tableEntry.compression === 'WOFF') {
+        var inBuffer = new Uint8Array(data.buffer, tableEntry.offset + 2, tableEntry.compressedLength - 2);
+        var outBuffer = new Uint8Array(tableEntry.originalLength);
+        inflate(inBuffer, outBuffer);
+        if (outBuffer.byteLength !== tableEntry.originalLength) {
+            throw new Error('Decompression error: ' + tableEntry.tag + ' decompressed length doesn\'t match recorded length');
+        }
+
+        var view = new DataView(outBuffer.buffer, 0);
+        return {data: view, offset: 0};
+    } else {
+        return {data: data, offset: tableEntry.offset};
+    }
+}
+
+// Public API ///////////////////////////////////////////////////////////
+
+/**
+ * Parse the OpenType file data (as an ArrayBuffer) and return a Font object.
+ * Throws an error if the font could not be parsed.
+ * @param  {ArrayBuffer}
+ * @return {opentype.Font}
+ */
+function parseBuffer(buffer) {
+    var indexToLocFormat;
+    var ltagTable;
+
+    // Since the constructor can also be called to create new fonts from scratch, we indicate this
+    // should be an empty font that we'll fill with our own data.
+    var font = new _font.Font({empty: true});
+
+    // OpenType fonts use big endian byte ordering.
+    // We can't rely on typed array view types, because they operate with the endianness of the host computer.
+    // Instead we use DataViews where we can specify endianness.
+    var data = new DataView(buffer, 0);
+    var numTables;
+    var tableEntries = [];
+    var signature = parse.getTag(data, 0);
+    if (signature === String.fromCharCode(0, 1, 0, 0)) {
+        font.outlinesFormat = 'truetype';
+        numTables = parse.getUShort(data, 4);
+        tableEntries = parseOpenTypeTableEntries(data, numTables);
+    } else if (signature === 'OTTO') {
+        font.outlinesFormat = 'cff';
+        numTables = parse.getUShort(data, 4);
+        tableEntries = parseOpenTypeTableEntries(data, numTables);
+    } else if (signature === 'wOFF') {
+        var flavor = parse.getTag(data, 4);
+        if (flavor === String.fromCharCode(0, 1, 0, 0)) {
+            font.outlinesFormat = 'truetype';
+        } else if (flavor === 'OTTO') {
+            font.outlinesFormat = 'cff';
+        } else {
+            throw new Error('Unsupported OpenType flavor ' + signature);
+        }
+
+        numTables = parse.getUShort(data, 12);
+        tableEntries = parseWOFFTableEntries(data, numTables);
+    } else {
+        throw new Error('Unsupported OpenType signature ' + signature);
+    }
+
+    var cffTableEntry;
+    var fvarTableEntry;
+    var glyfTableEntry;
+    var gposTableEntry;
+    var gsubTableEntry;
+    var hmtxTableEntry;
+    var kernTableEntry;
+    var locaTableEntry;
+    var nameTableEntry;
+    var metaTableEntry;
+
+    for (var i = 0; i < numTables; i += 1) {
+        var tableEntry = tableEntries[i];
+        var table;
+        switch (tableEntry.tag) {
+            case 'cmap':
+                table = uncompressTable(data, tableEntry);
+                font.tables.cmap = cmap.parse(table.data, table.offset);
+                font.encoding = new encoding.CmapEncoding(font.tables.cmap);
+                break;
+            case 'fvar':
+                fvarTableEntry = tableEntry;
+                break;
+            case 'head':
+                table = uncompressTable(data, tableEntry);
+                font.tables.head = head.parse(table.data, table.offset);
+                font.unitsPerEm = font.tables.head.unitsPerEm;
+                indexToLocFormat = font.tables.head.indexToLocFormat;
+                break;
+            case 'hhea':
+                table = uncompressTable(data, tableEntry);
+                font.tables.hhea = hhea.parse(table.data, table.offset);
+                font.ascender = font.tables.hhea.ascender;
+                font.descender = font.tables.hhea.descender;
+                font.numberOfHMetrics = font.tables.hhea.numberOfHMetrics;
+                break;
+            case 'hmtx':
+                hmtxTableEntry = tableEntry;
+                break;
+            case 'ltag':
+                table = uncompressTable(data, tableEntry);
+                ltagTable = ltag.parse(table.data, table.offset);
+                break;
+            case 'maxp':
+                table = uncompressTable(data, tableEntry);
+                font.tables.maxp = maxp.parse(table.data, table.offset);
+                font.numGlyphs = font.tables.maxp.numGlyphs;
+                break;
+            case 'name':
+                nameTableEntry = tableEntry;
+                break;
+            case 'OS/2':
+                table = uncompressTable(data, tableEntry);
+                font.tables.os2 = os2.parse(table.data, table.offset);
+                break;
+            case 'post':
+                table = uncompressTable(data, tableEntry);
+                font.tables.post = post.parse(table.data, table.offset);
+                font.glyphNames = new encoding.GlyphNames(font.tables.post);
+                break;
+            case 'glyf':
+                glyfTableEntry = tableEntry;
+                break;
+            case 'loca':
+                locaTableEntry = tableEntry;
+                break;
+            case 'CFF ':
+                cffTableEntry = tableEntry;
+                break;
+            case 'kern':
+                kernTableEntry = tableEntry;
+                break;
+            case 'GPOS':
+                gposTableEntry = tableEntry;
+                break;
+            case 'GSUB':
+                gsubTableEntry = tableEntry;
+                break;
+            case 'meta':
+                metaTableEntry = tableEntry;
+                break;
+        }
+    }
+
+    var nameTable = uncompressTable(data, nameTableEntry);
+    font.tables.name = _name.parse(nameTable.data, nameTable.offset, ltagTable);
+    font.names = font.tables.name;
+
+    if (glyfTableEntry && locaTableEntry) {
+        var shortVersion = indexToLocFormat === 0;
+        var locaTable = uncompressTable(data, locaTableEntry);
+        var locaOffsets = loca.parse(locaTable.data, locaTable.offset, font.numGlyphs, shortVersion);
+        var glyfTable = uncompressTable(data, glyfTableEntry);
+        font.glyphs = glyf.parse(glyfTable.data, glyfTable.offset, locaOffsets, font);
+    } else if (cffTableEntry) {
+        var cffTable = uncompressTable(data, cffTableEntry);
+        cff.parse(cffTable.data, cffTable.offset, font);
+    } else {
+        throw new Error('Font doesn\'t contain TrueType or CFF outlines.');
+    }
+
+    var hmtxTable = uncompressTable(data, hmtxTableEntry);
+    hmtx.parse(hmtxTable.data, hmtxTable.offset, font.numberOfHMetrics, font.numGlyphs, font.glyphs);
+    encoding.addGlyphNames(font);
+
+    if (kernTableEntry) {
+        var kernTable = uncompressTable(data, kernTableEntry);
+        font.kerningPairs = kern.parse(kernTable.data, kernTable.offset);
+    } else {
+        font.kerningPairs = {};
+    }
+
+    if (gposTableEntry) {
+        var gposTable = uncompressTable(data, gposTableEntry);
+        gpos.parse(gposTable.data, gposTable.offset, font);
+    }
+
+    if (gsubTableEntry) {
+        var gsubTable = uncompressTable(data, gsubTableEntry);
+        font.tables.gsub = gsub.parse(gsubTable.data, gsubTable.offset);
+    }
+
+    if (fvarTableEntry) {
+        var fvarTable = uncompressTable(data, fvarTableEntry);
+        font.tables.fvar = fvar.parse(fvarTable.data, fvarTable.offset, font.names);
+    }
+
+    if (metaTableEntry) {
+        var metaTable = uncompressTable(data, metaTableEntry);
+        font.tables.meta = meta.parse(metaTable.data, metaTable.offset);
+        font.metas = font.tables.meta;
+    }
+
+    return font;
+}
+
+/**
+ * Asynchronously load the font from a URL or a filesystem. When done, call the callback
+ * with two arguments `(err, font)`. The `err` will be null on success,
+ * the `font` is a Font object.
+ * We use the node.js callback convention so that
+ * opentype.js can integrate with frameworks like async.js.
+ * @alias opentype.load
+ * @param  {string} url - The URL of the font to load.
+ * @param  {Function} callback - The callback.
+ */
+function load(url, callback) {
+    var isNode = typeof window === 'undefined';
+    var loadFn = isNode ? loadFromFile : loadFromUrl;
+    loadFn(url, function(err, arrayBuffer) {
+        if (err) {
+            return callback(err);
+        }
+        var font;
+        try {
+            font = parseBuffer(arrayBuffer);
+        } catch (e) {
+            return callback(e, null);
+        }
+        return callback(null, font);
+    });
+}
+
+/**
+ * Synchronously load the font from a URL or file.
+ * When done, returns the font object or throws an error.
+ * @alias opentype.loadSync
+ * @param  {string} url - The URL of the font to load.
+ * @return {opentype.Font}
+ */
+function loadSync(url) {
+    var fs = require('fs');
+    var buffer = fs.readFileSync(url);
+    return parseBuffer(util.nodeBufferToArrayBuffer(buffer));
+}
+
+exports._parse = parse;
+exports.Font = _font.Font;
+exports.Glyph = glyph.Glyph;
+exports.Path = path.Path;
+exports.BoundingBox = bbox.BoundingBox;
+exports.parse = parseBuffer;
+exports.load = load;
+exports.loadSync = loadSync;
+
+},{"./bbox":2,"./encoding":5,"./font":6,"./glyph":7,"./parse":11,"./path":12,"./tables/cff":15,"./tables/cmap":16,"./tables/fvar":17,"./tables/glyf":18,"./tables/gpos":19,"./tables/gsub":20,"./tables/head":21,"./tables/hhea":22,"./tables/hmtx":23,"./tables/kern":24,"./tables/loca":25,"./tables/ltag":26,"./tables/maxp":27,"./tables/meta":28,"./tables/name":29,"./tables/os2":30,"./tables/post":31,"./util":34,"fs":undefined,"tiny-inflate":1}],11:[function(require,module,exports){
+// Parsing utility functions
+
+
+
+var check = require('./check');
+
+// Retrieve an unsigned byte from the DataView.
+exports.getByte = function getByte(dataView, offset) {
+    return dataView.getUint8(offset);
+};
+
+exports.getCard8 = exports.getByte;
+
+// Retrieve an unsigned 16-bit short from the DataView.
+// The value is stored in big endian.
+function getUShort(dataView, offset) {
+    return dataView.getUint16(offset, false);
+}
+
+exports.getUShort = exports.getCard16 = getUShort;
+
+// Retrieve a signed 16-bit short from the DataView.
+// The value is stored in big endian.
+exports.getShort = function(dataView, offset) {
+    return dataView.getInt16(offset, false);
+};
+
+// Retrieve an unsigned 32-bit long from the DataView.
+// The value is stored in big endian.
+exports.getULong = function(dataView, offset) {
+    return dataView.getUint32(offset, false);
+};
+
+// Retrieve a 32-bit signed fixed-point number (16.16) from the DataView.
+// The value is stored in big endian.
+exports.getFixed = function(dataView, offset) {
+    var decimal = dataView.getInt16(offset, false);
+    var fraction = dataView.getUint16(offset + 2, false);
+    return decimal + fraction / 65535;
+};
+
+// Retrieve a 4-character tag from the DataView.
+// Tags are used to identify tables.
+exports.getTag = function(dataView, offset) {
+    var tag = '';
+    for (var i = offset; i < offset + 4; i += 1) {
+        tag += String.fromCharCode(dataView.getInt8(i));
+    }
+
+    return tag;
+};
+
+// Retrieve an offset from the DataView.
+// Offsets are 1 to 4 bytes in length, depending on the offSize argument.
+exports.getOffset = function(dataView, offset, offSize) {
+    var v = 0;
+    for (var i = 0; i < offSize; i += 1) {
+        v <<= 8;
+        v += dataView.getUint8(offset + i);
+    }
+
+    return v;
+};
+
+// Retrieve a number of bytes from start offset to the end offset from the DataView.
+exports.getBytes = function(dataView, startOffset, endOffset) {
+    var bytes = [];
+    for (var i = startOffset; i < endOffset; i += 1) {
+        bytes.push(dataView.getUint8(i));
+    }
+
+    return bytes;
+};
+
+// Convert the list of bytes to a string.
+exports.bytesToString = function(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i += 1) {
+        s += String.fromCharCode(bytes[i]);
+    }
+
+    return s;
+};
+
+var typeOffsets = {
+    byte: 1,
+    uShort: 2,
+    short: 2,
+    uLong: 4,
+    fixed: 4,
+    longDateTime: 8,
+    tag: 4
+};
+
+// A stateful parser that changes the offset whenever a value is retrieved.
+// The data is a DataView.
+function Parser(data, offset) {
+    this.data = data;
+    this.offset = offset;
+    this.relativeOffset = 0;
+}
+
+Parser.prototype.parseByte = function() {
+    var v = this.data.getUint8(this.offset + this.relativeOffset);
+    this.relativeOffset += 1;
+    return v;
+};
+
+Parser.prototype.parseChar = function() {
+    var v = this.data.getInt8(this.offset + this.relativeOffset);
+    this.relativeOffset += 1;
+    return v;
+};
+
+Parser.prototype.parseCard8 = Parser.prototype.parseByte;
+
+Parser.prototype.parseUShort = function() {
+    var v = this.data.getUint16(this.offset + this.relativeOffset);
+    this.relativeOffset += 2;
+    return v;
+};
+
+Parser.prototype.parseCard16 = Parser.prototype.parseUShort;
+Parser.prototype.parseSID = Parser.prototype.parseUShort;
+Parser.prototype.parseOffset16 = Parser.prototype.parseUShort;
+
+Parser.prototype.parseShort = function() {
+    var v = this.data.getInt16(this.offset + this.relativeOffset);
+    this.relativeOffset += 2;
+    return v;
+};
+
+Parser.prototype.parseF2Dot14 = function() {
+    var v = this.data.getInt16(this.offset + this.relativeOffset) / 16384;
+    this.relativeOffset += 2;
+    return v;
+};
+
+Parser.prototype.parseULong = function() {
+    var v = exports.getULong(this.data, this.offset + this.relativeOffset);
+    this.relativeOffset += 4;
+    return v;
+};
+
+Parser.prototype.parseFixed = function() {
+    var v = exports.getFixed(this.data, this.offset + this.relativeOffset);
+    this.relativeOffset += 4;
+    return v;
+};
+
+Parser.prototype.parseString = function(length) {
+    var dataView = this.data;
+    var offset = this.offset + this.relativeOffset;
+    var string = '';
+    this.relativeOffset += length;
+    for (var i = 0; i < length; i++) {
+        string += String.fromCharCode(dataView.getUint8(offset + i));
+    }
+
+    return string;
+};
+
+Parser.prototype.parseTag = function() {
+    return this.parseString(4);
+};
+
+// LONGDATETIME is a 64-bit integer.
+// JavaScript and unix timestamps traditionally use 32 bits, so we
+// only take the last 32 bits.
+// + Since until 2038 those bits will be filled by zeros we can ignore them.
+Parser.prototype.parseLongDateTime = function() {
+    var v = exports.getULong(this.data, this.offset + this.relativeOffset + 4);
+    // Subtract seconds between 01/01/1904 and 01/01/1970
+    // to convert Apple Mac timstamp to Standard Unix timestamp
+    v -= 2082844800;
+    this.relativeOffset += 8;
+    return v;
+};
+
+Parser.prototype.parseVersion = function() {
+    var major = getUShort(this.data, this.offset + this.relativeOffset);
+
+    // How to interpret the minor version is very vague in the spec. 0x5000 is 5, 0x1000 is 1
+    // This returns the correct number if minor = 0xN000 where N is 0-9
+    var minor = getUShort(this.data, this.offset + this.relativeOffset + 2);
+    this.relativeOffset += 4;
+    return major + minor / 0x1000 / 10;
+};
+
+Parser.prototype.skip = function(type, amount) {
+    if (amount === undefined) {
+        amount = 1;
+    }
+
+    this.relativeOffset += typeOffsets[type] * amount;
+};
+
+///// Parsing lists and records ///////////////////////////////
+
+// Parse a list of 16 bit integers. The length of the list can be read on the stream
+// or provided as an argument.
+Parser.prototype.parseOffset16List =
+Parser.prototype.parseUShortList = function(count) {
+    if (count === undefined) { count = this.parseUShort(); }
+    var offsets = new Array(count);
+    var dataView = this.data;
+    var offset = this.offset + this.relativeOffset;
+    for (var i = 0; i < count; i++) {
+        offsets[i] = dataView.getUint16(offset);
+        offset += 2;
+    }
+
+    this.relativeOffset += count * 2;
+    return offsets;
+};
+
+/**
+ * Parse a list of items.
+ * Record count is optional, if omitted it is read from the stream.
+ * itemCallback is one of the Parser methods.
+ */
+Parser.prototype.parseList = function(count, itemCallback) {
+    if (!itemCallback) {
+        itemCallback = count;
+        count = this.parseUShort();
+    }
+    var list = new Array(count);
+    for (var i = 0; i < count; i++) {
+        list[i] = itemCallback.call(this);
+    }
+    return list;
+};
+
+/**
+ * Parse a list of records.
+ * Record count is optional, if omitted it is read from the stream.
+ * Example of recordDescription: { sequenceIndex: Parser.uShort, lookupListIndex: Parser.uShort }
+ */
+Parser.prototype.parseRecordList = function(count, recordDescription) {
+    // If the count argument is absent, read it in the stream.
+    if (!recordDescription) {
+        recordDescription = count;
+        count = this.parseUShort();
+    }
+    var records = new Array(count);
+    var fields = Object.keys(recordDescription);
+    for (var i = 0; i < count; i++) {
+        var rec = {};
+        for (var j = 0; j < fields.length; j++) {
+            var fieldName = fields[j];
+            var fieldType = recordDescription[fieldName];
+            rec[fieldName] = fieldType.call(this);
+        }
+        records[i] = rec;
+    }
+    return records;
+};
+
+// Parse a data structure into an object
+// Example of description: { sequenceIndex: Parser.uShort, lookupListIndex: Parser.uShort }
+Parser.prototype.parseStruct = function(description) {
+    if (typeof description === 'function') {
+        return description.call(this);
+    } else {
+        var fields = Object.keys(description);
+        var struct = {};
+        for (var j = 0; j < fields.length; j++) {
+            var fieldName = fields[j];
+            var fieldType = description[fieldName];
+            struct[fieldName] = fieldType.call(this);
+        }
+        return struct;
+    }
+};
+
+Parser.prototype.parsePointer = function(description) {
+    var structOffset = this.parseOffset16();
+    if (structOffset > 0) {                         // NULL offset => return indefined
+        return new Parser(this.data, this.offset + structOffset).parseStruct(description);
+    }
+};
+
+/**
+ * Parse a list of offsets to lists of 16-bit integers,
+ * or a list of offsets to lists of offsets to any kind of items.
+ * If itemCallback is not provided, a list of list of UShort is assumed.
+ * If provided, itemCallback is called on each item and must parse the item.
+ * See examples in tables/gsub.js
+ */
+Parser.prototype.parseListOfLists = function(itemCallback) {
+    var offsets = this.parseOffset16List();
+    var count = offsets.length;
+    var relativeOffset = this.relativeOffset;
+    var list = new Array(count);
+    for (var i = 0; i < count; i++) {
+        var start = offsets[i];
+        if (start === 0) {                  // NULL offset
+            list[i] = undefined;            // Add i as owned property to list. Convenient with assert.
+            continue;
+        }
+        this.relativeOffset = start;
+        if (itemCallback) {
+            var subOffsets = this.parseOffset16List();
+            var subList = new Array(subOffsets.length);
+            for (var j = 0; j < subOffsets.length; j++) {
+                this.relativeOffset = start + subOffsets[j];
+                subList[j] = itemCallback.call(this);
+            }
+            list[i] = subList;
+        } else {
+            list[i] = this.parseUShortList();
+        }
+    }
+    this.relativeOffset = relativeOffset;
+    return list;
+};
+
+///// Complex tables parsing //////////////////////////////////
+
+// Parse a coverage table in a GSUB, GPOS or GDEF table.
+// https://www.microsoft.com/typography/OTSPEC/chapter2.htm
+// parser.offset must point to the start of the table containing the coverage.
+Parser.prototype.parseCoverage = function() {
+    var startOffset = this.offset + this.relativeOffset;
+    var format = this.parseUShort();
+    var count = this.parseUShort();
+    if (format === 1) {
+        return {
+            format: 1,
+            glyphs: this.parseUShortList(count)
+        };
+    } else if (format === 2) {
+        var ranges = new Array(count);
+        for (var i = 0; i < count; i++) {
+            ranges[i] = {
+                start: this.parseUShort(),
+                end: this.parseUShort(),
+                index: this.parseUShort()
+            };
+        }
+        return {
+            format: 2,
+            ranges: ranges
+        };
+    }
+    check.assert(false, '0x' + startOffset.toString(16) + ': Coverage format must be 1 or 2.');
+};
+
+// Parse a Class Definition Table in a GSUB, GPOS or GDEF table.
+// https://www.microsoft.com/typography/OTSPEC/chapter2.htm
+Parser.prototype.parseClassDef = function() {
+    var startOffset = this.offset + this.relativeOffset;
+    var format = this.parseUShort();
+    if (format === 1) {
+        return {
+            format: 1,
+            startGlyph: this.parseUShort(),
+            classes: this.parseUShortList()
+        };
+    } else if (format === 2) {
+        return {
+            format: 2,
+            ranges: this.parseRecordList({
+                start: Parser.uShort,
+                end: Parser.uShort,
+                classId: Parser.uShort
+            })
+        };
+    }
+    check.assert(false, '0x' + startOffset.toString(16) + ': ClassDef format must be 1 or 2.');
+};
+
+///// Static methods ///////////////////////////////////
+// These convenience methods can be used as callbacks and should be called with "this" context set to a Parser instance.
+
+Parser.list = function(count, itemCallback) {
+    return function() {
+        return this.parseList(count, itemCallback);
+    };
+};
+
+Parser.recordList = function(count, recordDescription) {
+    return function() {
+        return this.parseRecordList(count, recordDescription);
+    };
+};
+
+Parser.pointer = function(description) {
+    return function() {
+        return this.parsePointer(description);
+    };
+};
+
+Parser.tag = Parser.prototype.parseTag;
+Parser.byte = Parser.prototype.parseByte;
+Parser.uShort = Parser.offset16 = Parser.prototype.parseUShort;
+Parser.uShortList = Parser.prototype.parseUShortList;
+Parser.struct = Parser.prototype.parseStruct;
+Parser.coverage = Parser.prototype.parseCoverage;
+Parser.classDef = Parser.prototype.parseClassDef;
+
+///// Script, Feature, Lookup lists ///////////////////////////////////////////////
+// https://www.microsoft.com/typography/OTSPEC/chapter2.htm
+
+var langSysTable = {
+    reserved: Parser.uShort,
+    reqFeatureIndex: Parser.uShort,
+    featureIndexes: Parser.uShortList
+};
+
+Parser.prototype.parseScriptList = function() {
+    return this.parsePointer(Parser.recordList({
+        tag: Parser.tag,
+        script: Parser.pointer({
+            defaultLangSys: Parser.pointer(langSysTable),
+            langSysRecords: Parser.recordList({
+                tag: Parser.tag,
+                langSys: Parser.pointer(langSysTable)
+            })
+        })
+    }));
+};
+
+Parser.prototype.parseFeatureList = function() {
+    return this.parsePointer(Parser.recordList({
+        tag: Parser.tag,
+        feature: Parser.pointer({
+            featureParams: Parser.offset16,
+            lookupListIndexes: Parser.uShortList
+        })
+    }));
+};
+
+Parser.prototype.parseLookupList = function(lookupTableParsers) {
+    return this.parsePointer(Parser.list(Parser.pointer(function() {
+        var lookupType = this.parseUShort();
+        check.argument(1 <= lookupType && lookupType <= 8, 'GSUB lookup type ' + lookupType + ' unknown.');
+        var lookupFlag = this.parseUShort();
+        var useMarkFilteringSet = lookupFlag & 0x10;
+        return {
+            lookupType: lookupType,
+            lookupFlag: lookupFlag,
+            subtables: this.parseList(Parser.pointer(lookupTableParsers[lookupType])),
+            markFilteringSet: useMarkFilteringSet ? this.parseUShort() : undefined
+        };
+    })));
+};
+
+exports.Parser = Parser;
+
+},{"./check":3}],12:[function(require,module,exports){
+// Geometric objects
+
+
+
+var bbox = require('./bbox');
+
+/**
+ * A bézier path containing a set of path commands similar to a SVG path.
+ * Paths can be drawn on a context using `draw`.
+ * @exports opentype.Path
+ * @class
+ * @constructor
+ */
+function Path() {
+    this.commands = [];
+    this.fill = 'black';
+    this.stroke = null;
+    this.strokeWidth = 1;
+}
+
+/**
+ * @param  {number} x
+ * @param  {number} y
+ */
+Path.prototype.moveTo = function(x, y) {
+    this.commands.push({
+        type: 'M',
+        x: x,
+        y: y
+    });
+};
+
+/**
+ * @param  {number} x
+ * @param  {number} y
+ */
+Path.prototype.lineTo = function(x, y) {
+    this.commands.push({
+        type: 'L',
+        x: x,
+        y: y
+    });
+};
+
+/**
+ * Draws cubic curve
+ * @function
+ * curveTo
+ * @memberof opentype.Path.prototype
+ * @param  {number} x1 - x of control 1
+ * @param  {number} y1 - y of control 1
+ * @param  {number} x2 - x of control 2
+ * @param  {number} y2 - y of control 2
+ * @param  {number} x - x of path point
+ * @param  {number} y - y of path point
+ */
+
+/**
+ * Draws cubic curve
+ * @function
+ * bezierCurveTo
+ * @memberof opentype.Path.prototype
+ * @param  {number} x1 - x of control 1
+ * @param  {number} y1 - y of control 1
+ * @param  {number} x2 - x of control 2
+ * @param  {number} y2 - y of control 2
+ * @param  {number} x - x of path point
+ * @param  {number} y - y of path point
+ * @see curveTo
+ */
+Path.prototype.curveTo = Path.prototype.bezierCurveTo = function(x1, y1, x2, y2, x, y) {
+    this.commands.push({
+        type: 'C',
+        x1: x1,
+        y1: y1,
+        x2: x2,
+        y2: y2,
+        x: x,
+        y: y
+    });
+};
+
+/**
+ * Draws quadratic curve
+ * @function
+ * quadraticCurveTo
+ * @memberof opentype.Path.prototype
+ * @param  {number} x1 - x of control
+ * @param  {number} y1 - y of control
+ * @param  {number} x - x of path point
+ * @param  {number} y - y of path point
+ */
+
+/**
+ * Draws quadratic curve
+ * @function
+ * quadTo
+ * @memberof opentype.Path.prototype
+ * @param  {number} x1 - x of control
+ * @param  {number} y1 - y of control
+ * @param  {number} x - x of path point
+ * @param  {number} y - y of path point
+ */
+Path.prototype.quadTo = Path.prototype.quadraticCurveTo = function(x1, y1, x, y) {
+    this.commands.push({
+        type: 'Q',
+        x1: x1,
+        y1: y1,
+        x: x,
+        y: y
+    });
+};
+
+/**
+ * Closes the path
+ * @function closePath
+ * @memberof opentype.Path.prototype
+ */
+
+/**
+ * Close the path
+ * @function close
+ * @memberof opentype.Path.prototype
+ */
+Path.prototype.close = Path.prototype.closePath = function() {
+    this.commands.push({
+        type: 'Z'
+    });
+};
+
+/**
+ * Add the given path or list of commands to the commands of this path.
+ * @param  {Array} pathOrCommands - another opentype.Path, an opentype.BoundingBox, or an array of commands.
+ */
+Path.prototype.extend = function(pathOrCommands) {
+    if (pathOrCommands.commands) {
+        pathOrCommands = pathOrCommands.commands;
+    } else if (pathOrCommands instanceof bbox.BoundingBox) {
+        var box = pathOrCommands;
+        this.moveTo(box.x1, box.y1);
+        this.lineTo(box.x2, box.y1);
+        this.lineTo(box.x2, box.y2);
+        this.lineTo(box.x1, box.y2);
+        this.close();
+        return;
+    }
+
+    Array.prototype.push.apply(this.commands, pathOrCommands);
+};
+
+/**
+ * Calculate the bounding box of the path.
+ * @returns {opentype.BoundingBox}
+ */
+Path.prototype.getBoundingBox = function() {
+    var box = new bbox.BoundingBox();
+
+    var startX = 0;
+    var startY = 0;
+    var prevX = 0;
+    var prevY = 0;
+    for (var i = 0; i < this.commands.length; i++) {
+        var cmd = this.commands[i];
+        switch (cmd.type) {
+            case 'M':
+                box.addPoint(cmd.x, cmd.y);
+                startX = prevX = cmd.x;
+                startY = prevY = cmd.y;
+                break;
+            case 'L':
+                box.addPoint(cmd.x, cmd.y);
+                prevX = cmd.x;
+                prevY = cmd.y;
+                break;
+            case 'Q':
+                box.addQuad(prevX, prevY, cmd.x1, cmd.y1, cmd.x, cmd.y);
+                prevX = cmd.x;
+                prevY = cmd.y;
+                break;
+            case 'C':
+                box.addBezier(prevX, prevY, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+                prevX = cmd.x;
+                prevY = cmd.y;
+                break;
+            case 'Z':
+                prevX = startX;
+                prevY = startY;
+                break;
+            default:
+                throw new Error('Unexpected path commmand ' + cmd.type);
+        }
+    }
+    if (box.isEmpty()) {
+        box.addPoint(0, 0);
+    }
+    return box;
+};
+
+/**
+ * Draw the path to a 2D context.
+ * @param {CanvasRenderingContext2D} ctx - A 2D drawing context.
+ */
+Path.prototype.draw = function(ctx) {
+    ctx.beginPath();
+    for (var i = 0; i < this.commands.length; i += 1) {
+        var cmd = this.commands[i];
+        if (cmd.type === 'M') {
+            ctx.moveTo(cmd.x, cmd.y);
+        } else if (cmd.type === 'L') {
+            ctx.lineTo(cmd.x, cmd.y);
+        } else if (cmd.type === 'C') {
+            ctx.bezierCurveTo(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+        } else if (cmd.type === 'Q') {
+            ctx.quadraticCurveTo(cmd.x1, cmd.y1, cmd.x, cmd.y);
+        } else if (cmd.type === 'Z') {
+            ctx.closePath();
+        }
+    }
+
+    if (this.fill) {
+        ctx.fillStyle = this.fill;
+        ctx.fill();
+    }
+
+    if (this.stroke) {
+        ctx.strokeStyle = this.stroke;
+        ctx.lineWidth = this.strokeWidth;
+        ctx.stroke();
+    }
+};
+
+/**
+ * Convert the Path to a string of path data instructions
+ * See http://www.w3.org/TR/SVG/paths.html#PathData
+ * @param  {number} [decimalPlaces=2] - The amount of decimal places for floating-point values
+ * @return {string}
+ */
+Path.prototype.toPathData = function(decimalPlaces) {
+    decimalPlaces = decimalPlaces !== undefined ? decimalPlaces : 2;
+
+    function floatToString(v) {
+        if (Math.round(v) === v) {
+            return '' + Math.round(v);
+        } else {
+            return v.toFixed(decimalPlaces);
+        }
+    }
+
+    function packValues() {
+        var s = '';
+        for (var i = 0; i < arguments.length; i += 1) {
+            var v = arguments[i];
+            if (v >= 0 && i > 0) {
+                s += ' ';
+            }
+
+            s += floatToString(v);
+        }
+
+        return s;
+    }
+
+    var d = '';
+    for (var i = 0; i < this.commands.length; i += 1) {
+        var cmd = this.commands[i];
+        if (cmd.type === 'M') {
+            d += 'M' + packValues(cmd.x, cmd.y);
+        } else if (cmd.type === 'L') {
+            d += 'L' + packValues(cmd.x, cmd.y);
+        } else if (cmd.type === 'C') {
+            d += 'C' + packValues(cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
+        } else if (cmd.type === 'Q') {
+            d += 'Q' + packValues(cmd.x1, cmd.y1, cmd.x, cmd.y);
+        } else if (cmd.type === 'Z') {
+            d += 'Z';
+        }
+    }
+
+    return d;
+};
+
+/**
+ * Convert the path to an SVG <path> element, as a string.
+ * @param  {number} [decimalPlaces=2] - The amount of decimal places for floating-point values
+ * @return {string}
+ */
+Path.prototype.toSVG = function(decimalPlaces) {
+    var svg = '<path d="';
+    svg += this.toPathData(decimalPlaces);
+    svg += '"';
+    if (this.fill && this.fill !== 'black') {
+        if (this.fill === null) {
+            svg += ' fill="none"';
+        } else {
+            svg += ' fill="' + this.fill + '"';
+        }
+    }
+
+    if (this.stroke) {
+        svg += ' stroke="' + this.stroke + '" stroke-width="' + this.strokeWidth + '"';
+    }
+
+    svg += '/>';
+    return svg;
+};
+
+Path.prototype.toDOMElement = function(decimalPlaces) {
+    var temporaryPath = this.toPathData(decimalPlaces);
+    var newPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+
+    newPath.setAttribute('d', temporaryPath);
+
+    return newPath;
+};
+
+exports.Path = Path;
+
+},{"./bbox":2}],13:[function(require,module,exports){
+// The Substitution object provides utility methods to manipulate
+// the GSUB substitution table.
+
+
+
+var check = require('./check');
+var Layout = require('./layout');
+
+/**
+ * @exports opentype.Substitution
+ * @class
+ * @extends opentype.Layout
+ * @param {opentype.Font}
+ * @constructor
+ */
+var Substitution = function(font) {
+    Layout.call(this, font, 'gsub');
+};
+
+// Check if 2 arrays of primitives are equal.
+function arraysEqual(ar1, ar2) {
+    var n = ar1.length;
+    if (n !== ar2.length) { return false; }
+    for (var i = 0; i < n; i++) {
+        if (ar1[i] !== ar2[i]) { return false; }
+    }
+    return true;
+}
+
+// Find the first subtable of a lookup table in a particular format.
+function getSubstFormat(lookupTable, format, defaultSubtable) {
+    var subtables = lookupTable.subtables;
+    for (var i = 0; i < subtables.length; i++) {
+        var subtable = subtables[i];
+        if (subtable.substFormat === format) {
+            return subtable;
+        }
+    }
+    if (defaultSubtable) {
+        subtables.push(defaultSubtable);
+        return defaultSubtable;
+    }
+}
+
+Substitution.prototype = Layout.prototype;
+
+/**
+ * Create a default GSUB table.
+ * @return {Object} gsub - The GSUB table.
+ */
+Substitution.prototype.createDefaultTable = function() {
+    // Generate a default empty GSUB table with just a DFLT script and dflt lang sys.
+    return {
+        version: 1,
+        scripts: [{
+            tag: 'DFLT',
+            script: {
+                defaultLangSys: { reserved: 0, reqFeatureIndex: 0xffff, featureIndexes: [] },
+                langSysRecords: []
+            }
+        }],
+        features: [],
+        lookups: []
+    };
+};
+
+/**
+ * List all single substitutions (lookup type 1) for a given script, language, and feature.
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ * @param {string} feature - 4-character feature name ('aalt', 'salt', 'ss01'...)
+ * @return {Array} substitutions - The list of substitutions.
+ */
+Substitution.prototype.getSingle = function(feature, script, language) {
+    var substitutions = [];
+    var lookupTables = this.getLookupTables(script, language, feature, 1);
+    for (var idx = 0; idx < lookupTables.length; idx++) {
+        var subtables = lookupTables[idx].subtables;
+        for (var i = 0; i < subtables.length; i++) {
+            var subtable = subtables[i];
+            var glyphs = this.expandCoverage(subtable.coverage);
+            var j;
+            if (subtable.substFormat === 1) {
+                var delta = subtable.deltaGlyphId;
+                for (j = 0; j < glyphs.length; j++) {
+                    var glyph = glyphs[j];
+                    substitutions.push({ sub: glyph, by: glyph + delta });
+                }
+            } else {
+                var substitute = subtable.substitute;
+                for (j = 0; j < glyphs.length; j++) {
+                    substitutions.push({ sub: glyphs[j], by: substitute[j] });
+                }
+            }
+        }
+    }
+    return substitutions;
+};
+
+/**
+ * List all alternates (lookup type 3) for a given script, language, and feature.
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ * @param {string} feature - 4-character feature name ('aalt', 'salt'...)
+ * @return {Array} alternates - The list of alternates
+ */
+Substitution.prototype.getAlternates = function(feature, script, language) {
+    var alternates = [];
+    var lookupTables = this.getLookupTables(script, language, feature, 3);
+    for (var idx = 0; idx < lookupTables.length; idx++) {
+        var subtables = lookupTables[idx].subtables;
+        for (var i = 0; i < subtables.length; i++) {
+            var subtable = subtables[i];
+            var glyphs = this.expandCoverage(subtable.coverage);
+            var alternateSets = subtable.alternateSets;
+            for (var j = 0; j < glyphs.length; j++) {
+                alternates.push({ sub: glyphs[j], by: alternateSets[j] });
+            }
+        }
+    }
+    return alternates;
+};
+
+/**
+ * List all ligatures (lookup type 4) for a given script, language, and feature.
+ * The result is an array of ligature objects like { sub: [ids], by: id }
+ * @param {string} feature - 4-letter feature name ('liga', 'rlig', 'dlig'...)
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ * @return {Array} ligatures - The list of ligatures.
+ */
+Substitution.prototype.getLigatures = function(feature, script, language) {
+    var ligatures = [];
+    var lookupTables = this.getLookupTables(script, language, feature, 4);
+    for (var idx = 0; idx < lookupTables.length; idx++) {
+        var subtables = lookupTables[idx].subtables;
+        for (var i = 0; i < subtables.length; i++) {
+            var subtable = subtables[i];
+            var glyphs = this.expandCoverage(subtable.coverage);
+            var ligatureSets = subtable.ligatureSets;
+            for (var j = 0; j < glyphs.length; j++) {
+                var startGlyph = glyphs[j];
+                var ligSet = ligatureSets[j];
+                for (var k = 0; k < ligSet.length; k++) {
+                    var lig = ligSet[k];
+                    ligatures.push({
+                        sub: [startGlyph].concat(lig.components),
+                        by: lig.ligGlyph
+                    });
+                }
+            }
+        }
+    }
+    return ligatures;
+};
+
+/**
+ * Add or modify a single substitution (lookup type 1)
+ * Format 2, more flexible, is always used.
+ * @param {string} feature - 4-letter feature name ('liga', 'rlig', 'dlig'...)
+ * @param {Object} substitution - { sub: id, delta: number } for format 1 or { sub: id, by: id } for format 2.
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ */
+Substitution.prototype.addSingle = function(feature, substitution, script, language) {
+    var lookupTable = this.getLookupTables(script, language, feature, 1, true)[0];
+    var subtable = getSubstFormat(lookupTable, 2, {                // lookup type 1 subtable, format 2, coverage format 1
+        substFormat: 2,
+        coverage: { format: 1, glyphs: [] },
+        substitute: []
+    });
+    check.assert(subtable.coverage.format === 1, 'Ligature: unable to modify coverage table format ' + subtable.coverage.format);
+    var coverageGlyph = substitution.sub;
+    var pos = this.binSearch(subtable.coverage.glyphs, coverageGlyph);
+    if (pos < 0) {
+        pos = -1 - pos;
+        subtable.coverage.glyphs.splice(pos, 0, coverageGlyph);
+        subtable.substitute.splice(pos, 0, 0);
+    }
+    subtable.substitute[pos] = substitution.by;
+};
+
+/**
+ * Add or modify an alternate substitution (lookup type 1)
+ * @param {string} feature - 4-letter feature name ('liga', 'rlig', 'dlig'...)
+ * @param {Object} substitution - { sub: id, by: [ids] }
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ */
+Substitution.prototype.addAlternate = function(feature, substitution, script, language) {
+    var lookupTable = this.getLookupTables(script, language, feature, 3, true)[0];
+    var subtable = getSubstFormat(lookupTable, 1, {                // lookup type 3 subtable, format 1, coverage format 1
+        substFormat: 1,
+        coverage: { format: 1, glyphs: [] },
+        alternateSets: []
+    });
+    check.assert(subtable.coverage.format === 1, 'Ligature: unable to modify coverage table format ' + subtable.coverage.format);
+    var coverageGlyph = substitution.sub;
+    var pos = this.binSearch(subtable.coverage.glyphs, coverageGlyph);
+    if (pos < 0) {
+        pos = -1 - pos;
+        subtable.coverage.glyphs.splice(pos, 0, coverageGlyph);
+        subtable.alternateSets.splice(pos, 0, 0);
+    }
+    subtable.alternateSets[pos] = substitution.by;
+};
+
+/**
+ * Add a ligature (lookup type 4)
+ * Ligatures with more components must be stored ahead of those with fewer components in order to be found
+ * @param {string} feature - 4-letter feature name ('liga', 'rlig', 'dlig'...)
+ * @param {Object} ligature - { sub: [ids], by: id }
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ */
+Substitution.prototype.addLigature = function(feature, ligature, script, language) {
+    var lookupTable = this.getLookupTables(script, language, feature, 4, true)[0];
+    var subtable = lookupTable.subtables[0];
+    if (!subtable) {
+        subtable = {                // lookup type 4 subtable, format 1, coverage format 1
+            substFormat: 1,
+            coverage: { format: 1, glyphs: [] },
+            ligatureSets: []
+        };
+        lookupTable.subtables[0] = subtable;
+    }
+    check.assert(subtable.coverage.format === 1, 'Ligature: unable to modify coverage table format ' + subtable.coverage.format);
+    var coverageGlyph = ligature.sub[0];
+    var ligComponents = ligature.sub.slice(1);
+    var ligatureTable = {
+        ligGlyph: ligature.by,
+        components: ligComponents
+    };
+    var pos = this.binSearch(subtable.coverage.glyphs, coverageGlyph);
+    if (pos >= 0) {
+        // ligatureSet already exists
+        var ligatureSet = subtable.ligatureSets[pos];
+        for (var i = 0; i < ligatureSet.length; i++) {
+            // If ligature already exists, return.
+            if (arraysEqual(ligatureSet[i].components, ligComponents)) {
+                return;
+            }
+        }
+        // ligature does not exist: add it.
+        ligatureSet.push(ligatureTable);
+    } else {
+        // Create a new ligatureSet and add coverage for the first glyph.
+        pos = -1 - pos;
+        subtable.coverage.glyphs.splice(pos, 0, coverageGlyph);
+        subtable.ligatureSets.splice(pos, 0, [ligatureTable]);
+    }
+};
+
+/**
+ * List all feature data for a given script and language.
+ * @param {string} feature - 4-letter feature name
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ * @return {Array} substitutions - The list of substitutions.
+ */
+Substitution.prototype.getFeature = function(feature, script, language) {
+    if (/ss\d\d/.test(feature)) {               // ss01 - ss20
+        return this.getSingle(feature, script, language);
+    }
+    switch (feature) {
+        case 'aalt':
+        case 'salt':
+            return this.getSingle(feature, script, language)
+                    .concat(this.getAlternates(feature, script, language));
+        case 'dlig':
+        case 'liga':
+        case 'rlig': return this.getLigatures(feature, script, language);
+    }
+};
+
+/**
+ * Add a substitution to a feature for a given script and language.
+ * @param {string} feature - 4-letter feature name
+ * @param {Object} sub - the substitution to add (an object like { sub: id or [ids], by: id or [ids] })
+ * @param {string} [script='DFLT']
+ * @param {string} [language='dflt']
+ */
+Substitution.prototype.add = function(feature, sub, script, language) {
+    if (/ss\d\d/.test(feature)) {               // ss01 - ss20
+        return this.addSingle(feature, sub, script, language);
+    }
+    switch (feature) {
+        case 'aalt':
+        case 'salt':
+            if (typeof sub.by === 'number') {
+                return this.addSingle(feature, sub, script, language);
+            }
+            return this.addAlternate(feature, sub, script, language);
+        case 'dlig':
+        case 'liga':
+        case 'rlig':
+            return this.addLigature(feature, sub, script, language);
+    }
+};
+
+module.exports = Substitution;
+
+},{"./check":3,"./layout":9}],14:[function(require,module,exports){
+// Table metadata
+
+
+
+var check = require('./check');
+var encode = require('./types').encode;
+var sizeOf = require('./types').sizeOf;
+/**
+ * @exports opentype.Table
+ * @class
+ * @param {string} tableName
+ * @param {Array} fields
+ * @param {Object} options
+ * @constructor
+ */
+function Table(tableName, fields, options) {
+    var i;
+    for (i = 0; i < fields.length; i += 1) {
+        var field = fields[i];
+        this[field.name] = field.value;
+    }
+
+    this.tableName = tableName;
+    this.fields = fields;
+    if (options) {
+        var optionKeys = Object.keys(options);
+        for (i = 0; i < optionKeys.length; i += 1) {
+            var k = optionKeys[i];
+            var v = options[k];
+            if (this[k] !== undefined) {
+                this[k] = v;
+            }
+        }
+    }
+}
+
+/**
+ * Encodes the table and returns an array of bytes
+ * @return {Array}
+ */
+Table.prototype.encode = function() {
+    return encode.TABLE(this);
+};
+
+/**
+ * Get the size of the table.
+ * @return {number}
+ */
+Table.prototype.sizeOf = function() {
+    return sizeOf.TABLE(this);
+};
+
+/**
+ * @private
+ */
+function ushortList(itemName, list, count) {
+    if (count === undefined) {
+        count = list.length;
+    }
+    var fields = new Array(list.length + 1);
+    fields[0] = {name: itemName + 'Count', type: 'USHORT', value: count};
+    for (var i = 0; i < list.length; i++) {
+        fields[i + 1] = {name: itemName + i, type: 'USHORT', value: list[i]};
+    }
+    return fields;
+}
+
+/**
+ * @private
+ */
+function tableList(itemName, records, itemCallback) {
+    var count = records.length;
+    var fields = new Array(count + 1);
+    fields[0] = {name: itemName + 'Count', type: 'USHORT', value: count};
+    for (var i = 0; i < count; i++) {
+        fields[i + 1] = {name: itemName + i, type: 'TABLE', value: itemCallback(records[i], i)};
+    }
+    return fields;
+}
+
+/**
+ * @private
+ */
+function recordList(itemName, records, itemCallback) {
+    var count = records.length;
+    var fields = [];
+    fields[0] = {name: itemName + 'Count', type: 'USHORT', value: count};
+    for (var i = 0; i < count; i++) {
+        fields = fields.concat(itemCallback(records[i], i));
+    }
+    return fields;
+}
+
+// Common Layout Tables
+
+/**
+ * @exports opentype.Coverage
+ * @class
+ * @param {opentype.Table}
+ * @constructor
+ * @extends opentype.Table
+ */
+function Coverage(coverageTable) {
+    if (coverageTable.format === 1) {
+        Table.call(this, 'coverageTable',
+            [{name: 'coverageFormat', type: 'USHORT', value: 1}]
+            .concat(ushortList('glyph', coverageTable.glyphs))
+        );
+    } else {
+        check.assert(false, 'Can\'t create coverage table format 2 yet.');
+    }
+}
+Coverage.prototype = Object.create(Table.prototype);
+Coverage.prototype.constructor = Coverage;
+
+function ScriptList(scriptListTable) {
+    Table.call(this, 'scriptListTable',
+        recordList('scriptRecord', scriptListTable, function(scriptRecord, i) {
+            var script = scriptRecord.script;
+            var defaultLangSys = script.defaultLangSys;
+            check.assert(!!defaultLangSys, 'Unable to write GSUB: script ' + scriptRecord.tag + ' has no default language system.');
+            return [
+                {name: 'scriptTag' + i, type: 'TAG', value: scriptRecord.tag},
+                {name: 'script' + i, type: 'TABLE', value: new Table('scriptTable', [
+                    {name: 'defaultLangSys', type: 'TABLE', value: new Table('defaultLangSys', [
+                        {name: 'lookupOrder', type: 'USHORT', value: 0},
+                        {name: 'reqFeatureIndex', type: 'USHORT', value: defaultLangSys.reqFeatureIndex}]
+                        .concat(ushortList('featureIndex', defaultLangSys.featureIndexes)))}
+                    ].concat(recordList('langSys', script.langSysRecords, function(langSysRecord, i) {
+                        var langSys = langSysRecord.langSys;
+                        return [
+                            {name: 'langSysTag' + i, type: 'TAG', value: langSysRecord.tag},
+                            {name: 'langSys' + i, type: 'TABLE', value: new Table('langSys', [
+                                {name: 'lookupOrder', type: 'USHORT', value: 0},
+                                {name: 'reqFeatureIndex', type: 'USHORT', value: langSys.reqFeatureIndex}
+                                ].concat(ushortList('featureIndex', langSys.featureIndexes)))}
+                        ];
+                    })))}
+            ];
+        })
+    );
+}
+ScriptList.prototype = Object.create(Table.prototype);
+ScriptList.prototype.constructor = ScriptList;
+
+/**
+ * @exports opentype.FeatureList
+ * @class
+ * @param {opentype.Table}
+ * @constructor
+ * @extends opentype.Table
+ */
+function FeatureList(featureListTable) {
+    Table.call(this, 'featureListTable',
+        recordList('featureRecord', featureListTable, function(featureRecord, i) {
+            var feature = featureRecord.feature;
+            return [
+                {name: 'featureTag' + i, type: 'TAG', value: featureRecord.tag},
+                {name: 'feature' + i, type: 'TABLE', value: new Table('featureTable', [
+                    {name: 'featureParams', type: 'USHORT', value: feature.featureParams},
+                    ].concat(ushortList('lookupListIndex', feature.lookupListIndexes)))}
+            ];
+        })
+    );
+}
+FeatureList.prototype = Object.create(Table.prototype);
+FeatureList.prototype.constructor = FeatureList;
+
+/**
+ * @exports opentype.LookupList
+ * @class
+ * @param {opentype.Table}
+ * @param {Object}
+ * @constructor
+ * @extends opentype.Table
+ */
+function LookupList(lookupListTable, subtableMakers) {
+    Table.call(this, 'lookupListTable', tableList('lookup', lookupListTable, function(lookupTable) {
+        var subtableCallback = subtableMakers[lookupTable.lookupType];
+        check.assert(!!subtableCallback, 'Unable to write GSUB lookup type ' + lookupTable.lookupType + ' tables.');
+        return new Table('lookupTable', [
+            {name: 'lookupType', type: 'USHORT', value: lookupTable.lookupType},
+            {name: 'lookupFlag', type: 'USHORT', value: lookupTable.lookupFlag}
+        ].concat(tableList('subtable', lookupTable.subtables, subtableCallback)));
+    }));
+}
+LookupList.prototype = Object.create(Table.prototype);
+LookupList.prototype.constructor = LookupList;
+
+// Record = same as Table, but inlined (a Table has an offset and its data is further in the stream)
+// Don't use offsets inside Records (probable bug), only in Tables.
+exports.Record = exports.Table = Table;
+exports.Coverage = Coverage;
+exports.ScriptList = ScriptList;
+exports.FeatureList = FeatureList;
+exports.LookupList = LookupList;
+
+exports.ushortList = ushortList;
+exports.tableList = tableList;
+exports.recordList = recordList;
+
+},{"./check":3,"./types":33}],15:[function(require,module,exports){
+// The `CFF` table contains the glyph outlines in PostScript format.
+// https://www.microsoft.com/typography/OTSPEC/cff.htm
+// http://download.microsoft.com/download/8/0/1/801a191c-029d-4af3-9642-555f6fe514ee/cff.pdf
+// http://download.microsoft.com/download/8/0/1/801a191c-029d-4af3-9642-555f6fe514ee/type2.pdf
+
+
+
+var encoding = require('../encoding');
+var glyphset = require('../glyphset');
+var parse = require('../parse');
+var path = require('../path');
+var table = require('../table');
+
+// Custom equals function that can also check lists.
+function equals(a, b) {
+    if (a === b) {
+        return true;
+    } else if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length) {
+            return false;
+        }
+
+        for (var i = 0; i < a.length; i += 1) {
+            if (!equals(a[i], b[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// Parse a `CFF` INDEX array.
+// An index array consists of a list of offsets, then a list of objects at those offsets.
+function parseCFFIndex(data, start, conversionFn) {
+    //var i, objectOffset, endOffset;
+    var offsets = [];
+    var objects = [];
+    var count = parse.getCard16(data, start);
+    var i;
+    var objectOffset;
+    var endOffset;
+    if (count !== 0) {
+        var offsetSize = parse.getByte(data, start + 2);
+        objectOffset = start + ((count + 1) * offsetSize) + 2;
+        var pos = start + 3;
+        for (i = 0; i < count + 1; i += 1) {
+            offsets.push(parse.getOffset(data, pos, offsetSize));
+            pos += offsetSize;
+        }
+
+        // The total size of the index array is 4 header bytes + the value of the last offset.
+        endOffset = objectOffset + offsets[count];
+    } else {
+        endOffset = start + 2;
+    }
+
+    for (i = 0; i < offsets.length - 1; i += 1) {
+        var value = parse.getBytes(data, objectOffset + offsets[i], objectOffset + offsets[i + 1]);
+        if (conversionFn) {
+            value = conversionFn(value);
+        }
+
+        objects.push(value);
+    }
+
+    return {objects: objects, startOffset: start, endOffset: endOffset};
+}
+
+// Parse a `CFF` DICT real value.
+function parseFloatOperand(parser) {
+    var s = '';
+    var eof = 15;
+    var lookup = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', 'E', 'E-', null, '-'];
+    while (true) {
+        var b = parser.parseByte();
+        var n1 = b >> 4;
+        var n2 = b & 15;
+
+        if (n1 === eof) {
+            break;
+        }
+
+        s += lookup[n1];
+
+        if (n2 === eof) {
+            break;
+        }
+
+        s += lookup[n2];
+    }
+
+    return parseFloat(s);
+}
+
+// Parse a `CFF` DICT operand.
+function parseOperand(parser, b0) {
+    var b1;
+    var b2;
+    var b3;
+    var b4;
+    if (b0 === 28) {
+        b1 = parser.parseByte();
+        b2 = parser.parseByte();
+        return b1 << 8 | b2;
+    }
+
+    if (b0 === 29) {
+        b1 = parser.parseByte();
+        b2 = parser.parseByte();
+        b3 = parser.parseByte();
+        b4 = parser.parseByte();
+        return b1 << 24 | b2 << 16 | b3 << 8 | b4;
+    }
+
+    if (b0 === 30) {
+        return parseFloatOperand(parser);
+    }
+
+    if (b0 >= 32 && b0 <= 246) {
+        return b0 - 139;
+    }
+
+    if (b0 >= 247 && b0 <= 250) {
+        b1 = parser.parseByte();
+        return (b0 - 247) * 256 + b1 + 108;
+    }
+
+    if (b0 >= 251 && b0 <= 254) {
+        b1 = parser.parseByte();
+        return -(b0 - 251) * 256 - b1 - 108;
+    }
+
+    throw new Error('Invalid b0 ' + b0);
+}
+
+// Convert the entries returned by `parseDict` to a proper dictionary.
+// If a value is a list of one, it is unpacked.
+function entriesToObject(entries) {
+    var o = {};
+    for (var i = 0; i < entries.length; i += 1) {
+        var key = entries[i][0];
+        var values = entries[i][1];
+        var value;
+        if (values.length === 1) {
+            value = values[0];
+        } else {
+            value = values;
+        }
+
+        if (o.hasOwnProperty(key)) {
+            throw new Error('Object ' + o + ' already has key ' + key);
+        }
+
+        o[key] = value;
+    }
+
+    return o;
+}
+
+// Parse a `CFF` DICT object.
+// A dictionary contains key-value pairs in a compact tokenized format.
+function parseCFFDict(data, start, size) {
+    start = start !== undefined ? start : 0;
+    var parser = new parse.Parser(data, start);
+    var entries = [];
+    var operands = [];
+    size = size !== undefined ? size : data.length;
+
+    while (parser.relativeOffset < size) {
+        var op = parser.parseByte();
+
+        // The first byte for each dict item distinguishes between operator (key) and operand (value).
+        // Values <= 21 are operators.
+        if (op <= 21) {
+            // Two-byte operators have an initial escape byte of 12.
+            if (op === 12) {
+                op = 1200 + parser.parseByte();
+            }
+
+            entries.push([op, operands]);
+            operands = [];
+        } else {
+            // Since the operands (values) come before the operators (keys), we store all operands in a list
+            // until we encounter an operator.
+            operands.push(parseOperand(parser, op));
+        }
+    }
+
+    return entriesToObject(entries);
+}
+
+// Given a String Index (SID), return the value of the string.
+// Strings below index 392 are standard CFF strings and are not encoded in the font.
+function getCFFString(strings, index) {
+    if (index <= 390) {
+        index = encoding.cffStandardStrings[index];
+    } else {
+        index = strings[index - 391];
+    }
+
+    return index;
+}
+
+// Interpret a dictionary and return a new dictionary with readable keys and values for missing entries.
+// This function takes `meta` which is a list of objects containing `operand`, `name` and `default`.
+function interpretDict(dict, meta, strings) {
+    var newDict = {};
+
+    // Because we also want to include missing values, we start out from the meta list
+    // and lookup values in the dict.
+    for (var i = 0; i < meta.length; i += 1) {
+        var m = meta[i];
+        var value = dict[m.op];
+        if (value === undefined) {
+            value = m.value !== undefined ? m.value : null;
+        }
+
+        if (m.type === 'SID') {
+            value = getCFFString(strings, value);
+        }
+
+        newDict[m.name] = value;
+    }
+
+    return newDict;
+}
+
+// Parse the CFF header.
+function parseCFFHeader(data, start) {
+    var header = {};
+    header.formatMajor = parse.getCard8(data, start);
+    header.formatMinor = parse.getCard8(data, start + 1);
+    header.size = parse.getCard8(data, start + 2);
+    header.offsetSize = parse.getCard8(data, start + 3);
+    header.startOffset = start;
+    header.endOffset = start + 4;
+    return header;
+}
+
+var TOP_DICT_META = [
+    {name: 'version', op: 0, type: 'SID'},
+    {name: 'notice', op: 1, type: 'SID'},
+    {name: 'copyright', op: 1200, type: 'SID'},
+    {name: 'fullName', op: 2, type: 'SID'},
+    {name: 'familyName', op: 3, type: 'SID'},
+    {name: 'weight', op: 4, type: 'SID'},
+    {name: 'isFixedPitch', op: 1201, type: 'number', value: 0},
+    {name: 'italicAngle', op: 1202, type: 'number', value: 0},
+    {name: 'underlinePosition', op: 1203, type: 'number', value: -100},
+    {name: 'underlineThickness', op: 1204, type: 'number', value: 50},
+    {name: 'paintType', op: 1205, type: 'number', value: 0},
+    {name: 'charstringType', op: 1206, type: 'number', value: 2},
+    {name: 'fontMatrix', op: 1207, type: ['real', 'real', 'real', 'real', 'real', 'real'], value: [0.001, 0, 0, 0.001, 0, 0]},
+    {name: 'uniqueId', op: 13, type: 'number'},
+    {name: 'fontBBox', op: 5, type: ['number', 'number', 'number', 'number'], value: [0, 0, 0, 0]},
+    {name: 'strokeWidth', op: 1208, type: 'number', value: 0},
+    {name: 'xuid', op: 14, type: [], value: null},
+    {name: 'charset', op: 15, type: 'offset', value: 0},
+    {name: 'encoding', op: 16, type: 'offset', value: 0},
+    {name: 'charStrings', op: 17, type: 'offset', value: 0},
+    {name: 'private', op: 18, type: ['number', 'offset'], value: [0, 0]}
+];
+
+var PRIVATE_DICT_META = [
+    {name: 'subrs', op: 19, type: 'offset', value: 0},
+    {name: 'defaultWidthX', op: 20, type: 'number', value: 0},
+    {name: 'nominalWidthX', op: 21, type: 'number', value: 0}
+];
+
+// Parse the CFF top dictionary. A CFF table can contain multiple fonts, each with their own top dictionary.
+// The top dictionary contains the essential metadata for the font, together with the private dictionary.
+function parseCFFTopDict(data, strings) {
+    var dict = parseCFFDict(data, 0, data.byteLength);
+    return interpretDict(dict, TOP_DICT_META, strings);
+}
+
+// Parse the CFF private dictionary. We don't fully parse out all the values, only the ones we need.
+function parseCFFPrivateDict(data, start, size, strings) {
+    var dict = parseCFFDict(data, start, size);
+    return interpretDict(dict, PRIVATE_DICT_META, strings);
+}
+
+// Parse the CFF charset table, which contains internal names for all the glyphs.
+// This function will return a list of glyph names.
+// See Adobe TN #5176 chapter 13, "Charsets".
+function parseCFFCharset(data, start, nGlyphs, strings) {
+    var i;
+    var sid;
+    var count;
+    var parser = new parse.Parser(data, start);
+
+    // The .notdef glyph is not included, so subtract 1.
+    nGlyphs -= 1;
+    var charset = ['.notdef'];
+
+    var format = parser.parseCard8();
+    if (format === 0) {
+        for (i = 0; i < nGlyphs; i += 1) {
+            sid = parser.parseSID();
+            charset.push(getCFFString(strings, sid));
+        }
+    } else if (format === 1) {
+        while (charset.length <= nGlyphs) {
+            sid = parser.parseSID();
+            count = parser.parseCard8();
+            for (i = 0; i <= count; i += 1) {
+                charset.push(getCFFString(strings, sid));
+                sid += 1;
+            }
+        }
+    } else if (format === 2) {
+        while (charset.length <= nGlyphs) {
+            sid = parser.parseSID();
+            count = parser.parseCard16();
+            for (i = 0; i <= count; i += 1) {
+                charset.push(getCFFString(strings, sid));
+                sid += 1;
+            }
+        }
+    } else {
+        throw new Error('Unknown charset format ' + format);
+    }
+
+    return charset;
+}
+
+// Parse the CFF encoding data. Only one encoding can be specified per font.
+// See Adobe TN #5176 chapter 12, "Encodings".
+function parseCFFEncoding(data, start, charset) {
+    var i;
+    var code;
+    var enc = {};
+    var parser = new parse.Parser(data, start);
+    var format = parser.parseCard8();
+    if (format === 0) {
+        var nCodes = parser.parseCard8();
+        for (i = 0; i < nCodes; i += 1) {
+            code = parser.parseCard8();
+            enc[code] = i;
+        }
+    } else if (format === 1) {
+        var nRanges = parser.parseCard8();
+        code = 1;
+        for (i = 0; i < nRanges; i += 1) {
+            var first = parser.parseCard8();
+            var nLeft = parser.parseCard8();
+            for (var j = first; j <= first + nLeft; j += 1) {
+                enc[j] = code;
+                code += 1;
+            }
+        }
+    } else {
+        throw new Error('Unknown encoding format ' + format);
+    }
+
+    return new encoding.CffEncoding(enc, charset);
+}
+
+// Take in charstring code and return a Glyph object.
+// The encoding is described in the Type 2 Charstring Format
+// https://www.microsoft.com/typography/OTSPEC/charstr2.htm
+function parseCFFCharstring(font, glyph, code) {
+    var c1x;
+    var c1y;
+    var c2x;
+    var c2y;
+    var p = new path.Path();
+    var stack = [];
+    var nStems = 0;
+    var haveWidth = false;
+    var width = font.defaultWidthX;
+    var open = false;
+    var x = 0;
+    var y = 0;
+
+    function newContour(x, y) {
+        if (open) {
+            p.closePath();
+        }
+
+        p.moveTo(x, y);
+        open = true;
+    }
+
+    function parseStems() {
+        var hasWidthArg;
+
+        // The number of stem operators on the stack is always even.
+        // If the value is uneven, that means a width is specified.
+        hasWidthArg = stack.length % 2 !== 0;
+        if (hasWidthArg && !haveWidth) {
+            width = stack.shift() + font.nominalWidthX;
+        }
+
+        nStems += stack.length >> 1;
+        stack.length = 0;
+        haveWidth = true;
+    }
+
+    function parse(code) {
+        var b1;
+        var b2;
+        var b3;
+        var b4;
+        var codeIndex;
+        var subrCode;
+        var jpx;
+        var jpy;
+        var c3x;
+        var c3y;
+        var c4x;
+        var c4y;
+
+        var i = 0;
+        while (i < code.length) {
+            var v = code[i];
+            i += 1;
+            switch (v) {
+                case 1: // hstem
+                    parseStems();
+                    break;
+                case 3: // vstem
+                    parseStems();
+                    break;
+                case 4: // vmoveto
+                    if (stack.length > 1 && !haveWidth) {
+                        width = stack.shift() + font.nominalWidthX;
+                        haveWidth = true;
+                    }
+
+                    y += stack.pop();
+                    newContour(x, y);
+                    break;
+                case 5: // rlineto
+                    while (stack.length > 0) {
+                        x += stack.shift();
+                        y += stack.shift();
+                        p.lineTo(x, y);
+                    }
+
+                    break;
+                case 6: // hlineto
+                    while (stack.length > 0) {
+                        x += stack.shift();
+                        p.lineTo(x, y);
+                        if (stack.length === 0) {
+                            break;
+                        }
+
+                        y += stack.shift();
+                        p.lineTo(x, y);
+                    }
+
+                    break;
+                case 7: // vlineto
+                    while (stack.length > 0) {
+                        y += stack.shift();
+                        p.lineTo(x, y);
+                        if (stack.length === 0) {
+                            break;
+                        }
+
+                        x += stack.shift();
+                        p.lineTo(x, y);
+                    }
+
+                    break;
+                case 8: // rrcurveto
+                    while (stack.length > 0) {
+                        c1x = x + stack.shift();
+                        c1y = y + stack.shift();
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x + stack.shift();
+                        y = c2y + stack.shift();
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    break;
+                case 10: // callsubr
+                    codeIndex = stack.pop() + font.subrsBias;
+                    subrCode = font.subrs[codeIndex];
+                    if (subrCode) {
+                        parse(subrCode);
+                    }
+
+                    break;
+                case 11: // return
+                    return;
+                case 12: // flex operators
+                    v = code[i];
+                    i += 1;
+                    switch (v) {
+                        case 35: // flex
+                            // |- dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 dx6 dy6 fd flex (12 35) |-
+                            c1x = x   + stack.shift();    // dx1
+                            c1y = y   + stack.shift();    // dy1
+                            c2x = c1x + stack.shift();    // dx2
+                            c2y = c1y + stack.shift();    // dy2
+                            jpx = c2x + stack.shift();    // dx3
+                            jpy = c2y + stack.shift();    // dy3
+                            c3x = jpx + stack.shift();    // dx4
+                            c3y = jpy + stack.shift();    // dy4
+                            c4x = c3x + stack.shift();    // dx5
+                            c4y = c3y + stack.shift();    // dy5
+                            x = c4x + stack.shift();      // dx6
+                            y = c4y + stack.shift();      // dy6
+                            stack.shift();                // flex depth
+                            p.curveTo(c1x, c1y, c2x, c2y, jpx, jpy);
+                            p.curveTo(c3x, c3y, c4x, c4y, x, y);
+                            break;
+                        case 34: // hflex
+                            // |- dx1 dx2 dy2 dx3 dx4 dx5 dx6 hflex (12 34) |-
+                            c1x = x   + stack.shift();    // dx1
+                            c1y = y;                      // dy1
+                            c2x = c1x + stack.shift();    // dx2
+                            c2y = c1y + stack.shift();    // dy2
+                            jpx = c2x + stack.shift();    // dx3
+                            jpy = c2y;                    // dy3
+                            c3x = jpx + stack.shift();    // dx4
+                            c3y = c2y;                    // dy4
+                            c4x = c3x + stack.shift();    // dx5
+                            c4y = y;                      // dy5
+                            x = c4x + stack.shift();      // dx6
+                            p.curveTo(c1x, c1y, c2x, c2y, jpx, jpy);
+                            p.curveTo(c3x, c3y, c4x, c4y, x, y);
+                            break;
+                        case 36: // hflex1
+                            // |- dx1 dy1 dx2 dy2 dx3 dx4 dx5 dy5 dx6 hflex1 (12 36) |-
+                            c1x = x   + stack.shift();    // dx1
+                            c1y = y   + stack.shift();    // dy1
+                            c2x = c1x + stack.shift();    // dx2
+                            c2y = c1y + stack.shift();    // dy2
+                            jpx = c2x + stack.shift();    // dx3
+                            jpy = c2y;                    // dy3
+                            c3x = jpx + stack.shift();    // dx4
+                            c3y = c2y;                    // dy4
+                            c4x = c3x + stack.shift();    // dx5
+                            c4y = c3y + stack.shift();    // dy5
+                            x = c4x + stack.shift();      // dx6
+                            p.curveTo(c1x, c1y, c2x, c2y, jpx, jpy);
+                            p.curveTo(c3x, c3y, c4x, c4y, x, y);
+                            break;
+                        case 37: // flex1
+                            // |- dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 d6 flex1 (12 37) |-
+                            c1x = x   + stack.shift();    // dx1
+                            c1y = y   + stack.shift();    // dy1
+                            c2x = c1x + stack.shift();    // dx2
+                            c2y = c1y + stack.shift();    // dy2
+                            jpx = c2x + stack.shift();    // dx3
+                            jpy = c2y + stack.shift();    // dy3
+                            c3x = jpx + stack.shift();    // dx4
+                            c3y = jpy + stack.shift();    // dy4
+                            c4x = c3x + stack.shift();    // dx5
+                            c4y = c3y + stack.shift();    // dy5
+                            if (Math.abs(c4x - x) > Math.abs(c4y - y)) {
+                                x = c4x + stack.shift();
+                            } else {
+                                y = c4y + stack.shift();
+                            }
+
+                            p.curveTo(c1x, c1y, c2x, c2y, jpx, jpy);
+                            p.curveTo(c3x, c3y, c4x, c4y, x, y);
+                            break;
+                        default:
+                            console.log('Glyph ' + glyph.index + ': unknown operator ' + 1200 + v);
+                            stack.length = 0;
+                    }
+                    break;
+                case 14: // endchar
+                    if (stack.length > 0 && !haveWidth) {
+                        width = stack.shift() + font.nominalWidthX;
+                        haveWidth = true;
+                    }
+
+                    if (open) {
+                        p.closePath();
+                        open = false;
+                    }
+
+                    break;
+                case 18: // hstemhm
+                    parseStems();
+                    break;
+                case 19: // hintmask
+                case 20: // cntrmask
+                    parseStems();
+                    i += (nStems + 7) >> 3;
+                    break;
+                case 21: // rmoveto
+                    if (stack.length > 2 && !haveWidth) {
+                        width = stack.shift() + font.nominalWidthX;
+                        haveWidth = true;
+                    }
+
+                    y += stack.pop();
+                    x += stack.pop();
+                    newContour(x, y);
+                    break;
+                case 22: // hmoveto
+                    if (stack.length > 1 && !haveWidth) {
+                        width = stack.shift() + font.nominalWidthX;
+                        haveWidth = true;
+                    }
+
+                    x += stack.pop();
+                    newContour(x, y);
+                    break;
+                case 23: // vstemhm
+                    parseStems();
+                    break;
+                case 24: // rcurveline
+                    while (stack.length > 2) {
+                        c1x = x + stack.shift();
+                        c1y = y + stack.shift();
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x + stack.shift();
+                        y = c2y + stack.shift();
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    x += stack.shift();
+                    y += stack.shift();
+                    p.lineTo(x, y);
+                    break;
+                case 25: // rlinecurve
+                    while (stack.length > 6) {
+                        x += stack.shift();
+                        y += stack.shift();
+                        p.lineTo(x, y);
+                    }
+
+                    c1x = x + stack.shift();
+                    c1y = y + stack.shift();
+                    c2x = c1x + stack.shift();
+                    c2y = c1y + stack.shift();
+                    x = c2x + stack.shift();
+                    y = c2y + stack.shift();
+                    p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    break;
+                case 26: // vvcurveto
+                    if (stack.length % 2) {
+                        x += stack.shift();
+                    }
+
+                    while (stack.length > 0) {
+                        c1x = x;
+                        c1y = y + stack.shift();
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x;
+                        y = c2y + stack.shift();
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    break;
+                case 27: // hhcurveto
+                    if (stack.length % 2) {
+                        y += stack.shift();
+                    }
+
+                    while (stack.length > 0) {
+                        c1x = x + stack.shift();
+                        c1y = y;
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x + stack.shift();
+                        y = c2y;
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    break;
+                case 28: // shortint
+                    b1 = code[i];
+                    b2 = code[i + 1];
+                    stack.push(((b1 << 24) | (b2 << 16)) >> 16);
+                    i += 2;
+                    break;
+                case 29: // callgsubr
+                    codeIndex = stack.pop() + font.gsubrsBias;
+                    subrCode = font.gsubrs[codeIndex];
+                    if (subrCode) {
+                        parse(subrCode);
+                    }
+
+                    break;
+                case 30: // vhcurveto
+                    while (stack.length > 0) {
+                        c1x = x;
+                        c1y = y + stack.shift();
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x + stack.shift();
+                        y = c2y + (stack.length === 1 ? stack.shift() : 0);
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                        if (stack.length === 0) {
+                            break;
+                        }
+
+                        c1x = x + stack.shift();
+                        c1y = y;
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        y = c2y + stack.shift();
+                        x = c2x + (stack.length === 1 ? stack.shift() : 0);
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    break;
+                case 31: // hvcurveto
+                    while (stack.length > 0) {
+                        c1x = x + stack.shift();
+                        c1y = y;
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        y = c2y + stack.shift();
+                        x = c2x + (stack.length === 1 ? stack.shift() : 0);
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                        if (stack.length === 0) {
+                            break;
+                        }
+
+                        c1x = x;
+                        c1y = y + stack.shift();
+                        c2x = c1x + stack.shift();
+                        c2y = c1y + stack.shift();
+                        x = c2x + stack.shift();
+                        y = c2y + (stack.length === 1 ? stack.shift() : 0);
+                        p.curveTo(c1x, c1y, c2x, c2y, x, y);
+                    }
+
+                    break;
+                default:
+                    if (v < 32) {
+                        console.log('Glyph ' + glyph.index + ': unknown operator ' + v);
+                    } else if (v < 247) {
+                        stack.push(v - 139);
+                    } else if (v < 251) {
+                        b1 = code[i];
+                        i += 1;
+                        stack.push((v - 247) * 256 + b1 + 108);
+                    } else if (v < 255) {
+                        b1 = code[i];
+                        i += 1;
+                        stack.push(-(v - 251) * 256 - b1 - 108);
+                    } else {
+                        b1 = code[i];
+                        b2 = code[i + 1];
+                        b3 = code[i + 2];
+                        b4 = code[i + 3];
+                        i += 4;
+                        stack.push(((b1 << 24) | (b2 << 16) | (b3 << 8) | b4) / 65536);
+                    }
+            }
+        }
+    }
+
+    parse(code);
+
+    glyph.advanceWidth = width;
+    return p;
+}
+
+// Subroutines are encoded using the negative half of the number space.
+// See type 2 chapter 4.7 "Subroutine operators".
+function calcCFFSubroutineBias(subrs) {
+    var bias;
+    if (subrs.length < 1240) {
+        bias = 107;
+    } else if (subrs.length < 33900) {
+        bias = 1131;
+    } else {
+        bias = 32768;
+    }
+
+    return bias;
+}
+
+// Parse the `CFF` table, which contains the glyph outlines in PostScript format.
+function parseCFFTable(data, start, font) {
+    font.tables.cff = {};
+    var header = parseCFFHeader(data, start);
+    var nameIndex = parseCFFIndex(data, header.endOffset, parse.bytesToString);
+    var topDictIndex = parseCFFIndex(data, nameIndex.endOffset);
+    var stringIndex = parseCFFIndex(data, topDictIndex.endOffset, parse.bytesToString);
+    var globalSubrIndex = parseCFFIndex(data, stringIndex.endOffset);
+    font.gsubrs = globalSubrIndex.objects;
+    font.gsubrsBias = calcCFFSubroutineBias(font.gsubrs);
+
+    var topDictData = new DataView(new Uint8Array(topDictIndex.objects[0]).buffer);
+    var topDict = parseCFFTopDict(topDictData, stringIndex.objects);
+    font.tables.cff.topDict = topDict;
+
+    var privateDictOffset = start + topDict['private'][1];
+    var privateDict = parseCFFPrivateDict(data, privateDictOffset, topDict['private'][0], stringIndex.objects);
+    font.defaultWidthX = privateDict.defaultWidthX;
+    font.nominalWidthX = privateDict.nominalWidthX;
+
+    if (privateDict.subrs !== 0) {
+        var subrOffset = privateDictOffset + privateDict.subrs;
+        var subrIndex = parseCFFIndex(data, subrOffset);
+        font.subrs = subrIndex.objects;
+        font.subrsBias = calcCFFSubroutineBias(font.subrs);
+    } else {
+        font.subrs = [];
+        font.subrsBias = 0;
+    }
+
+    // Offsets in the top dict are relative to the beginning of the CFF data, so add the CFF start offset.
+    var charStringsIndex = parseCFFIndex(data, start + topDict.charStrings);
+    font.nGlyphs = charStringsIndex.objects.length;
+
+    var charset = parseCFFCharset(data, start + topDict.charset, font.nGlyphs, stringIndex.objects);
+    if (topDict.encoding === 0) { // Standard encoding
+        font.cffEncoding = new encoding.CffEncoding(encoding.cffStandardEncoding, charset);
+    } else if (topDict.encoding === 1) { // Expert encoding
+        font.cffEncoding = new encoding.CffEncoding(encoding.cffExpertEncoding, charset);
+    } else {
+        font.cffEncoding = parseCFFEncoding(data, start + topDict.encoding, charset);
+    }
+
+    // Prefer the CMAP encoding to the CFF encoding.
+    font.encoding = font.encoding || font.cffEncoding;
+
+    font.glyphs = new glyphset.GlyphSet(font);
+    for (var i = 0; i < font.nGlyphs; i += 1) {
+        var charString = charStringsIndex.objects[i];
+        font.glyphs.push(i, glyphset.cffGlyphLoader(font, i, parseCFFCharstring, charString));
+    }
+}
+
+// Convert a string to a String ID (SID).
+// The list of strings is modified in place.
+function encodeString(s, strings) {
+    var sid;
+
+    // Is the string in the CFF standard strings?
+    var i = encoding.cffStandardStrings.indexOf(s);
+    if (i >= 0) {
+        sid = i;
+    }
+
+    // Is the string already in the string index?
+    i = strings.indexOf(s);
+    if (i >= 0) {
+        sid = i + encoding.cffStandardStrings.length;
+    } else {
+        sid = encoding.cffStandardStrings.length + strings.length;
+        strings.push(s);
+    }
+
+    return sid;
+}
+
+function makeHeader() {
+    return new table.Record('Header', [
+        {name: 'major', type: 'Card8', value: 1},
+        {name: 'minor', type: 'Card8', value: 0},
+        {name: 'hdrSize', type: 'Card8', value: 4},
+        {name: 'major', type: 'Card8', value: 1}
+    ]);
+}
+
+function makeNameIndex(fontNames) {
+    var t = new table.Record('Name INDEX', [
+        {name: 'names', type: 'INDEX', value: []}
+    ]);
+    t.names = [];
+    for (var i = 0; i < fontNames.length; i += 1) {
+        t.names.push({name: 'name_' + i, type: 'NAME', value: fontNames[i]});
+    }
+
+    return t;
+}
+
+// Given a dictionary's metadata, create a DICT structure.
+function makeDict(meta, attrs, strings) {
+    var m = {};
+    for (var i = 0; i < meta.length; i += 1) {
+        var entry = meta[i];
+        var value = attrs[entry.name];
+        if (value !== undefined && !equals(value, entry.value)) {
+            if (entry.type === 'SID') {
+                value = encodeString(value, strings);
+            }
+
+            m[entry.op] = {name: entry.name, type: entry.type, value: value};
+        }
+    }
+
+    return m;
+}
+
+// The Top DICT houses the global font attributes.
+function makeTopDict(attrs, strings) {
+    var t = new table.Record('Top DICT', [
+        {name: 'dict', type: 'DICT', value: {}}
+    ]);
+    t.dict = makeDict(TOP_DICT_META, attrs, strings);
+    return t;
+}
+
+function makeTopDictIndex(topDict) {
+    var t = new table.Record('Top DICT INDEX', [
+        {name: 'topDicts', type: 'INDEX', value: []}
+    ]);
+    t.topDicts = [{name: 'topDict_0', type: 'TABLE', value: topDict}];
+    return t;
+}
+
+function makeStringIndex(strings) {
+    var t = new table.Record('String INDEX', [
+        {name: 'strings', type: 'INDEX', value: []}
+    ]);
+    t.strings = [];
+    for (var i = 0; i < strings.length; i += 1) {
+        t.strings.push({name: 'string_' + i, type: 'STRING', value: strings[i]});
+    }
+
+    return t;
+}
+
+function makeGlobalSubrIndex() {
+    // Currently we don't use subroutines.
+    return new table.Record('Global Subr INDEX', [
+        {name: 'subrs', type: 'INDEX', value: []}
+    ]);
+}
+
+function makeCharsets(glyphNames, strings) {
+    var t = new table.Record('Charsets', [
+        {name: 'format', type: 'Card8', value: 0}
+    ]);
+    for (var i = 0; i < glyphNames.length; i += 1) {
+        var glyphName = glyphNames[i];
+        var glyphSID = encodeString(glyphName, strings);
+        t.fields.push({name: 'glyph_' + i, type: 'SID', value: glyphSID});
+    }
+
+    return t;
+}
+
+function glyphToOps(glyph) {
+    var ops = [];
+    var path = glyph.path;
+    ops.push({name: 'width', type: 'NUMBER', value: glyph.advanceWidth});
+    var x = 0;
+    var y = 0;
+    for (var i = 0; i < path.commands.length; i += 1) {
+        var dx;
+        var dy;
+        var cmd = path.commands[i];
+        if (cmd.type === 'Q') {
+            // CFF only supports bézier curves, so convert the quad to a bézier.
+            var _13 = 1 / 3;
+            var _23 = 2 / 3;
+
+            // We're going to create a new command so we don't change the original path.
+            cmd = {
+                type: 'C',
+                x: cmd.x,
+                y: cmd.y,
+                x1: _13 * x + _23 * cmd.x1,
+                y1: _13 * y + _23 * cmd.y1,
+                x2: _13 * cmd.x + _23 * cmd.x1,
+                y2: _13 * cmd.y + _23 * cmd.y1
+            };
+        }
+
+        if (cmd.type === 'M') {
+            dx = Math.round(cmd.x - x);
+            dy = Math.round(cmd.y - y);
+            ops.push({name: 'dx', type: 'NUMBER', value: dx});
+            ops.push({name: 'dy', type: 'NUMBER', value: dy});
+            ops.push({name: 'rmoveto', type: 'OP', value: 21});
+            x = Math.round(cmd.x);
+            y = Math.round(cmd.y);
+        } else if (cmd.type === 'L') {
+            dx = Math.round(cmd.x - x);
+            dy = Math.round(cmd.y - y);
+            ops.push({name: 'dx', type: 'NUMBER', value: dx});
+            ops.push({name: 'dy', type: 'NUMBER', value: dy});
+            ops.push({name: 'rlineto', type: 'OP', value: 5});
+            x = Math.round(cmd.x);
+            y = Math.round(cmd.y);
+        } else if (cmd.type === 'C') {
+            var dx1 = Math.round(cmd.x1 - x);
+            var dy1 = Math.round(cmd.y1 - y);
+            var dx2 = Math.round(cmd.x2 - cmd.x1);
+            var dy2 = Math.round(cmd.y2 - cmd.y1);
+            dx = Math.round(cmd.x - cmd.x2);
+            dy = Math.round(cmd.y - cmd.y2);
+            ops.push({name: 'dx1', type: 'NUMBER', value: dx1});
+            ops.push({name: 'dy1', type: 'NUMBER', value: dy1});
+            ops.push({name: 'dx2', type: 'NUMBER', value: dx2});
+            ops.push({name: 'dy2', type: 'NUMBER', value: dy2});
+            ops.push({name: 'dx', type: 'NUMBER', value: dx});
+            ops.push({name: 'dy', type: 'NUMBER', value: dy});
+            ops.push({name: 'rrcurveto', type: 'OP', value: 8});
+            x = Math.round(cmd.x);
+            y = Math.round(cmd.y);
+        }
+
+        // Contours are closed automatically.
+
+    }
+
+    ops.push({name: 'endchar', type: 'OP', value: 14});
+    return ops;
+}
+
+function makeCharStringsIndex(glyphs) {
+    var t = new table.Record('CharStrings INDEX', [
+        {name: 'charStrings', type: 'INDEX', value: []}
+    ]);
+
+    for (var i = 0; i < glyphs.length; i += 1) {
+        var glyph = glyphs.get(i);
+        var ops = glyphToOps(glyph);
+        t.charStrings.push({name: glyph.name, type: 'CHARSTRING', value: ops});
+    }
+
+    return t;
+}
+
+function makePrivateDict(attrs, strings) {
+    var t = new table.Record('Private DICT', [
+        {name: 'dict', type: 'DICT', value: {}}
+    ]);
+    t.dict = makeDict(PRIVATE_DICT_META, attrs, strings);
+    return t;
+}
+
+function makeCFFTable(glyphs, options) {
+    var t = new table.Table('CFF ', [
+        {name: 'header', type: 'RECORD'},
+        {name: 'nameIndex', type: 'RECORD'},
+        {name: 'topDictIndex', type: 'RECORD'},
+        {name: 'stringIndex', type: 'RECORD'},
+        {name: 'globalSubrIndex', type: 'RECORD'},
+        {name: 'charsets', type: 'RECORD'},
+        {name: 'charStringsIndex', type: 'RECORD'},
+        {name: 'privateDict', type: 'RECORD'}
+    ]);
+
+    var fontScale = 1 / options.unitsPerEm;
+    // We use non-zero values for the offsets so that the DICT encodes them.
+    // This is important because the size of the Top DICT plays a role in offset calculation,
+    // and the size shouldn't change after we've written correct offsets.
+    var attrs = {
+        version: options.version,
+        fullName: options.fullName,
+        familyName: options.familyName,
+        weight: options.weightName,
+        fontBBox: options.fontBBox || [0, 0, 0, 0],
+        fontMatrix: [fontScale, 0, 0, fontScale, 0, 0],
+        charset: 999,
+        encoding: 0,
+        charStrings: 999,
+        private: [0, 999]
+    };
+
+    var privateAttrs = {};
+
+    var glyphNames = [];
+    var glyph;
+
+    // Skip first glyph (.notdef)
+    for (var i = 1; i < glyphs.length; i += 1) {
+        glyph = glyphs.get(i);
+        glyphNames.push(glyph.name);
+    }
+
+    var strings = [];
+
+    t.header = makeHeader();
+    t.nameIndex = makeNameIndex([options.postScriptName]);
+    var topDict = makeTopDict(attrs, strings);
+    t.topDictIndex = makeTopDictIndex(topDict);
+    t.globalSubrIndex = makeGlobalSubrIndex();
+    t.charsets = makeCharsets(glyphNames, strings);
+    t.charStringsIndex = makeCharStringsIndex(glyphs);
+    t.privateDict = makePrivateDict(privateAttrs, strings);
+
+    // Needs to come at the end, to encode all custom strings used in the font.
+    t.stringIndex = makeStringIndex(strings);
+
+    var startOffset = t.header.sizeOf() +
+        t.nameIndex.sizeOf() +
+        t.topDictIndex.sizeOf() +
+        t.stringIndex.sizeOf() +
+        t.globalSubrIndex.sizeOf();
+    attrs.charset = startOffset;
+
+    // We use the CFF standard encoding; proper encoding will be handled in cmap.
+    attrs.encoding = 0;
+    attrs.charStrings = attrs.charset + t.charsets.sizeOf();
+    attrs.private[1] = attrs.charStrings + t.charStringsIndex.sizeOf();
+
+    // Recreate the Top DICT INDEX with the correct offsets.
+    topDict = makeTopDict(attrs, strings);
+    t.topDictIndex = makeTopDictIndex(topDict);
+
+    return t;
+}
+
+exports.parse = parseCFFTable;
+exports.make = makeCFFTable;
+
+},{"../encoding":5,"../glyphset":8,"../parse":11,"../path":12,"../table":14}],16:[function(require,module,exports){
+// The `cmap` table stores the mappings from characters to glyphs.
+// https://www.microsoft.com/typography/OTSPEC/cmap.htm
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+var table = require('../table');
+
+function parseCmapTableFormat12(cmap, p) {
+    var i;
+
+    //Skip reserved.
+    p.parseUShort();
+
+    // Length in bytes of the sub-tables.
+    cmap.length = p.parseULong();
+    cmap.language = p.parseULong();
+
+    var groupCount;
+    cmap.groupCount = groupCount = p.parseULong();
+    cmap.glyphIndexMap = {};
+
+    for (i = 0; i < groupCount; i += 1) {
+        var startCharCode = p.parseULong();
+        var endCharCode = p.parseULong();
+        var startGlyphId = p.parseULong();
+
+        for (var c = startCharCode; c <= endCharCode; c += 1) {
+            cmap.glyphIndexMap[c] = startGlyphId;
+            startGlyphId++;
+        }
+    }
+}
+
+function parseCmapTableFormat4(cmap, p, data, start, offset) {
+    var i;
+
+    // Length in bytes of the sub-tables.
+    cmap.length = p.parseUShort();
+    cmap.language = p.parseUShort();
+
+    // segCount is stored x 2.
+    var segCount;
+    cmap.segCount = segCount = p.parseUShort() >> 1;
+
+    // Skip searchRange, entrySelector, rangeShift.
+    p.skip('uShort', 3);
+
+    // The "unrolled" mapping from character codes to glyph indices.
+    cmap.glyphIndexMap = {};
+    var endCountParser = new parse.Parser(data, start + offset + 14);
+    var startCountParser = new parse.Parser(data, start + offset + 16 + segCount * 2);
+    var idDeltaParser = new parse.Parser(data, start + offset + 16 + segCount * 4);
+    var idRangeOffsetParser = new parse.Parser(data, start + offset + 16 + segCount * 6);
+    var glyphIndexOffset = start + offset + 16 + segCount * 8;
+    for (i = 0; i < segCount - 1; i += 1) {
+        var glyphIndex;
+        var endCount = endCountParser.parseUShort();
+        var startCount = startCountParser.parseUShort();
+        var idDelta = idDeltaParser.parseShort();
+        var idRangeOffset = idRangeOffsetParser.parseUShort();
+        for (var c = startCount; c <= endCount; c += 1) {
+            if (idRangeOffset !== 0) {
+                // The idRangeOffset is relative to the current position in the idRangeOffset array.
+                // Take the current offset in the idRangeOffset array.
+                glyphIndexOffset = (idRangeOffsetParser.offset + idRangeOffsetParser.relativeOffset - 2);
+
+                // Add the value of the idRangeOffset, which will move us into the glyphIndex array.
+                glyphIndexOffset += idRangeOffset;
+
+                // Then add the character index of the current segment, multiplied by 2 for USHORTs.
+                glyphIndexOffset += (c - startCount) * 2;
+                glyphIndex = parse.getUShort(data, glyphIndexOffset);
+                if (glyphIndex !== 0) {
+                    glyphIndex = (glyphIndex + idDelta) & 0xFFFF;
+                }
+            } else {
+                glyphIndex = (c + idDelta) & 0xFFFF;
+            }
+
+            cmap.glyphIndexMap[c] = glyphIndex;
+        }
+    }
+}
+
+// Parse the `cmap` table. This table stores the mappings from characters to glyphs.
+// There are many available formats, but we only support the Windows format 4 and 12.
+// This function returns a `CmapEncoding` object or null if no supported format could be found.
+function parseCmapTable(data, start) {
+    var i;
+    var cmap = {};
+    cmap.version = parse.getUShort(data, start);
+    check.argument(cmap.version === 0, 'cmap table version should be 0.');
+
+    // The cmap table can contain many sub-tables, each with their own format.
+    // We're only interested in a "platform 3" table. This is a Windows format.
+    cmap.numTables = parse.getUShort(data, start + 2);
+    var offset = -1;
+    for (i = cmap.numTables - 1; i >= 0; i -= 1) {
+        var platformId = parse.getUShort(data, start + 4 + (i * 8));
+        var encodingId = parse.getUShort(data, start + 4 + (i * 8) + 2);
+        if (platformId === 3 && (encodingId === 0 || encodingId === 1 || encodingId === 10)) {
+            offset = parse.getULong(data, start + 4 + (i * 8) + 4);
+            break;
+        }
+    }
+
+    if (offset === -1) {
+        // There is no cmap table in the font that we support, so return null.
+        // This font will be marked as unsupported.
+        return null;
+    }
+
+    var p = new parse.Parser(data, start + offset);
+    cmap.format = p.parseUShort();
+
+    if (cmap.format === 12) {
+        parseCmapTableFormat12(cmap, p);
+    } else if (cmap.format === 4) {
+        parseCmapTableFormat4(cmap, p, data, start, offset);
+    } else {
+        throw new Error('Only format 4 and 12 cmap tables are supported.');
+    }
+
+    return cmap;
+}
+
+function addSegment(t, code, glyphIndex) {
+    t.segments.push({
+        end: code,
+        start: code,
+        delta: -(code - glyphIndex),
+        offset: 0
+    });
+}
+
+function addTerminatorSegment(t) {
+    t.segments.push({
+        end: 0xFFFF,
+        start: 0xFFFF,
+        delta: 1,
+        offset: 0
+    });
+}
+
+function makeCmapTable(glyphs) {
+    var i;
+    var t = new table.Table('cmap', [
+        {name: 'version', type: 'USHORT', value: 0},
+        {name: 'numTables', type: 'USHORT', value: 1},
+        {name: 'platformID', type: 'USHORT', value: 3},
+        {name: 'encodingID', type: 'USHORT', value: 1},
+        {name: 'offset', type: 'ULONG', value: 12},
+        {name: 'format', type: 'USHORT', value: 4},
+        {name: 'length', type: 'USHORT', value: 0},
+        {name: 'language', type: 'USHORT', value: 0},
+        {name: 'segCountX2', type: 'USHORT', value: 0},
+        {name: 'searchRange', type: 'USHORT', value: 0},
+        {name: 'entrySelector', type: 'USHORT', value: 0},
+        {name: 'rangeShift', type: 'USHORT', value: 0}
+    ]);
+
+    t.segments = [];
+    for (i = 0; i < glyphs.length; i += 1) {
+        var glyph = glyphs.get(i);
+        for (var j = 0; j < glyph.unicodes.length; j += 1) {
+            addSegment(t, glyph.unicodes[j], i);
+        }
+
+        t.segments = t.segments.sort(function(a, b) {
+            return a.start - b.start;
+        });
+    }
+
+    addTerminatorSegment(t);
+
+    var segCount;
+    segCount = t.segments.length;
+    t.segCountX2 = segCount * 2;
+    t.searchRange = Math.pow(2, Math.floor(Math.log(segCount) / Math.log(2))) * 2;
+    t.entrySelector = Math.log(t.searchRange / 2) / Math.log(2);
+    t.rangeShift = t.segCountX2 - t.searchRange;
+
+    // Set up parallel segment arrays.
+    var endCounts = [];
+    var startCounts = [];
+    var idDeltas = [];
+    var idRangeOffsets = [];
+    var glyphIds = [];
+
+    for (i = 0; i < segCount; i += 1) {
+        var segment = t.segments[i];
+        endCounts = endCounts.concat({name: 'end_' + i, type: 'USHORT', value: segment.end});
+        startCounts = startCounts.concat({name: 'start_' + i, type: 'USHORT', value: segment.start});
+        idDeltas = idDeltas.concat({name: 'idDelta_' + i, type: 'SHORT', value: segment.delta});
+        idRangeOffsets = idRangeOffsets.concat({name: 'idRangeOffset_' + i, type: 'USHORT', value: segment.offset});
+        if (segment.glyphId !== undefined) {
+            glyphIds = glyphIds.concat({name: 'glyph_' + i, type: 'USHORT', value: segment.glyphId});
+        }
+    }
+
+    t.fields = t.fields.concat(endCounts);
+    t.fields.push({name: 'reservedPad', type: 'USHORT', value: 0});
+    t.fields = t.fields.concat(startCounts);
+    t.fields = t.fields.concat(idDeltas);
+    t.fields = t.fields.concat(idRangeOffsets);
+    t.fields = t.fields.concat(glyphIds);
+
+    t.length = 14 + // Subtable header
+        endCounts.length * 2 +
+        2 + // reservedPad
+        startCounts.length * 2 +
+        idDeltas.length * 2 +
+        idRangeOffsets.length * 2 +
+        glyphIds.length * 2;
+
+    return t;
+}
+
+exports.parse = parseCmapTable;
+exports.make = makeCmapTable;
+
+},{"../check":3,"../parse":11,"../table":14}],17:[function(require,module,exports){
+// The `fvar` table stores font variation axes and instances.
+// https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6fvar.html
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+var table = require('../table');
+
+function addName(name, names) {
+    var nameString = JSON.stringify(name);
+    var nameID = 256;
+    for (var nameKey in names) {
+        var n = parseInt(nameKey);
+        if (!n || n < 256) {
+            continue;
+        }
+
+        if (JSON.stringify(names[nameKey]) === nameString) {
+            return n;
+        }
+
+        if (nameID <= n) {
+            nameID = n + 1;
+        }
+    }
+
+    names[nameID] = name;
+    return nameID;
+}
+
+function makeFvarAxis(n, axis, names) {
+    var nameID = addName(axis.name, names);
+    return [
+        {name: 'tag_' + n, type: 'TAG', value: axis.tag},
+        {name: 'minValue_' + n, type: 'FIXED', value: axis.minValue << 16},
+        {name: 'defaultValue_' + n, type: 'FIXED', value: axis.defaultValue << 16},
+        {name: 'maxValue_' + n, type: 'FIXED', value: axis.maxValue << 16},
+        {name: 'flags_' + n, type: 'USHORT', value: 0},
+        {name: 'nameID_' + n, type: 'USHORT', value: nameID}
+    ];
+}
+
+function parseFvarAxis(data, start, names) {
+    var axis = {};
+    var p = new parse.Parser(data, start);
+    axis.tag = p.parseTag();
+    axis.minValue = p.parseFixed();
+    axis.defaultValue = p.parseFixed();
+    axis.maxValue = p.parseFixed();
+    p.skip('uShort', 1);  // reserved for flags; no values defined
+    axis.name = names[p.parseUShort()] || {};
+    return axis;
+}
+
+function makeFvarInstance(n, inst, axes, names) {
+    var nameID = addName(inst.name, names);
+    var fields = [
+        {name: 'nameID_' + n, type: 'USHORT', value: nameID},
+        {name: 'flags_' + n, type: 'USHORT', value: 0}
+    ];
+
+    for (var i = 0; i < axes.length; ++i) {
+        var axisTag = axes[i].tag;
+        fields.push({
+            name: 'axis_' + n + ' ' + axisTag,
+            type: 'FIXED',
+            value: inst.coordinates[axisTag] << 16
+        });
+    }
+
+    return fields;
+}
+
+function parseFvarInstance(data, start, axes, names) {
+    var inst = {};
+    var p = new parse.Parser(data, start);
+    inst.name = names[p.parseUShort()] || {};
+    p.skip('uShort', 1);  // reserved for flags; no values defined
+
+    inst.coordinates = {};
+    for (var i = 0; i < axes.length; ++i) {
+        inst.coordinates[axes[i].tag] = p.parseFixed();
+    }
+
+    return inst;
+}
+
+function makeFvarTable(fvar, names) {
+    var result = new table.Table('fvar', [
+        {name: 'version', type: 'ULONG', value: 0x10000},
+        {name: 'offsetToData', type: 'USHORT', value: 0},
+        {name: 'countSizePairs', type: 'USHORT', value: 2},
+        {name: 'axisCount', type: 'USHORT', value: fvar.axes.length},
+        {name: 'axisSize', type: 'USHORT', value: 20},
+        {name: 'instanceCount', type: 'USHORT', value: fvar.instances.length},
+        {name: 'instanceSize', type: 'USHORT', value: 4 + fvar.axes.length * 4}
+    ]);
+    result.offsetToData = result.sizeOf();
+
+    for (var i = 0; i < fvar.axes.length; i++) {
+        result.fields = result.fields.concat(makeFvarAxis(i, fvar.axes[i], names));
+    }
+
+    for (var j = 0; j < fvar.instances.length; j++) {
+        result.fields = result.fields.concat(makeFvarInstance(j, fvar.instances[j], fvar.axes, names));
+    }
+
+    return result;
+}
+
+function parseFvarTable(data, start, names) {
+    var p = new parse.Parser(data, start);
+    var tableVersion = p.parseULong();
+    check.argument(tableVersion === 0x00010000, 'Unsupported fvar table version.');
+    var offsetToData = p.parseOffset16();
+    // Skip countSizePairs.
+    p.skip('uShort', 1);
+    var axisCount = p.parseUShort();
+    var axisSize = p.parseUShort();
+    var instanceCount = p.parseUShort();
+    var instanceSize = p.parseUShort();
+
+    var axes = [];
+    for (var i = 0; i < axisCount; i++) {
+        axes.push(parseFvarAxis(data, start + offsetToData + i * axisSize, names));
+    }
+
+    var instances = [];
+    var instanceStart = start + offsetToData + axisCount * axisSize;
+    for (var j = 0; j < instanceCount; j++) {
+        instances.push(parseFvarInstance(data, instanceStart + j * instanceSize, axes, names));
+    }
+
+    return {axes: axes, instances: instances};
+}
+
+exports.make = makeFvarTable;
+exports.parse = parseFvarTable;
+
+},{"../check":3,"../parse":11,"../table":14}],18:[function(require,module,exports){
+// The `glyf` table describes the glyphs in TrueType outline format.
+// http://www.microsoft.com/typography/otspec/glyf.htm
+
+
+
+var check = require('../check');
+var glyphset = require('../glyphset');
+var parse = require('../parse');
+var path = require('../path');
+
+// Parse the coordinate data for a glyph.
+function parseGlyphCoordinate(p, flag, previousValue, shortVectorBitMask, sameBitMask) {
+    var v;
+    if ((flag & shortVectorBitMask) > 0) {
+        // The coordinate is 1 byte long.
+        v = p.parseByte();
+        // The `same` bit is re-used for short values to signify the sign of the value.
+        if ((flag & sameBitMask) === 0) {
+            v = -v;
+        }
+
+        v = previousValue + v;
+    } else {
+        //  The coordinate is 2 bytes long.
+        // If the `same` bit is set, the coordinate is the same as the previous coordinate.
+        if ((flag & sameBitMask) > 0) {
+            v = previousValue;
+        } else {
+            // Parse the coordinate as a signed 16-bit delta value.
+            v = previousValue + p.parseShort();
+        }
+    }
+
+    return v;
+}
+
+// Parse a TrueType glyph.
+function parseGlyph(glyph, data, start) {
+    var p = new parse.Parser(data, start);
+    glyph.numberOfContours = p.parseShort();
+    glyph._xMin = p.parseShort();
+    glyph._yMin = p.parseShort();
+    glyph._xMax = p.parseShort();
+    glyph._yMax = p.parseShort();
+    var flags;
+    var flag;
+    if (glyph.numberOfContours > 0) {
+        var i;
+        // This glyph is not a composite.
+        var endPointIndices = glyph.endPointIndices = [];
+        for (i = 0; i < glyph.numberOfContours; i += 1) {
+            endPointIndices.push(p.parseUShort());
+        }
+
+        glyph.instructionLength = p.parseUShort();
+        glyph.instructions = [];
+        for (i = 0; i < glyph.instructionLength; i += 1) {
+            glyph.instructions.push(p.parseByte());
+        }
+
+        var numberOfCoordinates = endPointIndices[endPointIndices.length - 1] + 1;
+        flags = [];
+        for (i = 0; i < numberOfCoordinates; i += 1) {
+            flag = p.parseByte();
+            flags.push(flag);
+            // If bit 3 is set, we repeat this flag n times, where n is the next byte.
+            if ((flag & 8) > 0) {
+                var repeatCount = p.parseByte();
+                for (var j = 0; j < repeatCount; j += 1) {
+                    flags.push(flag);
+                    i += 1;
+                }
+            }
+        }
+
+        check.argument(flags.length === numberOfCoordinates, 'Bad flags.');
+
+        if (endPointIndices.length > 0) {
+            var points = [];
+            var point;
+            // X/Y coordinates are relative to the previous point, except for the first point which is relative to 0,0.
+            if (numberOfCoordinates > 0) {
+                for (i = 0; i < numberOfCoordinates; i += 1) {
+                    flag = flags[i];
+                    point = {};
+                    point.onCurve = !!(flag & 1);
+                    point.lastPointOfContour = endPointIndices.indexOf(i) >= 0;
+                    points.push(point);
+                }
+
+                var px = 0;
+                for (i = 0; i < numberOfCoordinates; i += 1) {
+                    flag = flags[i];
+                    point = points[i];
+                    point.x = parseGlyphCoordinate(p, flag, px, 2, 16);
+                    px = point.x;
+                }
+
+                var py = 0;
+                for (i = 0; i < numberOfCoordinates; i += 1) {
+                    flag = flags[i];
+                    point = points[i];
+                    point.y = parseGlyphCoordinate(p, flag, py, 4, 32);
+                    py = point.y;
+                }
+            }
+
+            glyph.points = points;
+        } else {
+            glyph.points = [];
+        }
+    } else if (glyph.numberOfContours === 0) {
+        glyph.points = [];
+    } else {
+        glyph.isComposite = true;
+        glyph.points = [];
+        glyph.components = [];
+        var moreComponents = true;
+        while (moreComponents) {
+            flags = p.parseUShort();
+            var component = {
+                glyphIndex: p.parseUShort(),
+                xScale: 1,
+                scale01: 0,
+                scale10: 0,
+                yScale: 1,
+                dx: 0,
+                dy: 0
+            };
+            if ((flags & 1) > 0) {
+                // The arguments are words
+                if ((flags & 2) > 0) {
+                    // values are offset
+                    component.dx = p.parseShort();
+                    component.dy = p.parseShort();
+                } else {
+                    // values are matched points
+                    component.matchedPoints = [p.parseUShort(), p.parseUShort()];
+                }
+
+            } else {
+                // The arguments are bytes
+                if ((flags & 2) > 0) {
+                    // values are offset
+                    component.dx = p.parseChar();
+                    component.dy = p.parseChar();
+                } else {
+                    // values are matched points
+                    component.matchedPoints = [p.parseByte(), p.parseByte()];
+                }
+            }
+
+            if ((flags & 8) > 0) {
+                // We have a scale
+                component.xScale = component.yScale = p.parseF2Dot14();
+            } else if ((flags & 64) > 0) {
+                // We have an X / Y scale
+                component.xScale = p.parseF2Dot14();
+                component.yScale = p.parseF2Dot14();
+            } else if ((flags & 128) > 0) {
+                // We have a 2x2 transformation
+                component.xScale = p.parseF2Dot14();
+                component.scale01 = p.parseF2Dot14();
+                component.scale10 = p.parseF2Dot14();
+                component.yScale = p.parseF2Dot14();
+            }
+
+            glyph.components.push(component);
+            moreComponents = !!(flags & 32);
+        }
+    }
+}
+
+// Transform an array of points and return a new array.
+function transformPoints(points, transform) {
+    var newPoints = [];
+    for (var i = 0; i < points.length; i += 1) {
+        var pt = points[i];
+        var newPt = {
+            x: transform.xScale * pt.x + transform.scale01 * pt.y + transform.dx,
+            y: transform.scale10 * pt.x + transform.yScale * pt.y + transform.dy,
+            onCurve: pt.onCurve,
+            lastPointOfContour: pt.lastPointOfContour
+        };
+        newPoints.push(newPt);
+    }
+
+    return newPoints;
+}
+
+function getContours(points) {
+    var contours = [];
+    var currentContour = [];
+    for (var i = 0; i < points.length; i += 1) {
+        var pt = points[i];
+        currentContour.push(pt);
+        if (pt.lastPointOfContour) {
+            contours.push(currentContour);
+            currentContour = [];
+        }
+    }
+
+    check.argument(currentContour.length === 0, 'There are still points left in the current contour.');
+    return contours;
+}
+
+// Convert the TrueType glyph outline to a Path.
+function getPath(points) {
+    var p = new path.Path();
+    if (!points) {
+        return p;
+    }
+
+    var contours = getContours(points);
+    for (var i = 0; i < contours.length; i += 1) {
+        var contour = contours[i];
+        var firstPt = contour[0];
+        var lastPt = contour[contour.length - 1];
+        var curvePt;
+        var realFirstPoint;
+        if (firstPt.onCurve) {
+            curvePt = null;
+            // The first point will be consumed by the moveTo command,
+            // so skip it in the loop.
+            realFirstPoint = true;
+        } else {
+            if (lastPt.onCurve) {
+                // If the first point is off-curve and the last point is on-curve,
+                // start at the last point.
+                firstPt = lastPt;
+            } else {
+                // If both first and last points are off-curve, start at their middle.
+                firstPt = { x: (firstPt.x + lastPt.x) / 2, y: (firstPt.y + lastPt.y) / 2 };
+            }
+
+            curvePt = firstPt;
+            // The first point is synthesized, so don't skip the real first point.
+            realFirstPoint = false;
+        }
+
+        p.moveTo(firstPt.x, firstPt.y);
+
+        for (var j = realFirstPoint ? 1 : 0; j < contour.length; j += 1) {
+            var pt = contour[j];
+            var prevPt = j === 0 ? firstPt : contour[j - 1];
+            if (prevPt.onCurve && pt.onCurve) {
+                // This is a straight line.
+                p.lineTo(pt.x, pt.y);
+            } else if (prevPt.onCurve && !pt.onCurve) {
+                curvePt = pt;
+            } else if (!prevPt.onCurve && !pt.onCurve) {
+                var midPt = { x: (prevPt.x + pt.x) / 2, y: (prevPt.y + pt.y) / 2 };
+                p.quadraticCurveTo(prevPt.x, prevPt.y, midPt.x, midPt.y);
+                curvePt = pt;
+            } else if (!prevPt.onCurve && pt.onCurve) {
+                // Previous point off-curve, this point on-curve.
+                p.quadraticCurveTo(curvePt.x, curvePt.y, pt.x, pt.y);
+                curvePt = null;
+            } else {
+                throw new Error('Invalid state.');
+            }
+        }
+
+        if (firstPt !== lastPt) {
+            // Connect the last and first points
+            if (curvePt) {
+                p.quadraticCurveTo(curvePt.x, curvePt.y, firstPt.x, firstPt.y);
+            } else {
+                p.lineTo(firstPt.x, firstPt.y);
+            }
+        }
+    }
+
+    p.closePath();
+    return p;
+}
+
+function buildPath(glyphs, glyph) {
+    if (glyph.isComposite) {
+        for (var j = 0; j < glyph.components.length; j += 1) {
+            var component = glyph.components[j];
+            var componentGlyph = glyphs.get(component.glyphIndex);
+            // Force the ttfGlyphLoader to parse the glyph.
+            componentGlyph.getPath();
+            if (componentGlyph.points) {
+                var transformedPoints;
+                if (component.matchedPoints === undefined) {
+                    // component positioned by offset
+                    transformedPoints = transformPoints(componentGlyph.points, component);
+                } else {
+                    // component positioned by matched points
+                    if ((component.matchedPoints[0] > glyph.points.length - 1) ||
+                        (component.matchedPoints[1] > componentGlyph.points.length - 1)) {
+                        throw Error('Matched points out of range in ' + glyph.name);
+                    }
+                    var firstPt = glyph.points[component.matchedPoints[0]];
+                    var secondPt = componentGlyph.points[component.matchedPoints[1]];
+                    var transform = {
+                        xScale: component.xScale, scale01: component.scale01,
+                        scale10: component.scale10, yScale: component.yScale,
+                        dx: 0, dy: 0
+                    };
+                    secondPt = transformPoints([secondPt], transform)[0];
+                    transform.dx = firstPt.x - secondPt.x;
+                    transform.dy = firstPt.y - secondPt.y;
+                    transformedPoints = transformPoints(componentGlyph.points, transform);
+                }
+                glyph.points = glyph.points.concat(transformedPoints);
+            }
+        }
+    }
+
+    return getPath(glyph.points);
+}
+
+// Parse all the glyphs according to the offsets from the `loca` table.
+function parseGlyfTable(data, start, loca, font) {
+    var glyphs = new glyphset.GlyphSet(font);
+    var i;
+
+    // The last element of the loca table is invalid.
+    for (i = 0; i < loca.length - 1; i += 1) {
+        var offset = loca[i];
+        var nextOffset = loca[i + 1];
+        if (offset !== nextOffset) {
+            glyphs.push(i, glyphset.ttfGlyphLoader(font, i, parseGlyph, data, start + offset, buildPath));
+        } else {
+            glyphs.push(i, glyphset.glyphLoader(font, i));
+        }
+    }
+
+    return glyphs;
+}
+
+exports.parse = parseGlyfTable;
+
+},{"../check":3,"../glyphset":8,"../parse":11,"../path":12}],19:[function(require,module,exports){
+// The `GPOS` table contains kerning pairs, among other things.
+// https://www.microsoft.com/typography/OTSPEC/gpos.htm
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+
+// Parse ScriptList and FeatureList tables of GPOS, GSUB, GDEF, BASE, JSTF tables.
+// These lists are unused by now, this function is just the basis for a real parsing.
+function parseTaggedListTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var n = p.parseUShort();
+    var list = [];
+    for (var i = 0; i < n; i++) {
+        list[p.parseTag()] = { offset: p.parseUShort() };
+    }
+
+    return list;
+}
+
+// Parse a coverage table in a GSUB, GPOS or GDEF table.
+// Format 1 is a simple list of glyph ids,
+// Format 2 is a list of ranges. It is expanded in a list of glyphs, maybe not the best idea.
+function parseCoverageTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var format = p.parseUShort();
+    var count =  p.parseUShort();
+    if (format === 1) {
+        return p.parseUShortList(count);
+    } else if (format === 2) {
+        var coverage = [];
+        for (; count--;) {
+            var begin = p.parseUShort();
+            var end = p.parseUShort();
+            var index = p.parseUShort();
+            for (var i = begin; i <= end; i++) {
+                coverage[index++] = i;
+            }
+        }
+
+        return coverage;
+    }
+}
+
+// Parse a Class Definition Table in a GSUB, GPOS or GDEF table.
+// Returns a function that gets a class value from a glyph ID.
+function parseClassDefTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var format = p.parseUShort();
+    if (format === 1) {
+        // Format 1 specifies a range of consecutive glyph indices, one class per glyph ID.
+        var startGlyph = p.parseUShort();
+        var glyphCount = p.parseUShort();
+        var classes = p.parseUShortList(glyphCount);
+        return function(glyphID) {
+            return classes[glyphID - startGlyph] || 0;
+        };
+    } else if (format === 2) {
+        // Format 2 defines multiple groups of glyph indices that belong to the same class.
+        var rangeCount = p.parseUShort();
+        var startGlyphs = [];
+        var endGlyphs = [];
+        var classValues = [];
+        for (var i = 0; i < rangeCount; i++) {
+            startGlyphs[i] = p.parseUShort();
+            endGlyphs[i] = p.parseUShort();
+            classValues[i] = p.parseUShort();
+        }
+
+        return function(glyphID) {
+            var l = 0;
+            var r = startGlyphs.length - 1;
+            while (l < r) {
+                var c = (l + r + 1) >> 1;
+                if (glyphID < startGlyphs[c]) {
+                    r = c - 1;
+                } else {
+                    l = c;
+                }
+            }
+
+            if (startGlyphs[l] <= glyphID && glyphID <= endGlyphs[l]) {
+                return classValues[l] || 0;
+            }
+
+            return 0;
+        };
+    }
+}
+
+// Parse a pair adjustment positioning subtable, format 1 or format 2
+// The subtable is returned in the form of a lookup function.
+function parsePairPosSubTable(data, start) {
+    var p = new parse.Parser(data, start);
+    // This part is common to format 1 and format 2 subtables
+    var format = p.parseUShort();
+    var coverageOffset = p.parseUShort();
+    var coverage = parseCoverageTable(data, start + coverageOffset);
+    // valueFormat 4: XAdvance only, 1: XPlacement only, 0: no ValueRecord for second glyph
+    // Only valueFormat1=4 and valueFormat2=0 is supported.
+    var valueFormat1 = p.parseUShort();
+    var valueFormat2 = p.parseUShort();
+    var value1;
+    var value2;
+    if (valueFormat1 !== 4 || valueFormat2 !== 0) return;
+    var sharedPairSets = {};
+    if (format === 1) {
+        // Pair Positioning Adjustment: Format 1
+        var pairSetCount = p.parseUShort();
+        var pairSet = [];
+        // Array of offsets to PairSet tables-from beginning of PairPos subtable-ordered by Coverage Index
+        var pairSetOffsets = p.parseOffset16List(pairSetCount);
+        for (var firstGlyph = 0; firstGlyph < pairSetCount; firstGlyph++) {
+            var pairSetOffset = pairSetOffsets[firstGlyph];
+            var sharedPairSet = sharedPairSets[pairSetOffset];
+            if (!sharedPairSet) {
+                // Parse a pairset table in a pair adjustment subtable format 1
+                sharedPairSet = {};
+                p.relativeOffset = pairSetOffset;
+                var pairValueCount = p.parseUShort();
+                for (; pairValueCount--;) {
+                    var secondGlyph = p.parseUShort();
+                    if (valueFormat1) value1 = p.parseShort();
+                    if (valueFormat2) value2 = p.parseShort();
+                    // We only support valueFormat1 = 4 and valueFormat2 = 0,
+                    // so value1 is the XAdvance and value2 is empty.
+                    sharedPairSet[secondGlyph] = value1;
+                }
+            }
+
+            pairSet[coverage[firstGlyph]] = sharedPairSet;
+        }
+
+        return function(leftGlyph, rightGlyph) {
+            var pairs = pairSet[leftGlyph];
+            if (pairs) return pairs[rightGlyph];
+        };
+    } else if (format === 2) {
+        // Pair Positioning Adjustment: Format 2
+        var classDef1Offset = p.parseUShort();
+        var classDef2Offset = p.parseUShort();
+        var class1Count = p.parseUShort();
+        var class2Count = p.parseUShort();
+        var getClass1 = parseClassDefTable(data, start + classDef1Offset);
+        var getClass2 = parseClassDefTable(data, start + classDef2Offset);
+
+        // Parse kerning values by class pair.
+        var kerningMatrix = [];
+        for (var i = 0; i < class1Count; i++) {
+            var kerningRow = kerningMatrix[i] = [];
+            for (var j = 0; j < class2Count; j++) {
+                if (valueFormat1) value1 = p.parseShort();
+                if (valueFormat2) value2 = p.parseShort();
+                // We only support valueFormat1 = 4 and valueFormat2 = 0,
+                // so value1 is the XAdvance and value2 is empty.
+                kerningRow[j] = value1;
+            }
+        }
+
+        // Convert coverage list to a hash
+        var covered = {};
+        for (i = 0; i < coverage.length; i++) covered[coverage[i]] = 1;
+
+        // Get the kerning value for a specific glyph pair.
+        return function(leftGlyph, rightGlyph) {
+            if (!covered[leftGlyph]) return;
+            var class1 = getClass1(leftGlyph);
+            var class2 = getClass2(rightGlyph);
+            var kerningRow = kerningMatrix[class1];
+
+            if (kerningRow) {
+                return kerningRow[class2];
+            }
+        };
+    }
+}
+
+// Parse a LookupTable (present in of GPOS, GSUB, GDEF, BASE, JSTF tables).
+function parseLookupTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var lookupType = p.parseUShort();
+    var lookupFlag = p.parseUShort();
+    var useMarkFilteringSet = lookupFlag & 0x10;
+    var subTableCount = p.parseUShort();
+    var subTableOffsets = p.parseOffset16List(subTableCount);
+    var table = {
+        lookupType: lookupType,
+        lookupFlag: lookupFlag,
+        markFilteringSet: useMarkFilteringSet ? p.parseUShort() : -1
+    };
+    // LookupType 2, Pair adjustment
+    if (lookupType === 2) {
+        var subtables = [];
+        for (var i = 0; i < subTableCount; i++) {
+            var pairPosSubTable = parsePairPosSubTable(data, start + subTableOffsets[i]);
+            if (pairPosSubTable) subtables.push(pairPosSubTable);
+        }
+        // Return a function which finds the kerning values in the subtables.
+        table.getKerningValue = function(leftGlyph, rightGlyph) {
+            for (var i = subtables.length; i--;) {
+                var value = subtables[i](leftGlyph, rightGlyph);
+                if (value !== undefined) return value;
+            }
+
+            return 0;
+        };
+    }
+
+    return table;
+}
+
+// Parse the `GPOS` table which contains, among other things, kerning pairs.
+// https://www.microsoft.com/typography/OTSPEC/gpos.htm
+function parseGposTable(data, start, font) {
+    var p = new parse.Parser(data, start);
+    var tableVersion = p.parseFixed();
+    check.argument(tableVersion === 1, 'Unsupported GPOS table version.');
+
+    // ScriptList and FeatureList - ignored for now
+    parseTaggedListTable(data, start + p.parseUShort());
+    // 'kern' is the feature we are looking for.
+    parseTaggedListTable(data, start + p.parseUShort());
+
+    // LookupList
+    var lookupListOffset = p.parseUShort();
+    p.relativeOffset = lookupListOffset;
+    var lookupCount = p.parseUShort();
+    var lookupTableOffsets = p.parseOffset16List(lookupCount);
+    var lookupListAbsoluteOffset = start + lookupListOffset;
+    for (var i = 0; i < lookupCount; i++) {
+        var table = parseLookupTable(data, lookupListAbsoluteOffset + lookupTableOffsets[i]);
+        if (table.lookupType === 2 && !font.getGposKerningValue) font.getGposKerningValue = table.getKerningValue;
+    }
+}
+
+exports.parse = parseGposTable;
+
+},{"../check":3,"../parse":11}],20:[function(require,module,exports){
+// The `GSUB` table contains ligatures, among other things.
+// https://www.microsoft.com/typography/OTSPEC/gsub.htm
+
+
+
+var check = require('../check');
+var Parser = require('../parse').Parser;
+var subtableParsers = new Array(9);         // subtableParsers[0] is unused
+var table = require('../table');
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#SS
+subtableParsers[1] = function parseLookup1() {
+    var start = this.offset + this.relativeOffset;
+    var substFormat = this.parseUShort();
+    if (substFormat === 1) {
+        return {
+            substFormat: 1,
+            coverage: this.parsePointer(Parser.coverage),
+            deltaGlyphId: this.parseUShort()
+        };
+    } else if (substFormat === 2) {
+        return {
+            substFormat: 2,
+            coverage: this.parsePointer(Parser.coverage),
+            substitute: this.parseOffset16List()
+        };
+    }
+    check.assert(false, '0x' + start.toString(16) + ': lookup type 1 format must be 1 or 2.');
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#MS
+subtableParsers[2] = function parseLookup2() {
+    var substFormat = this.parseUShort();
+    check.argument(substFormat === 1, 'GSUB Multiple Substitution Subtable identifier-format must be 1');
+    return {
+        substFormat: substFormat,
+        coverage: this.parsePointer(Parser.coverage),
+        sequences: this.parseListOfLists()
+    };
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#AS
+subtableParsers[3] = function parseLookup3() {
+    var substFormat = this.parseUShort();
+    check.argument(substFormat === 1, 'GSUB Alternate Substitution Subtable identifier-format must be 1');
+    return {
+        substFormat: substFormat,
+        coverage: this.parsePointer(Parser.coverage),
+        alternateSets: this.parseListOfLists()
+    };
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#LS
+subtableParsers[4] = function parseLookup4() {
+    var substFormat = this.parseUShort();
+    check.argument(substFormat === 1, 'GSUB ligature table identifier-format must be 1');
+    return {
+        substFormat: substFormat,
+        coverage: this.parsePointer(Parser.coverage),
+        ligatureSets: this.parseListOfLists(function() {
+            return {
+                ligGlyph: this.parseUShort(),
+                components: this.parseUShortList(this.parseUShort() - 1)
+            };
+        })
+    };
+};
+
+var lookupRecordDesc = {
+    sequenceIndex: Parser.uShort,
+    lookupListIndex: Parser.uShort
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#CSF
+subtableParsers[5] = function parseLookup5() {
+    var start = this.offset + this.relativeOffset;
+    var substFormat = this.parseUShort();
+
+    if (substFormat === 1) {
+        return {
+            substFormat: substFormat,
+            coverage: this.parsePointer(Parser.coverage),
+            ruleSets: this.parseListOfLists(function() {
+                var glyphCount = this.parseUShort();
+                var substCount = this.parseUShort();
+                return {
+                    input: this.parseUShortList(glyphCount - 1),
+                    lookupRecords: this.parseRecordList(substCount, lookupRecordDesc)
+                };
+            })
+        };
+    } else if (substFormat === 2) {
+        return {
+            substFormat: substFormat,
+            coverage: this.parsePointer(Parser.coverage),
+            classDef: this.parsePointer(Parser.classDef),
+            classSets: this.parseListOfLists(function() {
+                var glyphCount = this.parseUShort();
+                var substCount = this.parseUShort();
+                return {
+                    classes: this.parseUShortList(glyphCount - 1),
+                    lookupRecords: this.parseRecordList(substCount, lookupRecordDesc)
+                };
+            })
+        };
+    } else if (substFormat === 3) {
+        var glyphCount = this.parseUShort();
+        var substCount = this.parseUShort();
+        return {
+            substFormat: substFormat,
+            coverages: this.parseList(glyphCount, Parser.pointer(Parser.coverage)),
+            lookupRecords: this.parseRecordList(substCount, lookupRecordDesc)
+        };
+    }
+    check.assert(false, '0x' + start.toString(16) + ': lookup type 5 format must be 1, 2 or 3.');
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#CC
+subtableParsers[6] = function parseLookup6() {
+    var start = this.offset + this.relativeOffset;
+    var substFormat = this.parseUShort();
+    if (substFormat === 1) {
+        return {
+            substFormat: 1,
+            coverage: this.parsePointer(Parser.coverage),
+            chainRuleSets: this.parseListOfLists(function() {
+                return {
+                    backtrack: this.parseUShortList(),
+                    input: this.parseUShortList(this.parseShort() - 1),
+                    lookahead: this.parseUShortList(),
+                    lookupRecords: this.parseRecordList(lookupRecordDesc)
+                };
+            })
+        };
+    } else if (substFormat === 2) {
+        return {
+            substFormat: 2,
+            coverage: this.parsePointer(Parser.coverage),
+            backtrackClassDef: this.parsePointer(Parser.classDef),
+            inputClassDef: this.parsePointer(Parser.classDef),
+            lookaheadClassDef: this.parsePointer(Parser.classDef),
+            chainClassSet: this.parseListOfLists(function() {
+                return {
+                    backtrack: this.parseUShortList(),
+                    input: this.parseUShortList(this.parseShort() - 1),
+                    lookahead: this.parseUShortList(),
+                    lookupRecords: this.parseRecordList(lookupRecordDesc)
+                };
+            })
+        };
+    } else if (substFormat === 3) {
+        return {
+            substFormat: 3,
+            backtrackCoverage: this.parseList(Parser.pointer(Parser.coverage)),
+            inputCoverage: this.parseList(Parser.pointer(Parser.coverage)),
+            lookaheadCoverage: this.parseList(Parser.pointer(Parser.coverage)),
+            lookupRecords: this.parseRecordList(lookupRecordDesc)
+        };
+    }
+    check.assert(false, '0x' + start.toString(16) + ': lookup type 6 format must be 1, 2 or 3.');
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#ES
+subtableParsers[7] = function parseLookup7() {
+    // Extension Substitution subtable
+    var substFormat = this.parseUShort();
+    check.argument(substFormat === 1, 'GSUB Extension Substitution subtable identifier-format must be 1');
+    var extensionLookupType = this.parseUShort();
+    var extensionParser = new Parser(this.data, this.offset + this.parseULong());
+    return {
+        substFormat: 1,
+        lookupType: extensionLookupType,
+        extension: subtableParsers[extensionLookupType].call(extensionParser)
+    };
+};
+
+// https://www.microsoft.com/typography/OTSPEC/GSUB.htm#RCCS
+subtableParsers[8] = function parseLookup8() {
+    var substFormat = this.parseUShort();
+    check.argument(substFormat === 1, 'GSUB Reverse Chaining Contextual Single Substitution Subtable identifier-format must be 1');
+    return {
+        substFormat: substFormat,
+        coverage: this.parsePointer(Parser.coverage),
+        backtrackCoverage: this.parseList(Parser.pointer(Parser.coverage)),
+        lookaheadCoverage: this.parseList(Parser.pointer(Parser.coverage)),
+        substitutes: this.parseUShortList()
+    };
+};
+
+// https://www.microsoft.com/typography/OTSPEC/gsub.htm
+function parseGsubTable(data, start) {
+    start = start || 0;
+    var p = new Parser(data, start);
+    var tableVersion = p.parseVersion();
+    check.argument(tableVersion === 1, 'Unsupported GSUB table version.');
+    return {
+        version: tableVersion,
+        scripts: p.parseScriptList(),
+        features: p.parseFeatureList(),
+        lookups: p.parseLookupList(subtableParsers)
+    };
+}
+
+// GSUB Writing //////////////////////////////////////////////
+var subtableMakers = new Array(9);
+
+subtableMakers[1] = function makeLookup1(subtable) {
+    if (subtable.substFormat === 1) {
+        return new table.Table('substitutionTable', [
+            {name: 'substFormat', type: 'USHORT', value: 1},
+            {name: 'coverage', type: 'TABLE', value: new table.Coverage(subtable.coverage)},
+            {name: 'deltaGlyphID', type: 'USHORT', value: subtable.deltaGlyphId}
+        ]);
+    } else {
+        return new table.Table('substitutionTable', [
+            {name: 'substFormat', type: 'USHORT', value: 2},
+            {name: 'coverage', type: 'TABLE', value: new table.Coverage(subtable.coverage)}
+        ].concat(table.ushortList('substitute', subtable.substitute)));
+    }
+    check.fail('Lookup type 1 substFormat must be 1 or 2.');
+};
+
+subtableMakers[3] = function makeLookup3(subtable) {
+    check.assert(subtable.substFormat === 1, 'Lookup type 3 substFormat must be 1.');
+    return new table.Table('substitutionTable', [
+        {name: 'substFormat', type: 'USHORT', value: 1},
+        {name: 'coverage', type: 'TABLE', value: new table.Coverage(subtable.coverage)}
+    ].concat(table.tableList('altSet', subtable.alternateSets, function(alternateSet) {
+        return new table.Table('alternateSetTable', table.ushortList('alternate', alternateSet));
+    })));
+};
+
+subtableMakers[4] = function makeLookup4(subtable) {
+    check.assert(subtable.substFormat === 1, 'Lookup type 4 substFormat must be 1.');
+    return new table.Table('substitutionTable', [
+        {name: 'substFormat', type: 'USHORT', value: 1},
+        {name: 'coverage', type: 'TABLE', value: new table.Coverage(subtable.coverage)}
+    ].concat(table.tableList('ligSet', subtable.ligatureSets, function(ligatureSet) {
+        return new table.Table('ligatureSetTable', table.tableList('ligature', ligatureSet, function(ligature) {
+            return new table.Table('ligatureTable',
+                [{name: 'ligGlyph', type: 'USHORT', value: ligature.ligGlyph}]
+                .concat(table.ushortList('component', ligature.components, ligature.components.length + 1))
+            );
+        }));
+    })));
+};
+
+function makeGsubTable(gsub) {
+    return new table.Table('GSUB', [
+        {name: 'version', type: 'ULONG', value: 0x10000},
+        {name: 'scripts', type: 'TABLE', value: new table.ScriptList(gsub.scripts)},
+        {name: 'features', type: 'TABLE', value: new table.FeatureList(gsub.features)},
+        {name: 'lookups', type: 'TABLE', value: new table.LookupList(gsub.lookups, subtableMakers)}
+    ]);
+}
+
+exports.parse = parseGsubTable;
+exports.make = makeGsubTable;
+
+},{"../check":3,"../parse":11,"../table":14}],21:[function(require,module,exports){
+// The `head` table contains global information about the font.
+// https://www.microsoft.com/typography/OTSPEC/head.htm
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the header `head` table
+function parseHeadTable(data, start) {
+    var head = {};
+    var p = new parse.Parser(data, start);
+    head.version = p.parseVersion();
+    head.fontRevision = Math.round(p.parseFixed() * 1000) / 1000;
+    head.checkSumAdjustment = p.parseULong();
+    head.magicNumber = p.parseULong();
+    check.argument(head.magicNumber === 0x5F0F3CF5, 'Font header has wrong magic number.');
+    head.flags = p.parseUShort();
+    head.unitsPerEm = p.parseUShort();
+    head.created = p.parseLongDateTime();
+    head.modified = p.parseLongDateTime();
+    head.xMin = p.parseShort();
+    head.yMin = p.parseShort();
+    head.xMax = p.parseShort();
+    head.yMax = p.parseShort();
+    head.macStyle = p.parseUShort();
+    head.lowestRecPPEM = p.parseUShort();
+    head.fontDirectionHint = p.parseShort();
+    head.indexToLocFormat = p.parseShort();
+    head.glyphDataFormat = p.parseShort();
+    return head;
+}
+
+function makeHeadTable(options) {
+    // Apple Mac timestamp epoch is 01/01/1904 not 01/01/1970
+    var timestamp = Math.round(new Date().getTime() / 1000) + 2082844800;
+    var createdTimestamp = timestamp;
+
+    if (options.createdTimestamp) {
+        createdTimestamp = options.createdTimestamp + 2082844800;
+    }
+
+    return new table.Table('head', [
+        {name: 'version', type: 'FIXED', value: 0x00010000},
+        {name: 'fontRevision', type: 'FIXED', value: 0x00010000},
+        {name: 'checkSumAdjustment', type: 'ULONG', value: 0},
+        {name: 'magicNumber', type: 'ULONG', value: 0x5F0F3CF5},
+        {name: 'flags', type: 'USHORT', value: 0},
+        {name: 'unitsPerEm', type: 'USHORT', value: 1000},
+        {name: 'created', type: 'LONGDATETIME', value: createdTimestamp},
+        {name: 'modified', type: 'LONGDATETIME', value: timestamp},
+        {name: 'xMin', type: 'SHORT', value: 0},
+        {name: 'yMin', type: 'SHORT', value: 0},
+        {name: 'xMax', type: 'SHORT', value: 0},
+        {name: 'yMax', type: 'SHORT', value: 0},
+        {name: 'macStyle', type: 'USHORT', value: 0},
+        {name: 'lowestRecPPEM', type: 'USHORT', value: 0},
+        {name: 'fontDirectionHint', type: 'SHORT', value: 2},
+        {name: 'indexToLocFormat', type: 'SHORT', value: 0},
+        {name: 'glyphDataFormat', type: 'SHORT', value: 0}
+    ], options);
+}
+
+exports.parse = parseHeadTable;
+exports.make = makeHeadTable;
+
+},{"../check":3,"../parse":11,"../table":14}],22:[function(require,module,exports){
+// The `hhea` table contains information for horizontal layout.
+// https://www.microsoft.com/typography/OTSPEC/hhea.htm
+
+
+
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the horizontal header `hhea` table
+function parseHheaTable(data, start) {
+    var hhea = {};
+    var p = new parse.Parser(data, start);
+    hhea.version = p.parseVersion();
+    hhea.ascender = p.parseShort();
+    hhea.descender = p.parseShort();
+    hhea.lineGap = p.parseShort();
+    hhea.advanceWidthMax = p.parseUShort();
+    hhea.minLeftSideBearing = p.parseShort();
+    hhea.minRightSideBearing = p.parseShort();
+    hhea.xMaxExtent = p.parseShort();
+    hhea.caretSlopeRise = p.parseShort();
+    hhea.caretSlopeRun = p.parseShort();
+    hhea.caretOffset = p.parseShort();
+    p.relativeOffset += 8;
+    hhea.metricDataFormat = p.parseShort();
+    hhea.numberOfHMetrics = p.parseUShort();
+    return hhea;
+}
+
+function makeHheaTable(options) {
+    return new table.Table('hhea', [
+        {name: 'version', type: 'FIXED', value: 0x00010000},
+        {name: 'ascender', type: 'FWORD', value: 0},
+        {name: 'descender', type: 'FWORD', value: 0},
+        {name: 'lineGap', type: 'FWORD', value: 0},
+        {name: 'advanceWidthMax', type: 'UFWORD', value: 0},
+        {name: 'minLeftSideBearing', type: 'FWORD', value: 0},
+        {name: 'minRightSideBearing', type: 'FWORD', value: 0},
+        {name: 'xMaxExtent', type: 'FWORD', value: 0},
+        {name: 'caretSlopeRise', type: 'SHORT', value: 1},
+        {name: 'caretSlopeRun', type: 'SHORT', value: 0},
+        {name: 'caretOffset', type: 'SHORT', value: 0},
+        {name: 'reserved1', type: 'SHORT', value: 0},
+        {name: 'reserved2', type: 'SHORT', value: 0},
+        {name: 'reserved3', type: 'SHORT', value: 0},
+        {name: 'reserved4', type: 'SHORT', value: 0},
+        {name: 'metricDataFormat', type: 'SHORT', value: 0},
+        {name: 'numberOfHMetrics', type: 'USHORT', value: 0}
+    ], options);
+}
+
+exports.parse = parseHheaTable;
+exports.make = makeHheaTable;
+
+},{"../parse":11,"../table":14}],23:[function(require,module,exports){
+// The `hmtx` table contains the horizontal metrics for all glyphs.
+// https://www.microsoft.com/typography/OTSPEC/hmtx.htm
+
+
+
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the `hmtx` table, which contains the horizontal metrics for all glyphs.
+// This function augments the glyph array, adding the advanceWidth and leftSideBearing to each glyph.
+function parseHmtxTable(data, start, numMetrics, numGlyphs, glyphs) {
+    var advanceWidth;
+    var leftSideBearing;
+    var p = new parse.Parser(data, start);
+    for (var i = 0; i < numGlyphs; i += 1) {
+        // If the font is monospaced, only one entry is needed. This last entry applies to all subsequent glyphs.
+        if (i < numMetrics) {
+            advanceWidth = p.parseUShort();
+            leftSideBearing = p.parseShort();
+        }
+
+        var glyph = glyphs.get(i);
+        glyph.advanceWidth = advanceWidth;
+        glyph.leftSideBearing = leftSideBearing;
+    }
+}
+
+function makeHmtxTable(glyphs) {
+    var t = new table.Table('hmtx', []);
+    for (var i = 0; i < glyphs.length; i += 1) {
+        var glyph = glyphs.get(i);
+        var advanceWidth = glyph.advanceWidth || 0;
+        var leftSideBearing = glyph.leftSideBearing || 0;
+        t.fields.push({name: 'advanceWidth_' + i, type: 'USHORT', value: advanceWidth});
+        t.fields.push({name: 'leftSideBearing_' + i, type: 'SHORT', value: leftSideBearing});
+    }
+
+    return t;
+}
+
+exports.parse = parseHmtxTable;
+exports.make = makeHmtxTable;
+
+},{"../parse":11,"../table":14}],24:[function(require,module,exports){
+// The `kern` table contains kerning pairs.
+// Note that some fonts use the GPOS OpenType layout table to specify kerning.
+// https://www.microsoft.com/typography/OTSPEC/kern.htm
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+
+function parseWindowsKernTable(p) {
+    var pairs = {};
+    // Skip nTables.
+    p.skip('uShort');
+    var subtableVersion = p.parseUShort();
+    check.argument(subtableVersion === 0, 'Unsupported kern sub-table version.');
+    // Skip subtableLength, subtableCoverage
+    p.skip('uShort', 2);
+    var nPairs = p.parseUShort();
+    // Skip searchRange, entrySelector, rangeShift.
+    p.skip('uShort', 3);
+    for (var i = 0; i < nPairs; i += 1) {
+        var leftIndex = p.parseUShort();
+        var rightIndex = p.parseUShort();
+        var value = p.parseShort();
+        pairs[leftIndex + ',' + rightIndex] = value;
+    }
+    return pairs;
+}
+
+function parseMacKernTable(p) {
+    var pairs = {};
+    // The Mac kern table stores the version as a fixed (32 bits) but we only loaded the first 16 bits.
+    // Skip the rest.
+    p.skip('uShort');
+    var nTables = p.parseULong();
+    //check.argument(nTables === 1, 'Only 1 subtable is supported (got ' + nTables + ').');
+    if (nTables > 1) {
+        console.warn('Only the first kern subtable is supported.');
+    }
+    p.skip('uLong');
+    var coverage = p.parseUShort();
+    var subtableVersion = coverage & 0xFF;
+    p.skip('uShort');
+    if (subtableVersion === 0) {
+        var nPairs = p.parseUShort();
+        // Skip searchRange, entrySelector, rangeShift.
+        p.skip('uShort', 3);
+        for (var i = 0; i < nPairs; i += 1) {
+            var leftIndex = p.parseUShort();
+            var rightIndex = p.parseUShort();
+            var value = p.parseShort();
+            pairs[leftIndex + ',' + rightIndex] = value;
+        }
+    }
+    return pairs;
+}
+
+// Parse the `kern` table which contains kerning pairs.
+function parseKernTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var tableVersion = p.parseUShort();
+    if (tableVersion === 0) {
+        return parseWindowsKernTable(p);
+    } else if (tableVersion === 1) {
+        return parseMacKernTable(p);
+    } else {
+        throw new Error('Unsupported kern table version (' + tableVersion + ').');
+    }
+}
+
+exports.parse = parseKernTable;
+
+},{"../check":3,"../parse":11}],25:[function(require,module,exports){
+// The `loca` table stores the offsets to the locations of the glyphs in the font.
+// https://www.microsoft.com/typography/OTSPEC/loca.htm
+
+
+
+var parse = require('../parse');
+
+// Parse the `loca` table. This table stores the offsets to the locations of the glyphs in the font,
+// relative to the beginning of the glyphData table.
+// The number of glyphs stored in the `loca` table is specified in the `maxp` table (under numGlyphs)
+// The loca table has two versions: a short version where offsets are stored as uShorts, and a long
+// version where offsets are stored as uLongs. The `head` table specifies which version to use
+// (under indexToLocFormat).
+function parseLocaTable(data, start, numGlyphs, shortVersion) {
+    var p = new parse.Parser(data, start);
+    var parseFn = shortVersion ? p.parseUShort : p.parseULong;
+    // There is an extra entry after the last index element to compute the length of the last glyph.
+    // That's why we use numGlyphs + 1.
+    var glyphOffsets = [];
+    for (var i = 0; i < numGlyphs + 1; i += 1) {
+        var glyphOffset = parseFn.call(p);
+        if (shortVersion) {
+            // The short table version stores the actual offset divided by 2.
+            glyphOffset *= 2;
+        }
+
+        glyphOffsets.push(glyphOffset);
+    }
+
+    return glyphOffsets;
+}
+
+exports.parse = parseLocaTable;
+
+},{"../parse":11}],26:[function(require,module,exports){
+// The `ltag` table stores IETF BCP-47 language tags. It allows supporting
+// languages for which TrueType does not assign a numeric code.
+// https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6ltag.html
+// http://www.w3.org/International/articles/language-tags/
+// http://www.iana.org/assignments/language-subtag-registry/language-subtag-registry
+
+
+
+var check = require('../check');
+var parse = require('../parse');
+var table = require('../table');
+
+function makeLtagTable(tags) {
+    var result = new table.Table('ltag', [
+        {name: 'version', type: 'ULONG', value: 1},
+        {name: 'flags', type: 'ULONG', value: 0},
+        {name: 'numTags', type: 'ULONG', value: tags.length}
+    ]);
+
+    var stringPool = '';
+    var stringPoolOffset = 12 + tags.length * 4;
+    for (var i = 0; i < tags.length; ++i) {
+        var pos = stringPool.indexOf(tags[i]);
+        if (pos < 0) {
+            pos = stringPool.length;
+            stringPool += tags[i];
+        }
+
+        result.fields.push({name: 'offset ' + i, type: 'USHORT', value: stringPoolOffset + pos});
+        result.fields.push({name: 'length ' + i, type: 'USHORT', value: tags[i].length});
+    }
+
+    result.fields.push({name: 'stringPool', type: 'CHARARRAY', value: stringPool});
+    return result;
+}
+
+function parseLtagTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var tableVersion = p.parseULong();
+    check.argument(tableVersion === 1, 'Unsupported ltag table version.');
+    // The 'ltag' specification does not define any flags; skip the field.
+    p.skip('uLong', 1);
+    var numTags = p.parseULong();
+
+    var tags = [];
+    for (var i = 0; i < numTags; i++) {
+        var tag = '';
+        var offset = start + p.parseUShort();
+        var length = p.parseUShort();
+        for (var j = offset; j < offset + length; ++j) {
+            tag += String.fromCharCode(data.getInt8(j));
+        }
+
+        tags.push(tag);
+    }
+
+    return tags;
+}
+
+exports.make = makeLtagTable;
+exports.parse = parseLtagTable;
+
+},{"../check":3,"../parse":11,"../table":14}],27:[function(require,module,exports){
+// The `maxp` table establishes the memory requirements for the font.
+// We need it just to get the number of glyphs in the font.
+// https://www.microsoft.com/typography/OTSPEC/maxp.htm
+
+
+
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the maximum profile `maxp` table.
+function parseMaxpTable(data, start) {
+    var maxp = {};
+    var p = new parse.Parser(data, start);
+    maxp.version = p.parseVersion();
+    maxp.numGlyphs = p.parseUShort();
+    if (maxp.version === 1.0) {
+        maxp.maxPoints = p.parseUShort();
+        maxp.maxContours = p.parseUShort();
+        maxp.maxCompositePoints = p.parseUShort();
+        maxp.maxCompositeContours = p.parseUShort();
+        maxp.maxZones = p.parseUShort();
+        maxp.maxTwilightPoints = p.parseUShort();
+        maxp.maxStorage = p.parseUShort();
+        maxp.maxFunctionDefs = p.parseUShort();
+        maxp.maxInstructionDefs = p.parseUShort();
+        maxp.maxStackElements = p.parseUShort();
+        maxp.maxSizeOfInstructions = p.parseUShort();
+        maxp.maxComponentElements = p.parseUShort();
+        maxp.maxComponentDepth = p.parseUShort();
+    }
+
+    return maxp;
+}
+
+function makeMaxpTable(numGlyphs) {
+    return new table.Table('maxp', [
+        {name: 'version', type: 'FIXED', value: 0x00005000},
+        {name: 'numGlyphs', type: 'USHORT', value: numGlyphs}
+    ]);
+}
+
+exports.parse = parseMaxpTable;
+exports.make = makeMaxpTable;
+
+},{"../parse":11,"../table":14}],28:[function(require,module,exports){
+// The `GPOS` table contains kerning pairs, among other things.
+// https://www.microsoft.com/typography/OTSPEC/gpos.htm
+
+
+
+var types = require('../types');
+var decode = types.decode;
+var check = require('../check');
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the metadata `meta` table.
+// https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6meta.html
+function parseMetaTable(data, start) {
+    var p = new parse.Parser(data, start);
+    var tableVersion = p.parseULong();
+    check.argument(tableVersion === 1, 'Unsupported META table version.');
+    p.parseULong(); // flags - currently unused and set to 0
+    p.parseULong(); // tableOffset
+    var numDataMaps = p.parseULong();
+
+    var tags = {};
+    for (var i = 0; i < numDataMaps; i++) {
+        var tag = p.parseTag();
+        var dataOffset = p.parseULong();
+        var dataLength = p.parseULong();
+        var text = decode.UTF8(data, start + dataOffset, dataLength);
+
+        tags[tag] = text;
+    }
+    return tags;
+}
+
+function makeMetaTable(tags) {
+    var numTags = Object.keys(tags).length;
+    var stringPool = '';
+    var stringPoolOffset = 16 + numTags * 12;
+
+    var result = new table.Table('meta', [
+        {name: 'version', type: 'ULONG', value: 1},
+        {name: 'flags', type: 'ULONG', value: 0},
+        {name: 'offset', type: 'ULONG', value: stringPoolOffset},
+        {name: 'numTags', type: 'ULONG', value: numTags}
+    ]);
+
+    for (var tag in tags) {
+        var pos = stringPool.length;
+        stringPool += tags[tag];
+
+        result.fields.push({name: 'tag ' + tag, type: 'TAG', value: tag});
+        result.fields.push({name: 'offset ' + tag, type: 'ULONG', value: stringPoolOffset + pos});
+        result.fields.push({name: 'length ' + tag, type: 'ULONG', value: tags[tag].length});
+    }
+
+    result.fields.push({name: 'stringPool', type: 'CHARARRAY', value: stringPool});
+
+    return result;
+}
+
+exports.parse = parseMetaTable;
+exports.make = makeMetaTable;
+
+},{"../check":3,"../parse":11,"../table":14,"../types":33}],29:[function(require,module,exports){
+// The `name` naming table.
+// https://www.microsoft.com/typography/OTSPEC/name.htm
+
+
+
+var types = require('../types');
+var decode = types.decode;
+var encode = types.encode;
+var parse = require('../parse');
+var table = require('../table');
+
+// NameIDs for the name table.
+var nameTableNames = [
+    'copyright',              // 0
+    'fontFamily',             // 1
+    'fontSubfamily',          // 2
+    'uniqueID',               // 3
+    'fullName',               // 4
+    'version',                // 5
+    'postScriptName',         // 6
+    'trademark',              // 7
+    'manufacturer',           // 8
+    'designer',               // 9
+    'description',            // 10
+    'manufacturerURL',        // 11
+    'designerURL',            // 12
+    'license',                // 13
+    'licenseURL',             // 14
+    'reserved',               // 15
+    'preferredFamily',        // 16
+    'preferredSubfamily',     // 17
+    'compatibleFullName',     // 18
+    'sampleText',             // 19
+    'postScriptFindFontName', // 20
+    'wwsFamily',              // 21
+    'wwsSubfamily'            // 22
+];
+
+var macLanguages = {
+    0: 'en',
+    1: 'fr',
+    2: 'de',
+    3: 'it',
+    4: 'nl',
+    5: 'sv',
+    6: 'es',
+    7: 'da',
+    8: 'pt',
+    9: 'no',
+    10: 'he',
+    11: 'ja',
+    12: 'ar',
+    13: 'fi',
+    14: 'el',
+    15: 'is',
+    16: 'mt',
+    17: 'tr',
+    18: 'hr',
+    19: 'zh-Hant',
+    20: 'ur',
+    21: 'hi',
+    22: 'th',
+    23: 'ko',
+    24: 'lt',
+    25: 'pl',
+    26: 'hu',
+    27: 'es',
+    28: 'lv',
+    29: 'se',
+    30: 'fo',
+    31: 'fa',
+    32: 'ru',
+    33: 'zh',
+    34: 'nl-BE',
+    35: 'ga',
+    36: 'sq',
+    37: 'ro',
+    38: 'cz',
+    39: 'sk',
+    40: 'si',
+    41: 'yi',
+    42: 'sr',
+    43: 'mk',
+    44: 'bg',
+    45: 'uk',
+    46: 'be',
+    47: 'uz',
+    48: 'kk',
+    49: 'az-Cyrl',
+    50: 'az-Arab',
+    51: 'hy',
+    52: 'ka',
+    53: 'mo',
+    54: 'ky',
+    55: 'tg',
+    56: 'tk',
+    57: 'mn-CN',
+    58: 'mn',
+    59: 'ps',
+    60: 'ks',
+    61: 'ku',
+    62: 'sd',
+    63: 'bo',
+    64: 'ne',
+    65: 'sa',
+    66: 'mr',
+    67: 'bn',
+    68: 'as',
+    69: 'gu',
+    70: 'pa',
+    71: 'or',
+    72: 'ml',
+    73: 'kn',
+    74: 'ta',
+    75: 'te',
+    76: 'si',
+    77: 'my',
+    78: 'km',
+    79: 'lo',
+    80: 'vi',
+    81: 'id',
+    82: 'tl',
+    83: 'ms',
+    84: 'ms-Arab',
+    85: 'am',
+    86: 'ti',
+    87: 'om',
+    88: 'so',
+    89: 'sw',
+    90: 'rw',
+    91: 'rn',
+    92: 'ny',
+    93: 'mg',
+    94: 'eo',
+    128: 'cy',
+    129: 'eu',
+    130: 'ca',
+    131: 'la',
+    132: 'qu',
+    133: 'gn',
+    134: 'ay',
+    135: 'tt',
+    136: 'ug',
+    137: 'dz',
+    138: 'jv',
+    139: 'su',
+    140: 'gl',
+    141: 'af',
+    142: 'br',
+    143: 'iu',
+    144: 'gd',
+    145: 'gv',
+    146: 'ga',
+    147: 'to',
+    148: 'el-polyton',
+    149: 'kl',
+    150: 'az',
+    151: 'nn'
+};
+
+// MacOS language ID → MacOS script ID
+//
+// Note that the script ID is not sufficient to determine what encoding
+// to use in TrueType files. For some languages, MacOS used a modification
+// of a mainstream script. For example, an Icelandic name would be stored
+// with smRoman in the TrueType naming table, but the actual encoding
+// is a special Icelandic version of the normal Macintosh Roman encoding.
+// As another example, Inuktitut uses an 8-bit encoding for Canadian Aboriginal
+// Syllables but MacOS had run out of available script codes, so this was
+// done as a (pretty radical) "modification" of Ethiopic.
+//
+// http://unicode.org/Public/MAPPINGS/VENDORS/APPLE/Readme.txt
+var macLanguageToScript = {
+    0: 0,  // langEnglish → smRoman
+    1: 0,  // langFrench → smRoman
+    2: 0,  // langGerman → smRoman
+    3: 0,  // langItalian → smRoman
+    4: 0,  // langDutch → smRoman
+    5: 0,  // langSwedish → smRoman
+    6: 0,  // langSpanish → smRoman
+    7: 0,  // langDanish → smRoman
+    8: 0,  // langPortuguese → smRoman
+    9: 0,  // langNorwegian → smRoman
+    10: 5,  // langHebrew → smHebrew
+    11: 1,  // langJapanese → smJapanese
+    12: 4,  // langArabic → smArabic
+    13: 0,  // langFinnish → smRoman
+    14: 6,  // langGreek → smGreek
+    15: 0,  // langIcelandic → smRoman (modified)
+    16: 0,  // langMaltese → smRoman
+    17: 0,  // langTurkish → smRoman (modified)
+    18: 0,  // langCroatian → smRoman (modified)
+    19: 2,  // langTradChinese → smTradChinese
+    20: 4,  // langUrdu → smArabic
+    21: 9,  // langHindi → smDevanagari
+    22: 21,  // langThai → smThai
+    23: 3,  // langKorean → smKorean
+    24: 29,  // langLithuanian → smCentralEuroRoman
+    25: 29,  // langPolish → smCentralEuroRoman
+    26: 29,  // langHungarian → smCentralEuroRoman
+    27: 29,  // langEstonian → smCentralEuroRoman
+    28: 29,  // langLatvian → smCentralEuroRoman
+    29: 0,  // langSami → smRoman
+    30: 0,  // langFaroese → smRoman (modified)
+    31: 4,  // langFarsi → smArabic (modified)
+    32: 7,  // langRussian → smCyrillic
+    33: 25,  // langSimpChinese → smSimpChinese
+    34: 0,  // langFlemish → smRoman
+    35: 0,  // langIrishGaelic → smRoman (modified)
+    36: 0,  // langAlbanian → smRoman
+    37: 0,  // langRomanian → smRoman (modified)
+    38: 29,  // langCzech → smCentralEuroRoman
+    39: 29,  // langSlovak → smCentralEuroRoman
+    40: 0,  // langSlovenian → smRoman (modified)
+    41: 5,  // langYiddish → smHebrew
+    42: 7,  // langSerbian → smCyrillic
+    43: 7,  // langMacedonian → smCyrillic
+    44: 7,  // langBulgarian → smCyrillic
+    45: 7,  // langUkrainian → smCyrillic (modified)
+    46: 7,  // langByelorussian → smCyrillic
+    47: 7,  // langUzbek → smCyrillic
+    48: 7,  // langKazakh → smCyrillic
+    49: 7,  // langAzerbaijani → smCyrillic
+    50: 4,  // langAzerbaijanAr → smArabic
+    51: 24,  // langArmenian → smArmenian
+    52: 23,  // langGeorgian → smGeorgian
+    53: 7,  // langMoldavian → smCyrillic
+    54: 7,  // langKirghiz → smCyrillic
+    55: 7,  // langTajiki → smCyrillic
+    56: 7,  // langTurkmen → smCyrillic
+    57: 27,  // langMongolian → smMongolian
+    58: 7,  // langMongolianCyr → smCyrillic
+    59: 4,  // langPashto → smArabic
+    60: 4,  // langKurdish → smArabic
+    61: 4,  // langKashmiri → smArabic
+    62: 4,  // langSindhi → smArabic
+    63: 26,  // langTibetan → smTibetan
+    64: 9,  // langNepali → smDevanagari
+    65: 9,  // langSanskrit → smDevanagari
+    66: 9,  // langMarathi → smDevanagari
+    67: 13,  // langBengali → smBengali
+    68: 13,  // langAssamese → smBengali
+    69: 11,  // langGujarati → smGujarati
+    70: 10,  // langPunjabi → smGurmukhi
+    71: 12,  // langOriya → smOriya
+    72: 17,  // langMalayalam → smMalayalam
+    73: 16,  // langKannada → smKannada
+    74: 14,  // langTamil → smTamil
+    75: 15,  // langTelugu → smTelugu
+    76: 18,  // langSinhalese → smSinhalese
+    77: 19,  // langBurmese → smBurmese
+    78: 20,  // langKhmer → smKhmer
+    79: 22,  // langLao → smLao
+    80: 30,  // langVietnamese → smVietnamese
+    81: 0,  // langIndonesian → smRoman
+    82: 0,  // langTagalog → smRoman
+    83: 0,  // langMalayRoman → smRoman
+    84: 4,  // langMalayArabic → smArabic
+    85: 28,  // langAmharic → smEthiopic
+    86: 28,  // langTigrinya → smEthiopic
+    87: 28,  // langOromo → smEthiopic
+    88: 0,  // langSomali → smRoman
+    89: 0,  // langSwahili → smRoman
+    90: 0,  // langKinyarwanda → smRoman
+    91: 0,  // langRundi → smRoman
+    92: 0,  // langNyanja → smRoman
+    93: 0,  // langMalagasy → smRoman
+    94: 0,  // langEsperanto → smRoman
+    128: 0,  // langWelsh → smRoman (modified)
+    129: 0,  // langBasque → smRoman
+    130: 0,  // langCatalan → smRoman
+    131: 0,  // langLatin → smRoman
+    132: 0,  // langQuechua → smRoman
+    133: 0,  // langGuarani → smRoman
+    134: 0,  // langAymara → smRoman
+    135: 7,  // langTatar → smCyrillic
+    136: 4,  // langUighur → smArabic
+    137: 26,  // langDzongkha → smTibetan
+    138: 0,  // langJavaneseRom → smRoman
+    139: 0,  // langSundaneseRom → smRoman
+    140: 0,  // langGalician → smRoman
+    141: 0,  // langAfrikaans → smRoman
+    142: 0,  // langBreton → smRoman (modified)
+    143: 28,  // langInuktitut → smEthiopic (modified)
+    144: 0,  // langScottishGaelic → smRoman (modified)
+    145: 0,  // langManxGaelic → smRoman (modified)
+    146: 0,  // langIrishGaelicScript → smRoman (modified)
+    147: 0,  // langTongan → smRoman
+    148: 6,  // langGreekAncient → smRoman
+    149: 0,  // langGreenlandic → smRoman
+    150: 0,  // langAzerbaijanRoman → smRoman
+    151: 0   // langNynorsk → smRoman
+};
+
+// While Microsoft indicates a region/country for all its language
+// IDs, we omit the region code if it's equal to the "most likely
+// region subtag" according to Unicode CLDR. For scripts, we omit
+// the subtag if it is equal to the Suppress-Script entry in the
+// IANA language subtag registry for IETF BCP 47.
+//
+// For example, Microsoft states that its language code 0x041A is
+// Croatian in Croatia. We transform this to the BCP 47 language code 'hr'
+// and not 'hr-HR' because Croatia is the default country for Croatian,
+// according to Unicode CLDR. As another example, Microsoft states
+// that 0x101A is Croatian (Latin) in Bosnia-Herzegovina. We transform
+// this to 'hr-BA' and not 'hr-Latn-BA' because Latin is the default script
+// for the Croatian language, according to IANA.
+//
+// http://www.unicode.org/cldr/charts/latest/supplemental/likely_subtags.html
+// http://www.iana.org/assignments/language-subtag-registry/language-subtag-registry
+var windowsLanguages = {
+    0x0436: 'af',
+    0x041C: 'sq',
+    0x0484: 'gsw',
+    0x045E: 'am',
+    0x1401: 'ar-DZ',
+    0x3C01: 'ar-BH',
+    0x0C01: 'ar',
+    0x0801: 'ar-IQ',
+    0x2C01: 'ar-JO',
+    0x3401: 'ar-KW',
+    0x3001: 'ar-LB',
+    0x1001: 'ar-LY',
+    0x1801: 'ary',
+    0x2001: 'ar-OM',
+    0x4001: 'ar-QA',
+    0x0401: 'ar-SA',
+    0x2801: 'ar-SY',
+    0x1C01: 'aeb',
+    0x3801: 'ar-AE',
+    0x2401: 'ar-YE',
+    0x042B: 'hy',
+    0x044D: 'as',
+    0x082C: 'az-Cyrl',
+    0x042C: 'az',
+    0x046D: 'ba',
+    0x042D: 'eu',
+    0x0423: 'be',
+    0x0845: 'bn',
+    0x0445: 'bn-IN',
+    0x201A: 'bs-Cyrl',
+    0x141A: 'bs',
+    0x047E: 'br',
+    0x0402: 'bg',
+    0x0403: 'ca',
+    0x0C04: 'zh-HK',
+    0x1404: 'zh-MO',
+    0x0804: 'zh',
+    0x1004: 'zh-SG',
+    0x0404: 'zh-TW',
+    0x0483: 'co',
+    0x041A: 'hr',
+    0x101A: 'hr-BA',
+    0x0405: 'cs',
+    0x0406: 'da',
+    0x048C: 'prs',
+    0x0465: 'dv',
+    0x0813: 'nl-BE',
+    0x0413: 'nl',
+    0x0C09: 'en-AU',
+    0x2809: 'en-BZ',
+    0x1009: 'en-CA',
+    0x2409: 'en-029',
+    0x4009: 'en-IN',
+    0x1809: 'en-IE',
+    0x2009: 'en-JM',
+    0x4409: 'en-MY',
+    0x1409: 'en-NZ',
+    0x3409: 'en-PH',
+    0x4809: 'en-SG',
+    0x1C09: 'en-ZA',
+    0x2C09: 'en-TT',
+    0x0809: 'en-GB',
+    0x0409: 'en',
+    0x3009: 'en-ZW',
+    0x0425: 'et',
+    0x0438: 'fo',
+    0x0464: 'fil',
+    0x040B: 'fi',
+    0x080C: 'fr-BE',
+    0x0C0C: 'fr-CA',
+    0x040C: 'fr',
+    0x140C: 'fr-LU',
+    0x180C: 'fr-MC',
+    0x100C: 'fr-CH',
+    0x0462: 'fy',
+    0x0456: 'gl',
+    0x0437: 'ka',
+    0x0C07: 'de-AT',
+    0x0407: 'de',
+    0x1407: 'de-LI',
+    0x1007: 'de-LU',
+    0x0807: 'de-CH',
+    0x0408: 'el',
+    0x046F: 'kl',
+    0x0447: 'gu',
+    0x0468: 'ha',
+    0x040D: 'he',
+    0x0439: 'hi',
+    0x040E: 'hu',
+    0x040F: 'is',
+    0x0470: 'ig',
+    0x0421: 'id',
+    0x045D: 'iu',
+    0x085D: 'iu-Latn',
+    0x083C: 'ga',
+    0x0434: 'xh',
+    0x0435: 'zu',
+    0x0410: 'it',
+    0x0810: 'it-CH',
+    0x0411: 'ja',
+    0x044B: 'kn',
+    0x043F: 'kk',
+    0x0453: 'km',
+    0x0486: 'quc',
+    0x0487: 'rw',
+    0x0441: 'sw',
+    0x0457: 'kok',
+    0x0412: 'ko',
+    0x0440: 'ky',
+    0x0454: 'lo',
+    0x0426: 'lv',
+    0x0427: 'lt',
+    0x082E: 'dsb',
+    0x046E: 'lb',
+    0x042F: 'mk',
+    0x083E: 'ms-BN',
+    0x043E: 'ms',
+    0x044C: 'ml',
+    0x043A: 'mt',
+    0x0481: 'mi',
+    0x047A: 'arn',
+    0x044E: 'mr',
+    0x047C: 'moh',
+    0x0450: 'mn',
+    0x0850: 'mn-CN',
+    0x0461: 'ne',
+    0x0414: 'nb',
+    0x0814: 'nn',
+    0x0482: 'oc',
+    0x0448: 'or',
+    0x0463: 'ps',
+    0x0415: 'pl',
+    0x0416: 'pt',
+    0x0816: 'pt-PT',
+    0x0446: 'pa',
+    0x046B: 'qu-BO',
+    0x086B: 'qu-EC',
+    0x0C6B: 'qu',
+    0x0418: 'ro',
+    0x0417: 'rm',
+    0x0419: 'ru',
+    0x243B: 'smn',
+    0x103B: 'smj-NO',
+    0x143B: 'smj',
+    0x0C3B: 'se-FI',
+    0x043B: 'se',
+    0x083B: 'se-SE',
+    0x203B: 'sms',
+    0x183B: 'sma-NO',
+    0x1C3B: 'sms',
+    0x044F: 'sa',
+    0x1C1A: 'sr-Cyrl-BA',
+    0x0C1A: 'sr',
+    0x181A: 'sr-Latn-BA',
+    0x081A: 'sr-Latn',
+    0x046C: 'nso',
+    0x0432: 'tn',
+    0x045B: 'si',
+    0x041B: 'sk',
+    0x0424: 'sl',
+    0x2C0A: 'es-AR',
+    0x400A: 'es-BO',
+    0x340A: 'es-CL',
+    0x240A: 'es-CO',
+    0x140A: 'es-CR',
+    0x1C0A: 'es-DO',
+    0x300A: 'es-EC',
+    0x440A: 'es-SV',
+    0x100A: 'es-GT',
+    0x480A: 'es-HN',
+    0x080A: 'es-MX',
+    0x4C0A: 'es-NI',
+    0x180A: 'es-PA',
+    0x3C0A: 'es-PY',
+    0x280A: 'es-PE',
+    0x500A: 'es-PR',
+
+    // Microsoft has defined two different language codes for
+    // “Spanish with modern sorting” and “Spanish with traditional
+    // sorting”. This makes sense for collation APIs, and it would be
+    // possible to express this in BCP 47 language tags via Unicode
+    // extensions (eg., es-u-co-trad is Spanish with traditional
+    // sorting). However, for storing names in fonts, the distinction
+    // does not make sense, so we give “es” in both cases.
+    0x0C0A: 'es',
+    0x040A: 'es',
+
+    0x540A: 'es-US',
+    0x380A: 'es-UY',
+    0x200A: 'es-VE',
+    0x081D: 'sv-FI',
+    0x041D: 'sv',
+    0x045A: 'syr',
+    0x0428: 'tg',
+    0x085F: 'tzm',
+    0x0449: 'ta',
+    0x0444: 'tt',
+    0x044A: 'te',
+    0x041E: 'th',
+    0x0451: 'bo',
+    0x041F: 'tr',
+    0x0442: 'tk',
+    0x0480: 'ug',
+    0x0422: 'uk',
+    0x042E: 'hsb',
+    0x0420: 'ur',
+    0x0843: 'uz-Cyrl',
+    0x0443: 'uz',
+    0x042A: 'vi',
+    0x0452: 'cy',
+    0x0488: 'wo',
+    0x0485: 'sah',
+    0x0478: 'ii',
+    0x046A: 'yo'
+};
+
+// Returns a IETF BCP 47 language code, for example 'zh-Hant'
+// for 'Chinese in the traditional script'.
+function getLanguageCode(platformID, languageID, ltag) {
+    switch (platformID) {
+        case 0:  // Unicode
+            if (languageID === 0xFFFF) {
+                return 'und';
+            } else if (ltag) {
+                return ltag[languageID];
+            }
+
+            break;
+
+        case 1:  // Macintosh
+            return macLanguages[languageID];
+
+        case 3:  // Windows
+            return windowsLanguages[languageID];
+    }
+
+    return undefined;
+}
+
+var utf16 = 'utf-16';
+
+// MacOS script ID → encoding. This table stores the default case,
+// which can be overridden by macLanguageEncodings.
+var macScriptEncodings = {
+    0: 'macintosh',           // smRoman
+    1: 'x-mac-japanese',      // smJapanese
+    2: 'x-mac-chinesetrad',   // smTradChinese
+    3: 'x-mac-korean',        // smKorean
+    6: 'x-mac-greek',         // smGreek
+    7: 'x-mac-cyrillic',      // smCyrillic
+    9: 'x-mac-devanagai',     // smDevanagari
+    10: 'x-mac-gurmukhi',     // smGurmukhi
+    11: 'x-mac-gujarati',     // smGujarati
+    12: 'x-mac-oriya',        // smOriya
+    13: 'x-mac-bengali',      // smBengali
+    14: 'x-mac-tamil',        // smTamil
+    15: 'x-mac-telugu',       // smTelugu
+    16: 'x-mac-kannada',      // smKannada
+    17: 'x-mac-malayalam',    // smMalayalam
+    18: 'x-mac-sinhalese',    // smSinhalese
+    19: 'x-mac-burmese',      // smBurmese
+    20: 'x-mac-khmer',        // smKhmer
+    21: 'x-mac-thai',         // smThai
+    22: 'x-mac-lao',          // smLao
+    23: 'x-mac-georgian',     // smGeorgian
+    24: 'x-mac-armenian',     // smArmenian
+    25: 'x-mac-chinesesimp',  // smSimpChinese
+    26: 'x-mac-tibetan',      // smTibetan
+    27: 'x-mac-mongolian',    // smMongolian
+    28: 'x-mac-ethiopic',     // smEthiopic
+    29: 'x-mac-ce',           // smCentralEuroRoman
+    30: 'x-mac-vietnamese',   // smVietnamese
+    31: 'x-mac-extarabic'     // smExtArabic
+};
+
+// MacOS language ID → encoding. This table stores the exceptional
+// cases, which override macScriptEncodings. For writing MacOS naming
+// tables, we need to emit a MacOS script ID. Therefore, we cannot
+// merge macScriptEncodings into macLanguageEncodings.
+//
+// http://unicode.org/Public/MAPPINGS/VENDORS/APPLE/Readme.txt
+var macLanguageEncodings = {
+    15: 'x-mac-icelandic',    // langIcelandic
+    17: 'x-mac-turkish',      // langTurkish
+    18: 'x-mac-croatian',     // langCroatian
+    24: 'x-mac-ce',           // langLithuanian
+    25: 'x-mac-ce',           // langPolish
+    26: 'x-mac-ce',           // langHungarian
+    27: 'x-mac-ce',           // langEstonian
+    28: 'x-mac-ce',           // langLatvian
+    30: 'x-mac-icelandic',    // langFaroese
+    37: 'x-mac-romanian',     // langRomanian
+    38: 'x-mac-ce',           // langCzech
+    39: 'x-mac-ce',           // langSlovak
+    40: 'x-mac-ce',           // langSlovenian
+    143: 'x-mac-inuit',       // langInuktitut
+    146: 'x-mac-gaelic'       // langIrishGaelicScript
+};
+
+function getEncoding(platformID, encodingID, languageID) {
+    switch (platformID) {
+        case 0:  // Unicode
+            return utf16;
+
+        case 1:  // Apple Macintosh
+            return macLanguageEncodings[languageID] || macScriptEncodings[encodingID];
+
+        case 3:  // Microsoft Windows
+            if (encodingID === 1 || encodingID === 10) {
+                return utf16;
+            }
+
+            break;
+    }
+
+    return undefined;
+}
+
+// Parse the naming `name` table.
+// FIXME: Format 1 additional fields are not supported yet.
+// ltag is the content of the `ltag' table, such as ['en', 'zh-Hans', 'de-CH-1904'].
+function parseNameTable(data, start, ltag) {
+    var name = {};
+    var p = new parse.Parser(data, start);
+    var format = p.parseUShort();
+    var count = p.parseUShort();
+    var stringOffset = p.offset + p.parseUShort();
+    for (var i = 0; i < count; i++) {
+        var platformID = p.parseUShort();
+        var encodingID = p.parseUShort();
+        var languageID = p.parseUShort();
+        var nameID = p.parseUShort();
+        var property = nameTableNames[nameID] || nameID;
+        var byteLength = p.parseUShort();
+        var offset = p.parseUShort();
+        var language = getLanguageCode(platformID, languageID, ltag);
+        var encoding = getEncoding(platformID, encodingID, languageID);
+        if (encoding !== undefined && language !== undefined) {
+            var text;
+            if (encoding === utf16) {
+                text = decode.UTF16(data, stringOffset + offset, byteLength);
+            } else {
+                text = decode.MACSTRING(data, stringOffset + offset, byteLength, encoding);
+            }
+
+            if (text) {
+                var translations = name[property];
+                if (translations === undefined) {
+                    translations = name[property] = {};
+                }
+
+                translations[language] = text;
+            }
+        }
+    }
+
+    var langTagCount = 0;
+    if (format === 1) {
+        // FIXME: Also handle Microsoft's 'name' table 1.
+        langTagCount = p.parseUShort();
+    }
+
+    return name;
+}
+
+// {23: 'foo'} → {'foo': 23}
+// ['bar', 'baz'] → {'bar': 0, 'baz': 1}
+function reverseDict(dict) {
+    var result = {};
+    for (var key in dict) {
+        result[dict[key]] = parseInt(key);
+    }
+
+    return result;
+}
+
+function makeNameRecord(platformID, encodingID, languageID, nameID, length, offset) {
+    return new table.Record('NameRecord', [
+        {name: 'platformID', type: 'USHORT', value: platformID},
+        {name: 'encodingID', type: 'USHORT', value: encodingID},
+        {name: 'languageID', type: 'USHORT', value: languageID},
+        {name: 'nameID', type: 'USHORT', value: nameID},
+        {name: 'length', type: 'USHORT', value: length},
+        {name: 'offset', type: 'USHORT', value: offset}
+    ]);
+}
+
+// Finds the position of needle in haystack, or -1 if not there.
+// Like String.indexOf(), but for arrays.
+function findSubArray(needle, haystack) {
+    var needleLength = needle.length;
+    var limit = haystack.length - needleLength + 1;
+
+    loop:
+    for (var pos = 0; pos < limit; pos++) {
+        for (; pos < limit; pos++) {
+            for (var k = 0; k < needleLength; k++) {
+                if (haystack[pos + k] !== needle[k]) {
+                    continue loop;
+                }
+            }
+
+            return pos;
+        }
+    }
+
+    return -1;
+}
+
+function addStringToPool(s, pool) {
+    var offset = findSubArray(s, pool);
+    if (offset < 0) {
+        offset = pool.length;
+        for (var i = 0, len = s.length; i < len; ++i) {
+            pool.push(s[i]);
+        }
+
+    }
+
+    return offset;
+}
+
+function makeNameTable(names, ltag) {
+    var nameID;
+    var nameIDs = [];
+
+    var namesWithNumericKeys = {};
+    var nameTableIds = reverseDict(nameTableNames);
+    for (var key in names) {
+        var id = nameTableIds[key];
+        if (id === undefined) {
+            id = key;
+        }
+
+        nameID = parseInt(id);
+
+        if (isNaN(nameID)) {
+            throw new Error('Name table entry "' + key + '" does not exist, see nameTableNames for complete list.');
+        }
+
+        namesWithNumericKeys[nameID] = names[key];
+        nameIDs.push(nameID);
+    }
+
+    var macLanguageIds = reverseDict(macLanguages);
+    var windowsLanguageIds = reverseDict(windowsLanguages);
+
+    var nameRecords = [];
+    var stringPool = [];
+
+    for (var i = 0; i < nameIDs.length; i++) {
+        nameID = nameIDs[i];
+        var translations = namesWithNumericKeys[nameID];
+        for (var lang in translations) {
+            var text = translations[lang];
+
+            // For MacOS, we try to emit the name in the form that was introduced
+            // in the initial version of the TrueType spec (in the late 1980s).
+            // However, this can fail for various reasons: the requested BCP 47
+            // language code might not have an old-style Mac equivalent;
+            // we might not have a codec for the needed character encoding;
+            // or the name might contain characters that cannot be expressed
+            // in the old-style Macintosh encoding. In case of failure, we emit
+            // the name in a more modern fashion (Unicode encoding with BCP 47
+            // language tags) that is recognized by MacOS 10.5, released in 2009.
+            // If fonts were only read by operating systems, we could simply
+            // emit all names in the modern form; this would be much easier.
+            // However, there are many applications and libraries that read
+            // 'name' tables directly, and these will usually only recognize
+            // the ancient form (silently skipping the unrecognized names).
+            var macPlatform = 1;  // Macintosh
+            var macLanguage = macLanguageIds[lang];
+            var macScript = macLanguageToScript[macLanguage];
+            var macEncoding = getEncoding(macPlatform, macScript, macLanguage);
+            var macName = encode.MACSTRING(text, macEncoding);
+            if (macName === undefined) {
+                macPlatform = 0;  // Unicode
+                macLanguage = ltag.indexOf(lang);
+                if (macLanguage < 0) {
+                    macLanguage = ltag.length;
+                    ltag.push(lang);
+                }
+
+                macScript = 4;  // Unicode 2.0 and later
+                macName = encode.UTF16(text);
+            }
+
+            var macNameOffset = addStringToPool(macName, stringPool);
+            nameRecords.push(makeNameRecord(macPlatform, macScript, macLanguage,
+                                            nameID, macName.length, macNameOffset));
+
+            var winLanguage = windowsLanguageIds[lang];
+            if (winLanguage !== undefined) {
+                var winName = encode.UTF16(text);
+                var winNameOffset = addStringToPool(winName, stringPool);
+                nameRecords.push(makeNameRecord(3, 1, winLanguage,
+                                                nameID, winName.length, winNameOffset));
+            }
+        }
+    }
+
+    nameRecords.sort(function(a, b) {
+        return ((a.platformID - b.platformID) ||
+                (a.encodingID - b.encodingID) ||
+                (a.languageID - b.languageID) ||
+                (a.nameID - b.nameID));
+    });
+
+    var t = new table.Table('name', [
+        {name: 'format', type: 'USHORT', value: 0},
+        {name: 'count', type: 'USHORT', value: nameRecords.length},
+        {name: 'stringOffset', type: 'USHORT', value: 6 + nameRecords.length * 12}
+    ]);
+
+    for (var r = 0; r < nameRecords.length; r++) {
+        t.fields.push({name: 'record_' + r, type: 'RECORD', value: nameRecords[r]});
+    }
+
+    t.fields.push({name: 'strings', type: 'LITERAL', value: stringPool});
+    return t;
+}
+
+exports.parse = parseNameTable;
+exports.make = makeNameTable;
+
+},{"../parse":11,"../table":14,"../types":33}],30:[function(require,module,exports){
+// The `OS/2` table contains metrics required in OpenType fonts.
+// https://www.microsoft.com/typography/OTSPEC/os2.htm
+
+
+
+var parse = require('../parse');
+var table = require('../table');
+
+var unicodeRanges = [
+    {begin: 0x0000, end: 0x007F}, // Basic Latin
+    {begin: 0x0080, end: 0x00FF}, // Latin-1 Supplement
+    {begin: 0x0100, end: 0x017F}, // Latin Extended-A
+    {begin: 0x0180, end: 0x024F}, // Latin Extended-B
+    {begin: 0x0250, end: 0x02AF}, // IPA Extensions
+    {begin: 0x02B0, end: 0x02FF}, // Spacing Modifier Letters
+    {begin: 0x0300, end: 0x036F}, // Combining Diacritical Marks
+    {begin: 0x0370, end: 0x03FF}, // Greek and Coptic
+    {begin: 0x2C80, end: 0x2CFF}, // Coptic
+    {begin: 0x0400, end: 0x04FF}, // Cyrillic
+    {begin: 0x0530, end: 0x058F}, // Armenian
+    {begin: 0x0590, end: 0x05FF}, // Hebrew
+    {begin: 0xA500, end: 0xA63F}, // Vai
+    {begin: 0x0600, end: 0x06FF}, // Arabic
+    {begin: 0x07C0, end: 0x07FF}, // NKo
+    {begin: 0x0900, end: 0x097F}, // Devanagari
+    {begin: 0x0980, end: 0x09FF}, // Bengali
+    {begin: 0x0A00, end: 0x0A7F}, // Gurmukhi
+    {begin: 0x0A80, end: 0x0AFF}, // Gujarati
+    {begin: 0x0B00, end: 0x0B7F}, // Oriya
+    {begin: 0x0B80, end: 0x0BFF}, // Tamil
+    {begin: 0x0C00, end: 0x0C7F}, // Telugu
+    {begin: 0x0C80, end: 0x0CFF}, // Kannada
+    {begin: 0x0D00, end: 0x0D7F}, // Malayalam
+    {begin: 0x0E00, end: 0x0E7F}, // Thai
+    {begin: 0x0E80, end: 0x0EFF}, // Lao
+    {begin: 0x10A0, end: 0x10FF}, // Georgian
+    {begin: 0x1B00, end: 0x1B7F}, // Balinese
+    {begin: 0x1100, end: 0x11FF}, // Hangul Jamo
+    {begin: 0x1E00, end: 0x1EFF}, // Latin Extended Additional
+    {begin: 0x1F00, end: 0x1FFF}, // Greek Extended
+    {begin: 0x2000, end: 0x206F}, // General Punctuation
+    {begin: 0x2070, end: 0x209F}, // Superscripts And Subscripts
+    {begin: 0x20A0, end: 0x20CF}, // Currency Symbol
+    {begin: 0x20D0, end: 0x20FF}, // Combining Diacritical Marks For Symbols
+    {begin: 0x2100, end: 0x214F}, // Letterlike Symbols
+    {begin: 0x2150, end: 0x218F}, // Number Forms
+    {begin: 0x2190, end: 0x21FF}, // Arrows
+    {begin: 0x2200, end: 0x22FF}, // Mathematical Operators
+    {begin: 0x2300, end: 0x23FF}, // Miscellaneous Technical
+    {begin: 0x2400, end: 0x243F}, // Control Pictures
+    {begin: 0x2440, end: 0x245F}, // Optical Character Recognition
+    {begin: 0x2460, end: 0x24FF}, // Enclosed Alphanumerics
+    {begin: 0x2500, end: 0x257F}, // Box Drawing
+    {begin: 0x2580, end: 0x259F}, // Block Elements
+    {begin: 0x25A0, end: 0x25FF}, // Geometric Shapes
+    {begin: 0x2600, end: 0x26FF}, // Miscellaneous Symbols
+    {begin: 0x2700, end: 0x27BF}, // Dingbats
+    {begin: 0x3000, end: 0x303F}, // CJK Symbols And Punctuation
+    {begin: 0x3040, end: 0x309F}, // Hiragana
+    {begin: 0x30A0, end: 0x30FF}, // Katakana
+    {begin: 0x3100, end: 0x312F}, // Bopomofo
+    {begin: 0x3130, end: 0x318F}, // Hangul Compatibility Jamo
+    {begin: 0xA840, end: 0xA87F}, // Phags-pa
+    {begin: 0x3200, end: 0x32FF}, // Enclosed CJK Letters And Months
+    {begin: 0x3300, end: 0x33FF}, // CJK Compatibility
+    {begin: 0xAC00, end: 0xD7AF}, // Hangul Syllables
+    {begin: 0xD800, end: 0xDFFF}, // Non-Plane 0 *
+    {begin: 0x10900, end: 0x1091F}, // Phoenicia
+    {begin: 0x4E00, end: 0x9FFF}, // CJK Unified Ideographs
+    {begin: 0xE000, end: 0xF8FF}, // Private Use Area (plane 0)
+    {begin: 0x31C0, end: 0x31EF}, // CJK Strokes
+    {begin: 0xFB00, end: 0xFB4F}, // Alphabetic Presentation Forms
+    {begin: 0xFB50, end: 0xFDFF}, // Arabic Presentation Forms-A
+    {begin: 0xFE20, end: 0xFE2F}, // Combining Half Marks
+    {begin: 0xFE10, end: 0xFE1F}, // Vertical Forms
+    {begin: 0xFE50, end: 0xFE6F}, // Small Form Variants
+    {begin: 0xFE70, end: 0xFEFF}, // Arabic Presentation Forms-B
+    {begin: 0xFF00, end: 0xFFEF}, // Halfwidth And Fullwidth Forms
+    {begin: 0xFFF0, end: 0xFFFF}, // Specials
+    {begin: 0x0F00, end: 0x0FFF}, // Tibetan
+    {begin: 0x0700, end: 0x074F}, // Syriac
+    {begin: 0x0780, end: 0x07BF}, // Thaana
+    {begin: 0x0D80, end: 0x0DFF}, // Sinhala
+    {begin: 0x1000, end: 0x109F}, // Myanmar
+    {begin: 0x1200, end: 0x137F}, // Ethiopic
+    {begin: 0x13A0, end: 0x13FF}, // Cherokee
+    {begin: 0x1400, end: 0x167F}, // Unified Canadian Aboriginal Syllabics
+    {begin: 0x1680, end: 0x169F}, // Ogham
+    {begin: 0x16A0, end: 0x16FF}, // Runic
+    {begin: 0x1780, end: 0x17FF}, // Khmer
+    {begin: 0x1800, end: 0x18AF}, // Mongolian
+    {begin: 0x2800, end: 0x28FF}, // Braille Patterns
+    {begin: 0xA000, end: 0xA48F}, // Yi Syllables
+    {begin: 0x1700, end: 0x171F}, // Tagalog
+    {begin: 0x10300, end: 0x1032F}, // Old Italic
+    {begin: 0x10330, end: 0x1034F}, // Gothic
+    {begin: 0x10400, end: 0x1044F}, // Deseret
+    {begin: 0x1D000, end: 0x1D0FF}, // Byzantine Musical Symbols
+    {begin: 0x1D400, end: 0x1D7FF}, // Mathematical Alphanumeric Symbols
+    {begin: 0xFF000, end: 0xFFFFD}, // Private Use (plane 15)
+    {begin: 0xFE00, end: 0xFE0F}, // Variation Selectors
+    {begin: 0xE0000, end: 0xE007F}, // Tags
+    {begin: 0x1900, end: 0x194F}, // Limbu
+    {begin: 0x1950, end: 0x197F}, // Tai Le
+    {begin: 0x1980, end: 0x19DF}, // New Tai Lue
+    {begin: 0x1A00, end: 0x1A1F}, // Buginese
+    {begin: 0x2C00, end: 0x2C5F}, // Glagolitic
+    {begin: 0x2D30, end: 0x2D7F}, // Tifinagh
+    {begin: 0x4DC0, end: 0x4DFF}, // Yijing Hexagram Symbols
+    {begin: 0xA800, end: 0xA82F}, // Syloti Nagri
+    {begin: 0x10000, end: 0x1007F}, // Linear B Syllabary
+    {begin: 0x10140, end: 0x1018F}, // Ancient Greek Numbers
+    {begin: 0x10380, end: 0x1039F}, // Ugaritic
+    {begin: 0x103A0, end: 0x103DF}, // Old Persian
+    {begin: 0x10450, end: 0x1047F}, // Shavian
+    {begin: 0x10480, end: 0x104AF}, // Osmanya
+    {begin: 0x10800, end: 0x1083F}, // Cypriot Syllabary
+    {begin: 0x10A00, end: 0x10A5F}, // Kharoshthi
+    {begin: 0x1D300, end: 0x1D35F}, // Tai Xuan Jing Symbols
+    {begin: 0x12000, end: 0x123FF}, // Cuneiform
+    {begin: 0x1D360, end: 0x1D37F}, // Counting Rod Numerals
+    {begin: 0x1B80, end: 0x1BBF}, // Sundanese
+    {begin: 0x1C00, end: 0x1C4F}, // Lepcha
+    {begin: 0x1C50, end: 0x1C7F}, // Ol Chiki
+    {begin: 0xA880, end: 0xA8DF}, // Saurashtra
+    {begin: 0xA900, end: 0xA92F}, // Kayah Li
+    {begin: 0xA930, end: 0xA95F}, // Rejang
+    {begin: 0xAA00, end: 0xAA5F}, // Cham
+    {begin: 0x10190, end: 0x101CF}, // Ancient Symbols
+    {begin: 0x101D0, end: 0x101FF}, // Phaistos Disc
+    {begin: 0x102A0, end: 0x102DF}, // Carian
+    {begin: 0x1F030, end: 0x1F09F}  // Domino Tiles
+];
+
+function getUnicodeRange(unicode) {
+    for (var i = 0; i < unicodeRanges.length; i += 1) {
+        var range = unicodeRanges[i];
+        if (unicode >= range.begin && unicode < range.end) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+// Parse the OS/2 and Windows metrics `OS/2` table
+function parseOS2Table(data, start) {
+    var os2 = {};
+    var p = new parse.Parser(data, start);
+    os2.version = p.parseUShort();
+    os2.xAvgCharWidth = p.parseShort();
+    os2.usWeightClass = p.parseUShort();
+    os2.usWidthClass = p.parseUShort();
+    os2.fsType = p.parseUShort();
+    os2.ySubscriptXSize = p.parseShort();
+    os2.ySubscriptYSize = p.parseShort();
+    os2.ySubscriptXOffset = p.parseShort();
+    os2.ySubscriptYOffset = p.parseShort();
+    os2.ySuperscriptXSize = p.parseShort();
+    os2.ySuperscriptYSize = p.parseShort();
+    os2.ySuperscriptXOffset = p.parseShort();
+    os2.ySuperscriptYOffset = p.parseShort();
+    os2.yStrikeoutSize = p.parseShort();
+    os2.yStrikeoutPosition = p.parseShort();
+    os2.sFamilyClass = p.parseShort();
+    os2.panose = [];
+    for (var i = 0; i < 10; i++) {
+        os2.panose[i] = p.parseByte();
+    }
+
+    os2.ulUnicodeRange1 = p.parseULong();
+    os2.ulUnicodeRange2 = p.parseULong();
+    os2.ulUnicodeRange3 = p.parseULong();
+    os2.ulUnicodeRange4 = p.parseULong();
+    os2.achVendID = String.fromCharCode(p.parseByte(), p.parseByte(), p.parseByte(), p.parseByte());
+    os2.fsSelection = p.parseUShort();
+    os2.usFirstCharIndex = p.parseUShort();
+    os2.usLastCharIndex = p.parseUShort();
+    os2.sTypoAscender = p.parseShort();
+    os2.sTypoDescender = p.parseShort();
+    os2.sTypoLineGap = p.parseShort();
+    os2.usWinAscent = p.parseUShort();
+    os2.usWinDescent = p.parseUShort();
+    if (os2.version >= 1) {
+        os2.ulCodePageRange1 = p.parseULong();
+        os2.ulCodePageRange2 = p.parseULong();
+    }
+
+    if (os2.version >= 2) {
+        os2.sxHeight = p.parseShort();
+        os2.sCapHeight = p.parseShort();
+        os2.usDefaultChar = p.parseUShort();
+        os2.usBreakChar = p.parseUShort();
+        os2.usMaxContent = p.parseUShort();
+    }
+
+    return os2;
+}
+
+function makeOS2Table(options) {
+    return new table.Table('OS/2', [
+        {name: 'version', type: 'USHORT', value: 0x0003},
+        {name: 'xAvgCharWidth', type: 'SHORT', value: 0},
+        {name: 'usWeightClass', type: 'USHORT', value: 0},
+        {name: 'usWidthClass', type: 'USHORT', value: 0},
+        {name: 'fsType', type: 'USHORT', value: 0},
+        {name: 'ySubscriptXSize', type: 'SHORT', value: 650},
+        {name: 'ySubscriptYSize', type: 'SHORT', value: 699},
+        {name: 'ySubscriptXOffset', type: 'SHORT', value: 0},
+        {name: 'ySubscriptYOffset', type: 'SHORT', value: 140},
+        {name: 'ySuperscriptXSize', type: 'SHORT', value: 650},
+        {name: 'ySuperscriptYSize', type: 'SHORT', value: 699},
+        {name: 'ySuperscriptXOffset', type: 'SHORT', value: 0},
+        {name: 'ySuperscriptYOffset', type: 'SHORT', value: 479},
+        {name: 'yStrikeoutSize', type: 'SHORT', value: 49},
+        {name: 'yStrikeoutPosition', type: 'SHORT', value: 258},
+        {name: 'sFamilyClass', type: 'SHORT', value: 0},
+        {name: 'bFamilyType', type: 'BYTE', value: 0},
+        {name: 'bSerifStyle', type: 'BYTE', value: 0},
+        {name: 'bWeight', type: 'BYTE', value: 0},
+        {name: 'bProportion', type: 'BYTE', value: 0},
+        {name: 'bContrast', type: 'BYTE', value: 0},
+        {name: 'bStrokeVariation', type: 'BYTE', value: 0},
+        {name: 'bArmStyle', type: 'BYTE', value: 0},
+        {name: 'bLetterform', type: 'BYTE', value: 0},
+        {name: 'bMidline', type: 'BYTE', value: 0},
+        {name: 'bXHeight', type: 'BYTE', value: 0},
+        {name: 'ulUnicodeRange1', type: 'ULONG', value: 0},
+        {name: 'ulUnicodeRange2', type: 'ULONG', value: 0},
+        {name: 'ulUnicodeRange3', type: 'ULONG', value: 0},
+        {name: 'ulUnicodeRange4', type: 'ULONG', value: 0},
+        {name: 'achVendID', type: 'CHARARRAY', value: 'XXXX'},
+        {name: 'fsSelection', type: 'USHORT', value: 0},
+        {name: 'usFirstCharIndex', type: 'USHORT', value: 0},
+        {name: 'usLastCharIndex', type: 'USHORT', value: 0},
+        {name: 'sTypoAscender', type: 'SHORT', value: 0},
+        {name: 'sTypoDescender', type: 'SHORT', value: 0},
+        {name: 'sTypoLineGap', type: 'SHORT', value: 0},
+        {name: 'usWinAscent', type: 'USHORT', value: 0},
+        {name: 'usWinDescent', type: 'USHORT', value: 0},
+        {name: 'ulCodePageRange1', type: 'ULONG', value: 0},
+        {name: 'ulCodePageRange2', type: 'ULONG', value: 0},
+        {name: 'sxHeight', type: 'SHORT', value: 0},
+        {name: 'sCapHeight', type: 'SHORT', value: 0},
+        {name: 'usDefaultChar', type: 'USHORT', value: 0},
+        {name: 'usBreakChar', type: 'USHORT', value: 0},
+        {name: 'usMaxContext', type: 'USHORT', value: 0}
+    ], options);
+}
+
+exports.unicodeRanges = unicodeRanges;
+exports.getUnicodeRange = getUnicodeRange;
+exports.parse = parseOS2Table;
+exports.make = makeOS2Table;
+
+},{"../parse":11,"../table":14}],31:[function(require,module,exports){
+// The `post` table stores additional PostScript information, such as glyph names.
+// https://www.microsoft.com/typography/OTSPEC/post.htm
+
+
+
+var encoding = require('../encoding');
+var parse = require('../parse');
+var table = require('../table');
+
+// Parse the PostScript `post` table
+function parsePostTable(data, start) {
+    var post = {};
+    var p = new parse.Parser(data, start);
+    var i;
+    post.version = p.parseVersion();
+    post.italicAngle = p.parseFixed();
+    post.underlinePosition = p.parseShort();
+    post.underlineThickness = p.parseShort();
+    post.isFixedPitch = p.parseULong();
+    post.minMemType42 = p.parseULong();
+    post.maxMemType42 = p.parseULong();
+    post.minMemType1 = p.parseULong();
+    post.maxMemType1 = p.parseULong();
+    switch (post.version) {
+        case 1:
+            post.names = encoding.standardNames.slice();
+            break;
+        case 2:
+            post.numberOfGlyphs = p.parseUShort();
+            post.glyphNameIndex = new Array(post.numberOfGlyphs);
+            for (i = 0; i < post.numberOfGlyphs; i++) {
+                post.glyphNameIndex[i] = p.parseUShort();
+            }
+
+            post.names = [];
+            for (i = 0; i < post.numberOfGlyphs; i++) {
+                if (post.glyphNameIndex[i] >= encoding.standardNames.length) {
+                    var nameLength = p.parseChar();
+                    post.names.push(p.parseString(nameLength));
+                }
+            }
+
+            break;
+        case 2.5:
+            post.numberOfGlyphs = p.parseUShort();
+            post.offset = new Array(post.numberOfGlyphs);
+            for (i = 0; i < post.numberOfGlyphs; i++) {
+                post.offset[i] = p.parseChar();
+            }
+
+            break;
+    }
+    return post;
+}
+
+function makePostTable() {
+    return new table.Table('post', [
+        {name: 'version', type: 'FIXED', value: 0x00030000},
+        {name: 'italicAngle', type: 'FIXED', value: 0},
+        {name: 'underlinePosition', type: 'FWORD', value: 0},
+        {name: 'underlineThickness', type: 'FWORD', value: 0},
+        {name: 'isFixedPitch', type: 'ULONG', value: 0},
+        {name: 'minMemType42', type: 'ULONG', value: 0},
+        {name: 'maxMemType42', type: 'ULONG', value: 0},
+        {name: 'minMemType1', type: 'ULONG', value: 0},
+        {name: 'maxMemType1', type: 'ULONG', value: 0}
+    ]);
+}
+
+exports.parse = parsePostTable;
+exports.make = makePostTable;
+
+},{"../encoding":5,"../parse":11,"../table":14}],32:[function(require,module,exports){
+// The `sfnt` wrapper provides organization for the tables in the font.
+// It is the top-level data structure in a font.
+// https://www.microsoft.com/typography/OTSPEC/otff.htm
+// Recommendations for creating OpenType Fonts:
+// http://www.microsoft.com/typography/otspec140/recom.htm
+
+
+
+var check = require('../check');
+var table = require('../table');
+
+var cmap = require('./cmap');
+var cff = require('./cff');
+var head = require('./head');
+var hhea = require('./hhea');
+var hmtx = require('./hmtx');
+var ltag = require('./ltag');
+var maxp = require('./maxp');
+var _name = require('./name');
+var os2 = require('./os2');
+var post = require('./post');
+var gsub = require('./gsub');
+var meta = require('./meta');
+
+function log2(v) {
+    return Math.log(v) / Math.log(2) | 0;
+}
+
+function computeCheckSum(bytes) {
+    while (bytes.length % 4 !== 0) {
+        bytes.push(0);
+    }
+
+    var sum = 0;
+    for (var i = 0; i < bytes.length; i += 4) {
+        sum += (bytes[i] << 24) +
+            (bytes[i + 1] << 16) +
+            (bytes[i + 2] << 8) +
+            (bytes[i + 3]);
+    }
+
+    sum %= Math.pow(2, 32);
+    return sum;
+}
+
+function makeTableRecord(tag, checkSum, offset, length) {
+    return new table.Record('Table Record', [
+        {name: 'tag', type: 'TAG', value: tag !== undefined ? tag : ''},
+        {name: 'checkSum', type: 'ULONG', value: checkSum !== undefined ? checkSum : 0},
+        {name: 'offset', type: 'ULONG', value: offset !== undefined ? offset : 0},
+        {name: 'length', type: 'ULONG', value: length !== undefined ? length : 0}
+    ]);
+}
+
+function makeSfntTable(tables) {
+    var sfnt = new table.Table('sfnt', [
+        {name: 'version', type: 'TAG', value: 'OTTO'},
+        {name: 'numTables', type: 'USHORT', value: 0},
+        {name: 'searchRange', type: 'USHORT', value: 0},
+        {name: 'entrySelector', type: 'USHORT', value: 0},
+        {name: 'rangeShift', type: 'USHORT', value: 0}
+    ]);
+    sfnt.tables = tables;
+    sfnt.numTables = tables.length;
+    var highestPowerOf2 = Math.pow(2, log2(sfnt.numTables));
+    sfnt.searchRange = 16 * highestPowerOf2;
+    sfnt.entrySelector = log2(highestPowerOf2);
+    sfnt.rangeShift = sfnt.numTables * 16 - sfnt.searchRange;
+
+    var recordFields = [];
+    var tableFields = [];
+
+    var offset = sfnt.sizeOf() + (makeTableRecord().sizeOf() * sfnt.numTables);
+    while (offset % 4 !== 0) {
+        offset += 1;
+        tableFields.push({name: 'padding', type: 'BYTE', value: 0});
+    }
+
+    for (var i = 0; i < tables.length; i += 1) {
+        var t = tables[i];
+        check.argument(t.tableName.length === 4, 'Table name' + t.tableName + ' is invalid.');
+        var tableLength = t.sizeOf();
+        var tableRecord = makeTableRecord(t.tableName, computeCheckSum(t.encode()), offset, tableLength);
+        recordFields.push({name: tableRecord.tag + ' Table Record', type: 'RECORD', value: tableRecord});
+        tableFields.push({name: t.tableName + ' table', type: 'RECORD', value: t});
+        offset += tableLength;
+        check.argument(!isNaN(offset), 'Something went wrong calculating the offset.');
+        while (offset % 4 !== 0) {
+            offset += 1;
+            tableFields.push({name: 'padding', type: 'BYTE', value: 0});
+        }
+    }
+
+    // Table records need to be sorted alphabetically.
+    recordFields.sort(function(r1, r2) {
+        if (r1.value.tag > r2.value.tag) {
+            return 1;
+        } else {
+            return -1;
+        }
+    });
+
+    sfnt.fields = sfnt.fields.concat(recordFields);
+    sfnt.fields = sfnt.fields.concat(tableFields);
+    return sfnt;
+}
+
+// Get the metrics for a character. If the string has more than one character
+// this function returns metrics for the first available character.
+// You can provide optional fallback metrics if no characters are available.
+function metricsForChar(font, chars, notFoundMetrics) {
+    for (var i = 0; i < chars.length; i += 1) {
+        var glyphIndex = font.charToGlyphIndex(chars[i]);
+        if (glyphIndex > 0) {
+            var glyph = font.glyphs.get(glyphIndex);
+            return glyph.getMetrics();
+        }
+    }
+
+    return notFoundMetrics;
+}
+
+function average(vs) {
+    var sum = 0;
+    for (var i = 0; i < vs.length; i += 1) {
+        sum += vs[i];
+    }
+
+    return sum / vs.length;
+}
+
+// Convert the font object to a SFNT data structure.
+// This structure contains all the necessary tables and metadata to create a binary OTF file.
+function fontToSfntTable(font) {
+    var xMins = [];
+    var yMins = [];
+    var xMaxs = [];
+    var yMaxs = [];
+    var advanceWidths = [];
+    var leftSideBearings = [];
+    var rightSideBearings = [];
+    var firstCharIndex;
+    var lastCharIndex = 0;
+    var ulUnicodeRange1 = 0;
+    var ulUnicodeRange2 = 0;
+    var ulUnicodeRange3 = 0;
+    var ulUnicodeRange4 = 0;
+
+    for (var i = 0; i < font.glyphs.length; i += 1) {
+        var glyph = font.glyphs.get(i);
+        var unicode = glyph.unicode | 0;
+
+        if (isNaN(glyph.advanceWidth)) {
+            throw new Error('Glyph ' + glyph.name + ' (' + i + '): advanceWidth is not a number.');
+        }
+
+        if (firstCharIndex > unicode || firstCharIndex === undefined) {
+            // ignore .notdef char
+            if (unicode > 0) {
+                firstCharIndex = unicode;
+            }
+        }
+
+        if (lastCharIndex < unicode) {
+            lastCharIndex = unicode;
+        }
+
+        var position = os2.getUnicodeRange(unicode);
+        if (position < 32) {
+            ulUnicodeRange1 |= 1 << position;
+        } else if (position < 64) {
+            ulUnicodeRange2 |= 1 << position - 32;
+        } else if (position < 96) {
+            ulUnicodeRange3 |= 1 << position - 64;
+        } else if (position < 123) {
+            ulUnicodeRange4 |= 1 << position - 96;
+        } else {
+            throw new Error('Unicode ranges bits > 123 are reserved for internal usage');
+        }
+        // Skip non-important characters.
+        if (glyph.name === '.notdef') continue;
+        var metrics = glyph.getMetrics();
+        xMins.push(metrics.xMin);
+        yMins.push(metrics.yMin);
+        xMaxs.push(metrics.xMax);
+        yMaxs.push(metrics.yMax);
+        leftSideBearings.push(metrics.leftSideBearing);
+        rightSideBearings.push(metrics.rightSideBearing);
+        advanceWidths.push(glyph.advanceWidth);
+    }
+
+    var globals = {
+        xMin: Math.min.apply(null, xMins),
+        yMin: Math.min.apply(null, yMins),
+        xMax: Math.max.apply(null, xMaxs),
+        yMax: Math.max.apply(null, yMaxs),
+        advanceWidthMax: Math.max.apply(null, advanceWidths),
+        advanceWidthAvg: average(advanceWidths),
+        minLeftSideBearing: Math.min.apply(null, leftSideBearings),
+        maxLeftSideBearing: Math.max.apply(null, leftSideBearings),
+        minRightSideBearing: Math.min.apply(null, rightSideBearings)
+    };
+    globals.ascender = font.ascender;
+    globals.descender = font.descender;
+
+    var headTable = head.make({
+        flags: 3, // 00000011 (baseline for font at y=0; left sidebearing point at x=0)
+        unitsPerEm: font.unitsPerEm,
+        xMin: globals.xMin,
+        yMin: globals.yMin,
+        xMax: globals.xMax,
+        yMax: globals.yMax,
+        lowestRecPPEM: 3,
+        createdTimestamp: font.createdTimestamp
+    });
+
+    var hheaTable = hhea.make({
+        ascender: globals.ascender,
+        descender: globals.descender,
+        advanceWidthMax: globals.advanceWidthMax,
+        minLeftSideBearing: globals.minLeftSideBearing,
+        minRightSideBearing: globals.minRightSideBearing,
+        xMaxExtent: globals.maxLeftSideBearing + (globals.xMax - globals.xMin),
+        numberOfHMetrics: font.glyphs.length
+    });
+
+    var maxpTable = maxp.make(font.glyphs.length);
+
+    var os2Table = os2.make({
+        xAvgCharWidth: Math.round(globals.advanceWidthAvg),
+        usWeightClass: font.tables.os2.usWeightClass,
+        usWidthClass: font.tables.os2.usWidthClass,
+        usFirstCharIndex: firstCharIndex,
+        usLastCharIndex: lastCharIndex,
+        ulUnicodeRange1: ulUnicodeRange1,
+        ulUnicodeRange2: ulUnicodeRange2,
+        ulUnicodeRange3: ulUnicodeRange3,
+        ulUnicodeRange4: ulUnicodeRange4,
+        fsSelection: font.tables.os2.fsSelection, // REGULAR
+        // See http://typophile.com/node/13081 for more info on vertical metrics.
+        // We get metrics for typical characters (such as "x" for xHeight).
+        // We provide some fallback characters if characters are unavailable: their
+        // ordering was chosen experimentally.
+        sTypoAscender: globals.ascender,
+        sTypoDescender: globals.descender,
+        sTypoLineGap: 0,
+        usWinAscent: globals.yMax,
+        usWinDescent: Math.abs(globals.yMin),
+        ulCodePageRange1: 1, // FIXME: hard-code Latin 1 support for now
+        sxHeight: metricsForChar(font, 'xyvw', {yMax: Math.round(globals.ascender / 2)}).yMax,
+        sCapHeight: metricsForChar(font, 'HIKLEFJMNTZBDPRAGOQSUVWXY', globals).yMax,
+        usDefaultChar: font.hasChar(' ') ? 32 : 0, // Use space as the default character, if available.
+        usBreakChar: font.hasChar(' ') ? 32 : 0 // Use space as the break character, if available.
+    });
+
+    var hmtxTable = hmtx.make(font.glyphs);
+    var cmapTable = cmap.make(font.glyphs);
+
+    var englishFamilyName = font.getEnglishName('fontFamily');
+    var englishStyleName = font.getEnglishName('fontSubfamily');
+    var englishFullName = englishFamilyName + ' ' + englishStyleName;
+    var postScriptName = font.getEnglishName('postScriptName');
+    if (!postScriptName) {
+        postScriptName = englishFamilyName.replace(/\s/g, '') + '-' + englishStyleName;
+    }
+
+    var names = {};
+    for (var n in font.names) {
+        names[n] = font.names[n];
+    }
+
+    if (!names.uniqueID) {
+        names.uniqueID = {en: font.getEnglishName('manufacturer') + ':' + englishFullName};
+    }
+
+    if (!names.postScriptName) {
+        names.postScriptName = {en: postScriptName};
+    }
+
+    if (!names.preferredFamily) {
+        names.preferredFamily = font.names.fontFamily;
+    }
+
+    if (!names.preferredSubfamily) {
+        names.preferredSubfamily = font.names.fontSubfamily;
+    }
+
+    var languageTags = [];
+    var nameTable = _name.make(names, languageTags);
+    var ltagTable = (languageTags.length > 0 ? ltag.make(languageTags) : undefined);
+
+    var postTable = post.make();
+    var cffTable = cff.make(font.glyphs, {
+        version: font.getEnglishName('version'),
+        fullName: englishFullName,
+        familyName: englishFamilyName,
+        weightName: englishStyleName,
+        postScriptName: postScriptName,
+        unitsPerEm: font.unitsPerEm,
+        fontBBox: [0, globals.yMin, globals.ascender, globals.advanceWidthMax]
+    });
+
+    var metaTable = (font.metas && Object.keys(font.metas).length > 0) ? meta.make(font.metas) : undefined;
+
+    // The order does not matter because makeSfntTable() will sort them.
+    var tables = [headTable, hheaTable, maxpTable, os2Table, nameTable, cmapTable, postTable, cffTable, hmtxTable];
+    if (ltagTable) {
+        tables.push(ltagTable);
+    }
+    // Optional tables
+    if (font.tables.gsub) {
+        tables.push(gsub.make(font.tables.gsub));
+    }
+    if (metaTable) {
+        tables.push(metaTable);
+    }
+
+    var sfntTable = makeSfntTable(tables);
+
+    // Compute the font's checkSum and store it in head.checkSumAdjustment.
+    var bytes = sfntTable.encode();
+    var checkSum = computeCheckSum(bytes);
+    var tableFields = sfntTable.fields;
+    var checkSumAdjusted = false;
+    for (i = 0; i < tableFields.length; i += 1) {
+        if (tableFields[i].name === 'head table') {
+            tableFields[i].value.checkSumAdjustment = 0xB1B0AFBA - checkSum;
+            checkSumAdjusted = true;
+            break;
+        }
+    }
+
+    if (!checkSumAdjusted) {
+        throw new Error('Could not find head table with checkSum to adjust.');
+    }
+
+    return sfntTable;
+}
+
+exports.computeCheckSum = computeCheckSum;
+exports.make = makeSfntTable;
+exports.fontToTable = fontToSfntTable;
+
+},{"../check":3,"../table":14,"./cff":15,"./cmap":16,"./gsub":20,"./head":21,"./hhea":22,"./hmtx":23,"./ltag":26,"./maxp":27,"./meta":28,"./name":29,"./os2":30,"./post":31}],33:[function(require,module,exports){
+// Data types used in the OpenType font file.
+// All OpenType fonts use Motorola-style byte ordering (Big Endian)
+
+/* global WeakMap */
+
+
+
+var check = require('./check');
+
+var LIMIT16 = 32768; // The limit at which a 16-bit number switches signs == 2^15
+var LIMIT32 = 2147483648; // The limit at which a 32-bit number switches signs == 2 ^ 31
+
+/**
+ * @exports opentype.decode
+ * @class
+ */
+var decode = {};
+/**
+ * @exports opentype.encode
+ * @class
+ */
+var encode = {};
+/**
+ * @exports opentype.sizeOf
+ * @class
+ */
+var sizeOf = {};
+
+// Return a function that always returns the same value.
+function constant(v) {
+    return function() {
+        return v;
+    };
+}
+
+// OpenType data types //////////////////////////////////////////////////////
+
+/**
+ * Convert an 8-bit unsigned integer to a list of 1 byte.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.BYTE = function(v) {
+    check.argument(v >= 0 && v <= 255, 'Byte value should be between 0 and 255.');
+    return [v];
+};
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.BYTE = constant(1);
+
+/**
+ * Convert a 8-bit signed integer to a list of 1 byte.
+ * @param {string}
+ * @returns {Array}
+ */
+encode.CHAR = function(v) {
+    return [v.charCodeAt(0)];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.CHAR = constant(1);
+
+/**
+ * Convert an ASCII string to a list of bytes.
+ * @param {string}
+ * @returns {Array}
+ */
+encode.CHARARRAY = function(v) {
+    var b = [];
+    for (var i = 0; i < v.length; i += 1) {
+        b[i] = v.charCodeAt(i);
+    }
+
+    return b;
+};
+
+/**
+ * @param {Array}
+ * @returns {number}
+ */
+sizeOf.CHARARRAY = function(v) {
+    return v.length;
+};
+
+/**
+ * Convert a 16-bit unsigned integer to a list of 2 bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.USHORT = function(v) {
+    return [(v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.USHORT = constant(2);
+
+/**
+ * Convert a 16-bit signed integer to a list of 2 bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.SHORT = function(v) {
+    // Two's complement
+    if (v >= LIMIT16) {
+        v = -(2 * LIMIT16 - v);
+    }
+
+    return [(v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.SHORT = constant(2);
+
+/**
+ * Convert a 24-bit unsigned integer to a list of 3 bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.UINT24 = function(v) {
+    return [(v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.UINT24 = constant(3);
+
+/**
+ * Convert a 32-bit unsigned integer to a list of 4 bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.ULONG = function(v) {
+    return [(v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.ULONG = constant(4);
+
+/**
+ * Convert a 32-bit unsigned integer to a list of 4 bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.LONG = function(v) {
+    // Two's complement
+    if (v >= LIMIT32) {
+        v = -(2 * LIMIT32 - v);
+    }
+
+    return [(v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.LONG = constant(4);
+
+encode.FIXED = encode.ULONG;
+sizeOf.FIXED = sizeOf.ULONG;
+
+encode.FWORD = encode.SHORT;
+sizeOf.FWORD = sizeOf.SHORT;
+
+encode.UFWORD = encode.USHORT;
+sizeOf.UFWORD = sizeOf.USHORT;
+
+/**
+ * Convert a 32-bit Apple Mac timestamp integer to a list of 8 bytes, 64-bit timestamp.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.LONGDATETIME = function(v) {
+    return [0, 0, 0, 0, (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.LONGDATETIME = constant(8);
+
+/**
+ * Convert a 4-char tag to a list of 4 bytes.
+ * @param {string}
+ * @returns {Array}
+ */
+encode.TAG = function(v) {
+    check.argument(v.length === 4, 'Tag should be exactly 4 ASCII characters.');
+    return [v.charCodeAt(0),
+            v.charCodeAt(1),
+            v.charCodeAt(2),
+            v.charCodeAt(3)];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.TAG = constant(4);
+
+// CFF data types ///////////////////////////////////////////////////////////
+
+encode.Card8 = encode.BYTE;
+sizeOf.Card8 = sizeOf.BYTE;
+
+encode.Card16 = encode.USHORT;
+sizeOf.Card16 = sizeOf.USHORT;
+
+encode.OffSize = encode.BYTE;
+sizeOf.OffSize = sizeOf.BYTE;
+
+encode.SID = encode.USHORT;
+sizeOf.SID = sizeOf.USHORT;
+
+// Convert a numeric operand or charstring number to a variable-size list of bytes.
+/**
+ * Convert a numeric operand or charstring number to a variable-size list of bytes.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.NUMBER = function(v) {
+    if (v >= -107 && v <= 107) {
+        return [v + 139];
+    } else if (v >= 108 && v <= 1131) {
+        v = v - 108;
+        return [(v >> 8) + 247, v & 0xFF];
+    } else if (v >= -1131 && v <= -108) {
+        v = -v - 108;
+        return [(v >> 8) + 251, v & 0xFF];
+    } else if (v >= -32768 && v <= 32767) {
+        return encode.NUMBER16(v);
+    } else {
+        return encode.NUMBER32(v);
+    }
+};
+
+/**
+ * @param {number}
+ * @returns {number}
+ */
+sizeOf.NUMBER = function(v) {
+    return encode.NUMBER(v).length;
+};
+
+/**
+ * Convert a signed number between -32768 and +32767 to a three-byte value.
+ * This ensures we always use three bytes, but is not the most compact format.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.NUMBER16 = function(v) {
+    return [28, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.NUMBER16 = constant(3);
+
+/**
+ * Convert a signed number between -(2^31) and +(2^31-1) to a five-byte value.
+ * This is useful if you want to be sure you always use four bytes,
+ * at the expense of wasting a few bytes for smaller numbers.
+ * @param {number}
+ * @returns {Array}
+ */
+encode.NUMBER32 = function(v) {
+    return [29, (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF];
+};
+
+/**
+ * @constant
+ * @type {number}
+ */
+sizeOf.NUMBER32 = constant(5);
+
+/**
+ * @param {number}
+ * @returns {Array}
+ */
+encode.REAL = function(v) {
+    var value = v.toString();
+
+    // Some numbers use an epsilon to encode the value. (e.g. JavaScript will store 0.0000001 as 1e-7)
+    // This code converts it back to a number without the epsilon.
+    var m = /\.(\d*?)(?:9{5,20}|0{5,20})\d{0,2}(?:e(.+)|$)/.exec(value);
+    if (m) {
+        var epsilon = parseFloat('1e' + ((m[2] ? +m[2] : 0) + m[1].length));
+        value = (Math.round(v * epsilon) / epsilon).toString();
+    }
+
+    var nibbles = '';
+    var i;
+    var ii;
+    for (i = 0, ii = value.length; i < ii; i += 1) {
+        var c = value[i];
+        if (c === 'e') {
+            nibbles += value[++i] === '-' ? 'c' : 'b';
+        } else if (c === '.') {
+            nibbles += 'a';
+        } else if (c === '-') {
+            nibbles += 'e';
+        } else {
+            nibbles += c;
+        }
+    }
+
+    nibbles += (nibbles.length & 1) ? 'f' : 'ff';
+    var out = [30];
+    for (i = 0, ii = nibbles.length; i < ii; i += 2) {
+        out.push(parseInt(nibbles.substr(i, 2), 16));
+    }
+
+    return out;
+};
+
+/**
+ * @param {number}
+ * @returns {number}
+ */
+sizeOf.REAL = function(v) {
+    return encode.REAL(v).length;
+};
+
+encode.NAME = encode.CHARARRAY;
+sizeOf.NAME = sizeOf.CHARARRAY;
+
+encode.STRING = encode.CHARARRAY;
+sizeOf.STRING = sizeOf.CHARARRAY;
+
+/**
+ * @param {DataView} data
+ * @param {number} offset
+ * @param {number} numBytes
+ * @returns {string}
+ */
+decode.UTF8 = function(data, offset, numBytes) {
+    var codePoints = [];
+    var numChars = numBytes;
+    for (var j = 0; j < numChars; j++, offset += 1) {
+        codePoints[j] = data.getUint8(offset);
+    }
+
+    return String.fromCharCode.apply(null, codePoints);
+};
+
+/**
+ * @param {DataView} data
+ * @param {number} offset
+ * @param {number} numBytes
+ * @returns {string}
+ */
+decode.UTF16 = function(data, offset, numBytes) {
+    var codePoints = [];
+    var numChars = numBytes / 2;
+    for (var j = 0; j < numChars; j++, offset += 2) {
+        codePoints[j] = data.getUint16(offset);
+    }
+
+    return String.fromCharCode.apply(null, codePoints);
+};
+
+/**
+ * Convert a JavaScript string to UTF16-BE.
+ * @param {string}
+ * @returns {Array}
+ */
+encode.UTF16 = function(v) {
+    var b = [];
+    for (var i = 0; i < v.length; i += 1) {
+        var codepoint = v.charCodeAt(i);
+        b[b.length] = (codepoint >> 8) & 0xFF;
+        b[b.length] = codepoint & 0xFF;
+    }
+
+    return b;
+};
+
+/**
+ * @param {string}
+ * @returns {number}
+ */
+sizeOf.UTF16 = function(v) {
+    return v.length * 2;
+};
 
 // Data for converting old eight-bit Macintosh encodings to Unicode.
 // This representation is optimized for decoding; encoding is slower
@@ -64,13 +8954,2196 @@
 //
 //     s = u''.join([chr(c).decode('mac_greek') for c in range(128, 256)])
 //     print(s.encode('utf-8'))
+/**
+ * @private
+ */
+var eightBitMacEncodings = {
+    'x-mac-croatian':  // Python: 'mac_croatian'
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®Š™´¨≠ŽØ∞±≤≥∆µ∂∑∏š∫ªºΩžø' +
+        '¿¡¬√ƒ≈Ć«Č… ÀÃÕŒœĐ—“”‘’÷◊©⁄€‹›Æ»–·‚„‰ÂćÁčÈÍÎÏÌÓÔđÒÚÛÙıˆ˜¯πË˚¸Êæˇ',
+    'x-mac-cyrillic':  // Python: 'mac_cyrillic'
+        'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ†°Ґ£§•¶І®©™Ђђ≠Ѓѓ∞±≤≥іµґЈЄєЇїЉљЊњ' +
+        'јЅ¬√ƒ≈∆«»… ЋћЌќѕ–—“”‘’÷„ЎўЏџ№Ёёяабвгдежзийклмнопрстуфхцчшщъыьэю',
+    'x-mac-gaelic':
+        // http://unicode.org/Public/MAPPINGS/VENDORS/APPLE/GAELIC.TXT
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØḂ±≤≥ḃĊċḊḋḞḟĠġṀæø' +
+        'ṁṖṗɼƒſṠ«»… ÀÃÕŒœ–—“”‘’ṡẛÿŸṪ€‹›Ŷŷṫ·Ỳỳ⁊ÂÊÁËÈÍÎÏÌÓÔ♣ÒÚÛÙıÝýŴŵẄẅẀẁẂẃ',
+    'x-mac-greek':  // Python: 'mac_greek'
+        'Ä¹²É³ÖÜ΅àâä΄¨çéèêë£™îï•½‰ôö¦€ùûü†ΓΔΘΛΞΠß®©ΣΪ§≠°·Α±≤≥¥ΒΕΖΗΙΚΜΦΫΨΩ' +
+        'άΝ¬ΟΡ≈Τ«»… ΥΧΆΈœ–―“”‘’÷ΉΊΌΎέήίόΏύαβψδεφγηιξκλμνοπώρστθωςχυζϊϋΐΰ\u00AD',
+    'x-mac-icelandic':  // Python: 'mac_iceland'
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûüÝ°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø' +
+        '¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€ÐðÞþý·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ',
+    'x-mac-inuit':
+        // http://unicode.org/Public/MAPPINGS/VENDORS/APPLE/INUIT.TXT
+        'ᐃᐄᐅᐆᐊᐋᐱᐲᐳᐴᐸᐹᑉᑎᑏᑐᑑᑕᑖᑦᑭᑮᑯᑰᑲᑳᒃᒋᒌᒍᒎᒐᒑ°ᒡᒥᒦ•¶ᒧ®©™ᒨᒪᒫᒻᓂᓃᓄᓅᓇᓈᓐᓯᓰᓱᓲᓴᓵᔅᓕᓖᓗ' +
+        'ᓘᓚᓛᓪᔨᔩᔪᔫᔭ… ᔮᔾᕕᕖᕗ–—“”‘’ᕘᕙᕚᕝᕆᕇᕈᕉᕋᕌᕐᕿᖀᖁᖂᖃᖄᖅᖏᖐᖑᖒᖓᖔᖕᙱᙲᙳᙴᙵᙶᖖᖠᖡᖢᖣᖤᖥᖦᕼŁł',
+    'x-mac-ce':  // Python: 'mac_latin2'
+        'ÄĀāÉĄÖÜáąČäčĆćéŹźĎíďĒēĖóėôöõúĚěü†°Ę£§•¶ß®©™ę¨≠ģĮįĪ≤≥īĶ∂∑łĻļĽľĹĺŅ' +
+        'ņŃ¬√ńŇ∆«»… ňŐÕőŌ–—“”‘’÷◊ōŔŕŘ‹›řŖŗŠ‚„šŚśÁŤťÍŽžŪÓÔūŮÚůŰűŲųÝýķŻŁżĢˇ',
+    macintosh:  // Python: 'mac_roman'
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø' +
+        '¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ',
+    'x-mac-romanian':  // Python: 'mac_romanian'
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ĂȘ∞±≤≥¥µ∂∑∏π∫ªºΩăș' +
+        '¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›Țț‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ',
+    'x-mac-turkish':  // Python: 'mac_turkish'
+        'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø' +
+        '¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸĞğİıŞş‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙˆ˜¯˘˙˚¸˝˛ˇ'
+};
 
-// result.push(c);
+/**
+ * Decodes an old-style Macintosh string. Returns either a Unicode JavaScript
+ * string, or 'undefined' if the encoding is unsupported. For example, we do
+ * not support Chinese, Japanese or Korean because these would need large
+ * mapping tables.
+ * @param {DataView} dataView
+ * @param {number} offset
+ * @param {number} dataLength
+ * @param {string} encoding
+ * @returns {string}
+ */
+decode.MACSTRING = function(dataView, offset, dataLength, encoding) {
+    var table = eightBitMacEncodings[encoding];
+    if (table === undefined) {
+        return undefined;
+    }
+
+    var result = '';
+    for (var i = 0; i < dataLength; i++) {
+        var c = dataView.getUint8(offset + i);
+        // In all eight-bit Mac encodings, the characters 0x00..0x7F are
+        // mapped to U+0000..U+007F; we only need to look up the others.
+        if (c <= 0x7F) {
+            result += String.fromCharCode(c);
+        } else {
+            result += table[c & 0x7F];
+        }
+    }
+
+    return result;
+};
+
+// Helper function for encode.MACSTRING. Returns a dictionary for mapping
+// Unicode character codes to their 8-bit MacOS equivalent. This table
+// is not exactly a super cheap data structure, but we do not care because
+// encoding Macintosh strings is only rarely needed in typical applications.
+var macEncodingTableCache = typeof WeakMap === 'function' && new WeakMap();
+var macEncodingCacheKeys;
+var getMacEncodingTable = function(encoding) {
+    // Since we use encoding as a cache key for WeakMap, it has to be
+    // a String object and not a literal. And at least on NodeJS 2.10.1,
+    // WeakMap requires that the same String instance is passed for cache hits.
+    if (!macEncodingCacheKeys) {
+        macEncodingCacheKeys = {};
+        for (var e in eightBitMacEncodings) {
+            /*jshint -W053 */  // Suppress "Do not use String as a constructor."
+            macEncodingCacheKeys[e] = new String(e);
+        }
+    }
+
+    var cacheKey = macEncodingCacheKeys[encoding];
+    if (cacheKey === undefined) {
+        return undefined;
+    }
+
+    // We can't do "if (cache.has(key)) {return cache.get(key)}" here:
+    // since garbage collection may run at any time, it could also kick in
+    // between the calls to cache.has() and cache.get(). In that case,
+    // we would return 'undefined' even though we do support the encoding.
+    if (macEncodingTableCache) {
+        var cachedTable = macEncodingTableCache.get(cacheKey);
+        if (cachedTable !== undefined) {
+            return cachedTable;
+        }
+    }
+
+    var decodingTable = eightBitMacEncodings[encoding];
+    if (decodingTable === undefined) {
+        return undefined;
+    }
+
+    var encodingTable = {};
+    for (var i = 0; i < decodingTable.length; i++) {
+        encodingTable[decodingTable.charCodeAt(i)] = i + 0x80;
+    }
+
+    if (macEncodingTableCache) {
+        macEncodingTableCache.set(cacheKey, encodingTable);
+    }
+
+    return encodingTable;
+};
+
+/**
+ * Encodes an old-style Macintosh string. Returns a byte array upon success.
+ * If the requested encoding is unsupported, or if the input string contains
+ * a character that cannot be expressed in the encoding, the function returns
+ * 'undefined'.
+ * @param {string} str
+ * @param {string} encoding
+ * @returns {Array}
+ */
+encode.MACSTRING = function(str, encoding) {
+    var table = getMacEncodingTable(encoding);
+    if (table === undefined) {
+        return undefined;
+    }
+
+    var result = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+
+        // In all eight-bit Mac encodings, the characters 0x00..0x7F are
+        // mapped to U+0000..U+007F; we only need to look up the others.
+        if (c >= 0x80) {
+            c = table[c];
+            if (c === undefined) {
+                // str contains a Unicode character that cannot be encoded
+                // in the requested encoding.
+                return undefined;
+            }
+        }
+        result[i] = c;
+        // result.push(c);
+    }
+
+    return result;
+};
+
+/**
+ * @param {string} str
+ * @param {string} encoding
+ * @returns {number}
+ */
+sizeOf.MACSTRING = function(str, encoding) {
+    var b = encode.MACSTRING(str, encoding);
+    if (b !== undefined) {
+        return b.length;
+    } else {
+        return 0;
+    }
+};
+
+// Convert a list of values to a CFF INDEX structure.
+// The values should be objects containing name / type / value.
+/**
+ * @param {Array} l
+ * @returns {Array}
+ */
+encode.INDEX = function(l) {
+    var i;
+    //var offset, offsets, offsetEncoder, encodedOffsets, encodedOffset, data,
+    //    i, v;
+    // Because we have to know which data type to use to encode the offsets,
+    // we have to go through the values twice: once to encode the data and
+    // calculate the offets, then again to encode the offsets using the fitting data type.
+    var offset = 1; // First offset is always 1.
+    var offsets = [offset];
+    var data = [];
+    for (i = 0; i < l.length; i += 1) {
+        var v = encode.OBJECT(l[i]);
+        Array.prototype.push.apply(data, v);
+        offset += v.length;
+        offsets.push(offset);
+    }
+
+    if (data.length === 0) {
+        return [0, 0];
+    }
+
+    var encodedOffsets = [];
+    var offSize = (1 + Math.floor(Math.log(offset) / Math.log(2)) / 8) | 0;
+    var offsetEncoder = [undefined, encode.BYTE, encode.USHORT, encode.UINT24, encode.ULONG][offSize];
+    for (i = 0; i < offsets.length; i += 1) {
+        var encodedOffset = offsetEncoder(offsets[i]);
+        Array.prototype.push.apply(encodedOffsets, encodedOffset);
+    }
+
+    return Array.prototype.concat(encode.Card16(l.length),
+                           encode.OffSize(offSize),
+                           encodedOffsets,
+                           data);
+};
+
+/**
+ * @param {Array}
+ * @returns {number}
+ */
+sizeOf.INDEX = function(v) {
+    return encode.INDEX(v).length;
+};
+
+/**
+ * Convert an object to a CFF DICT structure.
+ * The keys should be numeric.
+ * The values should be objects containing name / type / value.
+ * @param {Object} m
+ * @returns {Array}
+ */
+encode.DICT = function(m) {
+    var d = [];
+    var keys = Object.keys(m);
+    var length = keys.length;
+
+    for (var i = 0; i < length; i += 1) {
+        // Object.keys() return string keys, but our keys are always numeric.
+        var k = parseInt(keys[i], 0);
+        var v = m[k];
+        // Value comes before the key.
+        d = d.concat(encode.OPERAND(v.value, v.type));
+        d = d.concat(encode.OPERATOR(k));
+    }
+
+    return d;
+};
+
+/**
+ * @param {Object}
+ * @returns {number}
+ */
+sizeOf.DICT = function(m) {
+    return encode.DICT(m).length;
+};
+
+/**
+ * @param {number}
+ * @returns {Array}
+ */
+encode.OPERATOR = function(v) {
+    if (v < 1200) {
+        return [v];
+    } else {
+        return [12, v - 1200];
+    }
+};
+
+/**
+ * @param {Array} v
+ * @param {string}
+ * @returns {Array}
+ */
+encode.OPERAND = function(v, type) {
+    var d = [];
+    if (Array.isArray(type)) {
+        for (var i = 0; i < type.length; i += 1) {
+            check.argument(v.length === type.length, 'Not enough arguments given for type' + type);
+            d = d.concat(encode.OPERAND(v[i], type[i]));
+        }
+    } else {
+        if (type === 'SID') {
+            d = d.concat(encode.NUMBER(v));
+        } else if (type === 'offset') {
+            // We make it easy for ourselves and always encode offsets as
+            // 4 bytes. This makes offset calculation for the top dict easier.
+            d = d.concat(encode.NUMBER32(v));
+        } else if (type === 'number') {
+            d = d.concat(encode.NUMBER(v));
+        } else if (type === 'real') {
+            d = d.concat(encode.REAL(v));
+        } else {
+            throw new Error('Unknown operand type ' + type);
+            // FIXME Add support for booleans
+        }
+    }
+
+    return d;
+};
+
+encode.OP = encode.BYTE;
+sizeOf.OP = sizeOf.BYTE;
+
+// memoize charstring encoding using WeakMap if available
+var wmm = typeof WeakMap === 'function' && new WeakMap();
+
+/**
+ * Convert a list of CharString operations to bytes.
+ * @param {Array}
+ * @returns {Array}
+ */
+encode.CHARSTRING = function(ops) {
+    // See encode.MACSTRING for why we don't do "if (wmm && wmm.has(ops))".
+    if (wmm) {
+        var cachedValue = wmm.get(ops);
+        if (cachedValue !== undefined) {
+            return cachedValue;
+        }
+    }
+
+    var d = [];
+    var length = ops.length;
+
+    for (var i = 0; i < length; i += 1) {
+        var op = ops[i];
+        d = d.concat(encode[op.type](op.value));
+    }
+
+    if (wmm) {
+        wmm.set(ops, d);
+    }
+
+    return d;
+};
+
+/**
+ * @param {Array}
+ * @returns {number}
+ */
+sizeOf.CHARSTRING = function(ops) {
+    return encode.CHARSTRING(ops).length;
+};
+
+// Utility functions ////////////////////////////////////////////////////////
+
+/**
+ * Convert an object containing name / type / value to bytes.
+ * @param {Object}
+ * @returns {Array}
+ */
+encode.OBJECT = function(v) {
+    var encodingFunction = encode[v.type];
+    check.argument(encodingFunction !== undefined, 'No encoding function for type ' + v.type);
+    return encodingFunction(v.value);
+};
+
+/**
+ * @param {Object}
+ * @returns {number}
+ */
+sizeOf.OBJECT = function(v) {
+    var sizeOfFunction = sizeOf[v.type];
+    check.argument(sizeOfFunction !== undefined, 'No sizeOf function for type ' + v.type);
+    return sizeOfFunction(v.value);
+};
+
+/**
+ * Convert a table object to bytes.
+ * A table contains a list of fields containing the metadata (name, type and default value).
+ * The table itself has the field values set as attributes.
+ * @param {opentype.Table}
+ * @returns {Array}
+ */
+encode.TABLE = function(table) {
+    var d = [];
+    var length = table.fields.length;
+    var subtables = [];
+    var subtableOffsets = [];
+    var i;
+
+    for (i = 0; i < length; i += 1) {
+        var field = table.fields[i];
+        var encodingFunction = encode[field.type];
+        check.argument(encodingFunction !== undefined, 'No encoding function for field type ' + field.type + ' (' + field.name + ')');
+        var value = table[field.name];
+        if (value === undefined) {
+            value = field.value;
+        }
+
+        var bytes = encodingFunction(value);
+
+        if (field.type === 'TABLE') {
+            subtableOffsets.push(d.length);
+            d = d.concat([0, 0]);
+            subtables.push(bytes);
+        } else {
+            d = d.concat(bytes);
+        }
+    }
+
+    for (i = 0; i < subtables.length; i += 1) {
+        var o = subtableOffsets[i];
+        var offset = d.length;
+        check.argument(offset < 65536, 'Table ' + table.tableName + ' too big.');
+        d[o] = offset >> 8;
+        d[o + 1] = offset & 0xff;
+        d = d.concat(subtables[i]);
+    }
+
+    return d;
+};
+
+/**
+ * @param {opentype.Table}
+ * @returns {number}
+ */
+sizeOf.TABLE = function(table) {
+    var numBytes = 0;
+    var length = table.fields.length;
+
+    for (var i = 0; i < length; i += 1) {
+        var field = table.fields[i];
+        var sizeOfFunction = sizeOf[field.type];
+        check.argument(sizeOfFunction !== undefined, 'No sizeOf function for field type ' + field.type + ' (' + field.name + ')');
+        var value = table[field.name];
+        if (value === undefined) {
+            value = field.value;
+        }
+
+        numBytes += sizeOfFunction(value);
+
+        // Subtables take 2 more bytes for offsets.
+        if (field.type === 'TABLE') {
+            numBytes += 2;
+        }
+    }
+
+    return numBytes;
+};
+
+encode.RECORD = encode.TABLE;
+sizeOf.RECORD = sizeOf.TABLE;
+
+// Merge in a list of bytes.
+encode.LITERAL = function(v) {
+    return v;
+};
+
+sizeOf.LITERAL = function(v) {
+    return v.length;
+};
+
+exports.decode = decode;
+exports.encode = encode;
+exports.sizeOf = sizeOf;
+
+},{"./check":3}],34:[function(require,module,exports){
+'use strict';
+
+exports.isBrowser = function() {
+    return typeof window !== 'undefined';
+};
+
+exports.isNode = function() {
+    return typeof window === 'undefined';
+};
+
+exports.nodeBufferToArrayBuffer = function(buffer) {
+    var ab = new ArrayBuffer(buffer.length);
+    var view = new Uint8Array(ab);
+    for (var i = 0; i < buffer.length; ++i) {
+        view[i] = buffer[i];
+    }
+
+    return ab;
+};
+
+exports.arrayBufferToNodeBuffer = function(ab) {
+    var buffer = new Buffer(ab.byteLength);
+    var view = new Uint8Array(ab);
+    for (var i = 0; i < buffer.length; ++i) {
+        buffer[i] = view[i];
+    }
+
+    return buffer;
+};
+
+exports.checkArgument = function(expression, message) {
+    if (!expression) {
+        throw message;
+    }
+};
+
+},{}]},{},[10])(10)
+});
+define('specimenTools/loadFonts',[
+    'opentype'
+], function(
+    opentype
+) {
+    "use strict";
+    /*globals FileReader, XMLHttpRequest, console*/
+
+    /**
+     * Callback for when a fontfile has been loaded
+     *
+     * @param i: index of the font loaded
+     * @param fontFileName
+     * @param err: null, error-object or string with error message
+     * @param fontArraybuffer
+     */
+    function onLoadFont(i, fontFileName, err, fontArraybuffer) {
+        /* jshint validthis: true */
+        var font;
+        if(!err) {
+            try {
+                font = opentype.parse(fontArraybuffer);
+            }
+            catch (parseError) {
+                err = parseError;
+            }
+        }
+
+        if(err) {
+            console.warn('Can\'t load font', fontFileName, ' with error:', err);
+            this.countAll--;
+        }
+        else {
+            this.pubsub.publish('loadFont', i, fontFileName, font, fontArraybuffer);
+            this.countLoaded += 1;
+        }
+
+        if(this.countLoaded === this.countAll)
+            this.pubsub.publish('allFontsLoaded', this.countAll);
+
+    }
+
+    function loadFromUrl(fontInfo, callback) {
+        var request = new XMLHttpRequest()
+          , url = fontInfo.url
+          ;
+        request.open('get', url, true);
+        request.responseType = 'arraybuffer';
+        request.onload = function() {
+            if (request.status !== 200) {
+                return callback('Font could not be loaded: ' + request.statusText);
+            }
+            return callback(null, request.response);
+        };
+        request.send();
+    }
+
+    function fileInputFileOnLoad(callback, loadEvent) {
+        /*jshint unused: vars, validthis:true*/
+        callback(null, this.result);
+    }
+    function fileInputFileOnError(callback, loadEvent) {
+        /*jshint unused: vars, validthis:true*/
+        callback(this.error);
+    }
+    function loadFromFileInput(file, callback) {
+        var reader = new FileReader();
+        reader.onload = fileInputFileOnLoad.bind(reader, callback);
+        reader.onerror = fileInputFileOnError.bind(reader, callback);
+        reader.readAsArrayBuffer(file);
+    }
+
+    function loadFontsFromFileInput(pubsub, fileInputFiles) {
+        _loadFonts(pubsub, fileInputFiles, loadFromFileInput);
+    }
+    loadFontsFromFileInput.needsPubSub = true;
+
+
+    function loadFontsFromUrl(pubsub, fontFiles) {
+        var i, l
+          , fontInfo = []
+          ;
+        for(i=0,l=fontFiles.length;i<l;i++) {
+            if (!fontFiles[i])
+                throw new Error('The url at index '+i+' appears to be invalid.');
+            fontInfo.push({
+                name: fontFiles[i]
+                , url: fontFiles[i]
+            });
+        }
+        _loadFonts(pubsub, fontInfo, loadFromUrl);
+    }
+
+    function _loadFonts(pubsub, fontFiles, loadFont) {
+        var i, l, fontInfo, onload
+          , loaderState = {
+                countLoaded: 0
+              , countAll: fontFiles.length
+              , pubsub: pubsub
+            }
+          ;
+
+        for(i=0,l=fontFiles.length;i<l;i++) {
+            fontInfo = fontFiles[i];
+            pubsub.publish('prepareFont', i, fontInfo.name, l);
+            onload = onLoadFont.bind(loaderState, i, fontInfo.name);
+            // The timeout thing is handy to slow down the load progress,
+            // if development is done on that part.
+            // setTimeout(function(fontInfo, onload) {
+            loadFont(fontInfo, onload);
+            // }.bind(null, fontInfo, onload), Math.random() * 5000);
+        }
+    }
+
+    return {
+        fromUrl: loadFontsFromUrl
+      , fromFileInput: loadFontsFromFileInput
+    };
+});
+
+define('specimenTools/initDocumentWidgets',[], function() {
+    "use strict";
+
+    /**
+     * doc: a DOM document
+     * factories: an array of arrays:
+     *          [
+     *              [
+     *                  '.css-class-for-widget-container',
+     *                  WidgetConstructor,
+     *                  optional further WidgetConstructor_arguments
+     *                  , ...
+     *              ]
+     *          ]
+     *      A WidgetConstructor will be called essentially like this:
+     *
+     *      new WidgetConstructor(domContainer,
+     *                            pubsub,
+     *                            ..., further WidgetConstructor_arguments);
+     */
+    function initDocumentWidgets(doc, factories, pubsub) {
+        var i, l, className, containersForClass, Constructor
+         , j, ll, container
+         , containers = []
+         , args, instance
+         ;
+        for(i=0,l=factories.length;i<l;i++) {
+            className = factories[i][0];
+            containersForClass = doc.getElementsByClassName(className);
+            if(!containersForClass.length)
+                continue;
+            Constructor = factories[i][1];
+            for(j=0,ll=containersForClass.length;j<ll;j++) {
+                container = containersForClass[j];
+                containers.push(container);
+                args = [container, pubsub];
+                Array.prototype.push.apply(args, factories[i].slice(2));
+                // this way we can call the Constructor with a
+                // dynamic arguments list, i.e. by circumventing the `new`
+                // keyword via Object.create.
+                instance = Object.create(Constructor.prototype);
+                Constructor.apply(instance, args);
+            }
+        }
+        return containers;
+    }
+
+    return initDocumentWidgets;
+});
+
+define('specimenTools/services/PubSub',[
+], function(
+) {
+    "use strict";
+    /**
+     * Simple module for signaling.
+     *
+     * On a call to `pubSub.publish("channel-name"[, optional, arg1, ... args])`
+     * the callback of all subscriptions of "channel-name" will be invoked
+     * with the optional arguments given to `publish`:
+     *          `callback(optional, arg1, ... args)`
+     *
+     * The subscriptions are always invoked in the order of subscription.
+     *
+     * There's no way to cancel subscription yet.
+     */
+    function PubSub() {
+        this._callbacks = Object.create(null);
+    }
+
+    var _p = PubSub.prototype;
+
+    _p.subscribe = function(channel, callback) {
+        var callbacks = this._callbacks[channel];
+        if(!callbacks)
+            this._callbacks[channel] = callbacks = [];
+        callbacks.push(callback);
+    };
+
+    _p.publish = function(channel /* , args, ... */) {
+        var i, l
+          , args = []
+          , callbacks = this._callbacks[channel] || []
+          ;
+        for(i=1,l=arguments.length;i<l;i++)
+            args.push(arguments[i]);
+        for(i=0,l=callbacks.length;i<l;i++)
+            callbacks[i].apply(null, args);
+    };
+
+    return PubSub;
+});
+
+define('specimenTools/services/dom-tool',[
+], function(
+) {
+    "use strict";
+
+    function applyClasses (element, classes, remove) {
+        if(!classes)
+            return;
+        if(typeof classes === 'string')
+            classes = classes.split(' ').filter(function(item){return !!item;});
+        if( element.classList )
+            element.classList[remove ? 'remove' : 'add'].apply(element.classList, classes);
+        else {
+            // IE11 and SVG elements apparently :-/
+            var classesToRemove
+              , seen
+              , filterFunc
+              ;
+            if(remove) {
+                classesToRemove = new Set(classes);
+                filterFunc = function(item) {
+                    return !classesToRemove.has(item);
+                };
+            }
+            else {
+                seen = new Set();
+                element.setAttribute('class', element.getAttribute('class')
+                        + (' ' + classes.join(' '))
+                );
+
+                filterFunc = function(item) {
+                    if(seen.has(item))
+                        return false;
+                    seen.add(item);
+                    return true;
+
+                };
+            }
+            element.setAttribute('class', element.getAttribute('class')
+                                                 .split(' ')
+                                                 .filter(filterFunc)
+                                                 .join(' ')
+                                );
+
+        }
+    }
+
+    function insertElement(into, element, pos) {
+        var children = into.children || into.childNodes
+          , append = children.length
+          ;
+        if(pos === undefined || pos > append)
+            pos = append;
+        else if(pos < 0) {
+            pos = children.length + pos;
+            if(pos < 0)
+                pos = 0;
+        }
+        if(pos === append)
+            into.appendChild(element);
+        else
+            into.insertBefore(element, children[pos]);
+    }
+
+    function mapToClass(parent, class_, func, thisArg, includeParent) {
+        var items = []
+          , i, l
+          ;
+        if(includeParent && parent.classList.contains(class_))
+            items.push(parent);
+
+        Array.prototype.push.apply(items, parent.getElementsByClassName(class_));
+
+        for(i=0,l=items.length;i<l;i++)
+            func.call(thisArg || null, items[i], i);
+    }
+
+    return {
+        applyClasses: applyClasses
+      , insertElement: insertElement
+      , mapToClass: mapToClass
+    };
+});
+
+define('specimenTools/_BaseWidget',[
+    './services/dom-tool'
+], function(
+    domTool
+){
+    "use strict";
+
+    function _BaseWidget(options) {
+        this._options = this._makeOptions(options);
+    }
+
+    _BaseWidget.defaultOptions = {};
+
+    var _p = _BaseWidget.prototype;
+    _p.constructor = _BaseWidget;
+
+    _p._makeOptions = function(options) {
+            // With Object.keys we won't get keys from the prototype
+            // of options but maybe we want this!?
+        var keys = options ? Object.keys(options) : []
+          , i, l
+          , result = Object.create(this.constructor.defaultOptions)
+          ;
+        for(i=0,l=keys.length;i<l;i++)
+            result[keys[i]] = options[keys[i]];
+        return result;
+    };
+
+    _p._applyClasses = domTool.applyClasses;
+
+    _p._cssName2jsName = function (name) {
+        var pieces = name.split('-'), i, l;
+        for(i=1,l=pieces.length;i<l;i++)
+            pieces[i] = pieces[i][0].toUpperCase() + pieces[i].slice(1);
+        return pieces.join('');
+    };
+
+    return _BaseWidget;
+});
+
+define('specimenTools/services/FontsData',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+    /*jshint esnext:true*/
+
+    var weight2weightName = {
+            250: 'Thin'
+          , 275: 'ExtraLight'
+          , 300: 'Light'
+          , 400: 'Regular'
+          , 500: 'Medium'
+          , 600: 'SemiBold'
+          , 700: 'Bold'
+          , 800: 'ExtraBold'
+          , 900: 'Black'
+          // bad values (found first in WorkSans)
+          , 260: 'Thin'
+          , 280: 'ExtraLight'
+        }
+      , weight2cssWeight = {
+            250: '100'
+          , 275: '200'
+          , 300: '300'
+          , 400: '400'
+          , 500: '500'
+          , 600: '600'
+          , 700: '700'
+          , 800: '800'
+          , 900: '900'
+          // bad values (found first in WorkSans)
+          , 260: '100'
+          , 280: '200'
+        }
+      ;
+
+    function FontsData(pubsub, options) {
+        Parent.call(this, options);
+        this._pubSub = pubsub;
+        this._pubSub.subscribe('loadFont', this._onLoadFont.bind(this));
+        this._data = [];
+        Object.defineProperty(this._data, 'globalCache', {
+            value: Object.create(null)
+        });
+    }
+
+    var _p = FontsData.prototype = Object.create(Parent.prototype);
+    _p.constructor = FontsData;
+
+    FontsData.defaultOptions = {
+        // This should be set explicitly to true (or a string containing
+        // glyphs that are allowed to miss despite of being required in
+        // languageCharSets or gfCharSets
+        // The builtin FontsData.DEFAULT_LAX_CHAR_LIST is there for
+        // convenience but may cause trouble!
+        useLaxDetection: false
+      , languageCharSets: null
+      , charSets: null
+      , minCharSetCoverage: 1
+    };
+
+    FontsData._cacheDecorator = function (k) {
+        return function(fontIndex) {
+            /*jshint validthis:true*/
+            var args = [], i, l, data, cached;
+
+            for(i=0,l=arguments.length;i<l;i++)
+                args[i] = arguments[i];
+
+            data = this._aquireFontData(fontIndex);
+            if(!(k in data.cache))
+                cached = data.cache[k] = this[k].apply(this, args);
+            else
+                cached = data.cache[k];
+            return cached;
+        };
+    };
+
+    FontsData._installPublicCachedInterface = function(_p) {
+        var k, newk;
+        for(k in _p) {
+            newk = k.slice(1);
+            if(k.indexOf('_get') !== 0
+                        || typeof _p[k] !== 'function'
+                        // don't override if it is defined
+                        || newk in _p)
+                continue;
+            _p[newk] = FontsData._cacheDecorator(k);
+        }
+    };
+
+    FontsData._getFeatures = function _getFeatures(features, langSys, featureIndexes) {
+        /*jshint validthis:true*/
+        var i,l, idx, tag;
+        for(i=0,l=featureIndexes.length;i<l;i++) {
+            idx = featureIndexes[i];
+            tag = features[idx].tag;
+            if(!this[tag])
+                this[tag] = [];
+            this[tag].push(langSys);
+        }
+    };
+
+    FontsData.getFeatures = function getFeatures(font) {
+        // get all gsub features:
+        var features = {/*tag: ["{script:lang}", {script:lang}]*/}
+          ,  table, scripts, i, l, j, m, script, scriptTag, lang
+          ;
+        if(!('gsub' in font.tables) || !font.tables.gsub.scripts)
+            return features;
+        table = font.tables.gsub;
+        scripts = font.tables.gsub.scripts;
+        for(i=0,l=scripts.length;i<l;i++) {
+            script = scripts[i].script;
+            scriptTag = scripts[i].tag;
+            if(script.defaultLangSys) {
+                lang = 'Default';
+                FontsData._getFeatures.call(features
+                  , table.features
+                  , [scriptTag, lang].join(':')
+                  , script.defaultLangSys.featureIndexes
+                );
+            }
+            if(script.langSysRecords) {
+                for(j = 0, m = script.langSysRecords.length; j < m; j++) {
+                    lang = script.langSysRecords[j].tag;
+                    FontsData._getFeatures.call(features
+                      , table.features
+                      , [scriptTag, lang].join(':')
+                      , script.langSysRecords[j].langSys.featureIndexes
+                    );
+                }
+            }
+            return features;
+        }
+        // when supported by opentype.js, get all gpos features:
+    };
+
+    FontsData.sortCoverage = function sortCoverage(a, b) {
+        if(a[1] === b[1])
+            // compare the names of the languages, to sort alphabetical;
+            return a[0].localeCompare(b[0]);
+        return b[1] - a[1] ;
+    };
+
+    // These are characters that appear in the CLDR data as needed for
+    // some languages, but we decided that they are not exactly needed
+    // for language support.
+    // These are all punctuation characters currently.
+    // Don't just trust this list, and if something is terribly wrong
+    // for your language, please complain!
+    FontsData.DEFAULT_LAX_CHAR_LIST = new Set([
+        0x0000 // NULL -> this is not necessary AFAIK (in legacy latin_unique-glyphs.nam)
+      , 0x000D // CARRIAGE RETURN (CR) -> this is not necessary AFAIK (in legacy latin_unique-glyphs.nam)
+
+        // PUA characters see google/fonts# 75
+        // Used for foundry logo but not necessary.
+        // (in legacy latin_unique-glyphs.nam)
+      , 0xE0FF
+      , 0xEFFD
+      , 0xF000
+
+        // we are working on getting these supported by the google encodings
+      , 0x2010 // HYPHEN -> we usually use/include HYPHEN-MINUS: 0x002D
+      , 0x2032 // PRIME
+      , 0x2033 // DOUBLE PRIME
+      , 0x02B9 // MODIFIER LETTER PRIME
+      , 0x02BA // MODIFIER LETTER DOUBLE PRIME
+      , 0x27e8 // MATHEMATICAL LEFT ANGLE BRACKET
+      , 0x27e9 // MATHEMATICAL RIGHT ANGLE BRACKET
+      , 0x2052 // COMMERCIAL MINUS SIGN
+      , 0x2020 // DAGGER
+      , 0x2021 // DOUBLE DAGGER
+    ]);
+
+    FontsData.getCharSetCoverage = function(testForChars /*string*/
+                                , charset /*set*/, laxCharSet /*set*/) {
+        var found = 0
+          , i
+          , total = testForChars.length
+          , l = total
+          , included = []
+          , missing = []
+          , laxSkipped = []
+          , charCode
+          ;
+        for(i=0;i<l;i++) {
+            charCode = testForChars.codePointAt(i);
+            if(charset.has(charCode)) {
+                found += 1;
+                included.push(charCode);
+            }
+            else if(laxCharSet && laxCharSet.has(charCode)) {
+                total = total-1;
+                laxSkipped.push(charCode);
+            }
+            else
+                missing.push(charCode);
+        }
+        return [found/total, found, total, missing, included, laxSkipped];
+    };
+
+    /**
+     * Note that an empty string equals not using a lax char set.
+     * But if chars is not a string, the default set will be returned.
+     */
+    FontsData.getLaxCharSet = function(chars) {
+        var i, l, laxCharSet
+          , charsIsString = chars === 'string'
+          ;
+        if(charsIsString || (chars && isFinite(chars.length))) {
+            laxCharSet = new Set();
+            for(i=0,l=chars.length;i<l;i++)
+                laxCharSet.add(charsIsString ? chars.codePointAt(i) : chars[i]);
+        }
+        else
+            laxCharSet = FontsData.DEFAULT_LAX_CHAR_LIST;
+        return laxCharSet;
+    };
+
+    FontsData.getCoverageInfo = function(testForCharsets, charset, useLaxDetection) {
+        var result = Object.create(null)
+          , key
+          , laxCharList = FontsData.getLaxCharSet(useLaxDetection)
+          ;
+
+        for(key in testForCharsets) {
+            // testForCharsets[key] is a string
+            result[key] = FontsData.getCharSetCoverage(testForCharsets[key]
+                                , charset, useLaxDetection && laxCharList);
+        }
+        return result;
+    };
+
+    FontsData.getLanguageCoverageForCharSet = function(languageCharSets, charset, useLaxDetection) {
+        var coverage = FontsData.getCoverageInfo(languageCharSets, charset, useLaxDetection)
+          , result = []
+          , k, item
+          ;
+         // reformat and sort
+         for(k in coverage) {
+            item = [k];
+            Array.prototype.push.apply(item, coverage[k]);
+            result.push(item);
+        }
+        result.sort(FontsData.sortCoverage);
+        return result;
+    };
+
+    FontsData.getLanguageCoverage = function (languageCharSets, font, useLaxDetection) {
+        // FIXME: this charset could be cached per fontindex.
+        // Duplicate in FontsData.getCharSetsCoverageInfo.
+        var charSet = new Set(Object.keys(font.encoding.cmap.glyphIndexMap).map(k=>parseInt(k,10)));
+        return FontsData.getLanguageCoverageForCharSet(languageCharSets, charSet, useLaxDetection);
+    };
+
+    FontsData.getCharSetsCoverageInfoForCharSet = function(charSets, charset, useLaxDetection) {
+        var extractedCharSets = Object.create(null)
+          , k
+          ;
+        // prepare
+        for(k in charSets)
+            extractedCharSets[k] = charSets[k][0];
+
+        return FontsData.getCoverageInfo(extractedCharSets, charset, useLaxDetection);
+    };
+
+    FontsData.getCharSetsCoverageInfo = function(charSets, font, useLaxDetection) {
+        // FIXME: this charset could be cached per fontindex.
+        // Duplicate in FontsData.getLanguageCoverage.
+        var charSet = new Set(Object.keys(font.encoding.cmap.glyphIndexMap).map(k=>parseInt(k,10)));
+        return FontsData.getCharSetsCoverageInfoForCharSet(charSets, charSet, useLaxDetection);
+    };
+
+    _p._aquireFontData = function(fontIndex) {
+        var data = this._data[fontIndex];
+        if(!data)
+            throw new Error('FontIndex "'+fontIndex+'" is not available.');
+        return data;
+    };
+
+    _p._onLoadFont = function(fontIndex, fontFileName, font, originalArraybuffer) {
+        this._data[fontIndex] = {
+            font: font
+          , fileName: fontFileName
+          , originalArraybuffer: originalArraybuffer
+          , cache: Object.create(null)
+        };
+    };
+
+    _p.__getLanguageCoverage = function(fontIndex, useLaxDetection) {
+        var languageCharSets = this._options.languageCharSets;
+        if(!languageCharSets)
+            throw new Error('To use "getLanguageCoverage" the optionial "languageCharSets" must be set.');
+        return FontsData.getLanguageCoverage(languageCharSets, this._data[fontIndex].font, useLaxDetection);
+    };
+
+    _p.getLanguageCoverage = function(fontIndex) {
+        var func = this._options.useLaxDetection
+                                ? 'getLanguageCoverageLax'
+                                : 'getLanguageCoverageStrict'
+                                ;
+        return this[func](fontIndex);
+    };
+
+    _p._getLanguageCoverageStrict = function(fontIndex) {
+        return this.__getLanguageCoverage(fontIndex, false);
+    };
+
+    _p._getLanguageCoverageLax = function(fontIndex) {
+        return this.__getLanguageCoverage(fontIndex, this._options.useLaxDetection || true);
+    };
+    ///////////////
+    // START CHAR SETS INFO
+    _p.__getCharSetsCoverage = function(fontIndex, useLaxDetection) {
+        var charSets = this._options.charSets;
+        if(!charSets)
+            throw new Error('To use "getCharSetsCoverage" the optionial "charSets" must be set.');
+        return FontsData.getCharSetsCoverageInfo(charSets, this._data[fontIndex].font, useLaxDetection);
+    };
+
+    _p.getCharSetsCoverage = function(fontIndex) {
+        var func = this._options.useLaxDetection
+                                    ? 'getCharSetsCoverageLax'
+                                    : 'getCharSetsCoverageStrict'
+                                    ;
+        return this[func](fontIndex);
+    };
+
+    _p._getCharSetsCoverageStrict = function(fontIndex) {
+        return this.__getCharSetsCoverage(fontIndex, false);
+    };
+
+    _p._getCharSetsCoverageLax = function(fontIndex) {
+        return this.__getCharSetsCoverage(fontIndex, this._options.useLaxDetection || true);
+    };
+
+    /**
+     * This is intended for analyzing rather than for specimen/end user application.
+     * Thus we don't bother to cache the result and hence we can add more
+     * arguments next to fontIndex.
+     *
+     * The returned coverage data in this case is formatted like the result
+     * of `getLanguageCoverageLax/Strict`, so that it can be rendered with the
+     * same function
+     */
+    _p.getCharSetsCoverageSorted = function(fontIndex, useLaxDetection) {
+        var coverage =  this.__getCharSetsCoverage(
+                                        fontIndex
+                                      , useLaxDetection
+                                            ? this._options.useLaxDetection
+                                            : false
+                                      )
+          , charSets = this._options.charSets
+          , result = []
+          , name, entry
+          ;
+        for(name in coverage) {
+            entry = [name];
+            Array.prototype.push.apply(entry, coverage[name]);
+            result.push(entry);
+        }
+
+        result.sort(function(a, b) {
+            var sortIndexA, sortIndexB;
+            if(a[1] !== b[1])
+                // best coverage (the higher number) first
+                return  b[1] - a[1];
+
+            // sortIndexes are derived when prosessing the original Namelist files.
+            sortIndexA = charSets[a[0]][a.length-1];
+            sortIndexB = charSets[b[0]][b.length-1];
+            return sortIndexA - sortIndexB;
+        });
+        return result;
+    };
+
+    function __collectCharSetsLanguages(names, charSets) {
+        var langs = new Set()
+          , result = []
+          , ownLangs
+          , i, l
+          ;
+        for(i=0,l=names.length;i<l;i++) {
+            ownLangs = charSets[names[i]][1];
+            ownLangs.forEach(Set.prototype.add, langs);
+        }
+        langs.forEach(function(item){result.push(item);});
+        result.sort();
+        return result;
+    }
+
+    _p.__getCharSetInfo = function (coverage, name) {
+        var data = this._options.charSets[name]
+          , ownLanguages= data[1]
+          , deepDependencies = data[2]
+          , inheritedLanguages = __collectCharSetsLanguages(deepDependencies,  this._options.charSets)
+          ;
+        return {
+            name: name
+          , charset: data[0]
+          , ownLanguages: ownLanguages
+          , inheritedLanguages: inheritedLanguages
+          , allLanguages: ownLanguages.concat(inheritedLanguages).sort()
+          , includedCharSets: data[2]
+          , sortIndex: data[data.length-1]
+          , laxSkipped: coverage ? coverage[name][5] : []
+        };
+    };
+
+     function _sortCharSetInfo(itemA, itemB) {
+        return itemA.sortIndex - itemB.sortIndex;
+    }
+
+    /**
+     * This for inspection tools.
+     */
+    _p.getFullCharSetsInfo = function() {
+        var name, result = [];
+        for(name in this._options.charSets)
+            result.push(this.__getCharSetInfo(null, name));
+        result.sort(_sortCharSetInfo);
+        return result;
+    };
+
+    /**
+     * No cache, so we can expose more arguments. This for inspection tools.
+     */
+    _p.getCharSetsInfoNoCache = function(fontIndex, useLaxDetection, minCoverage) {
+        // this call will be cached actually
+        var getCharSetsCoverageFunc =  useLaxDetection
+                        ? 'getCharSetsCoverageLax'
+                        : 'getCharSetsCoverageStrict'
+          , coverage = this[getCharSetsCoverageFunc](fontIndex)
+          ;
+        return Object.keys(coverage)
+            .filter(function(k){return coverage[k][0] >= (minCoverage || 0);})
+            .map(this.__getCharSetInfo.bind(this, coverage))
+            .sort(_sortCharSetInfo)
+            ;
+    };
+
+    _p.getCharSetsInfo = function(fontIndex) {
+        var func = this._options.useLaxDetection
+                                    ? 'getCharSetsInfoLax'
+                                    : 'getCharSetsInfoStrict'
+                                    ;
+        return this[func](fontIndex);
+    };
+
+    _p._getCharSetsInfoLax = function(fontIndex) {
+        return this.getCharSetsInfoNoCache(fontIndex
+                                    , this._options.useLaxDetection || true
+                                    , this._options.minCharSetCoverage);
+    };
+
+    _p._getCharSetsInfoStrict = function(fontIndex) {
+        return this.getCharSetsInfoNoCache(fontIndex
+                                    , false
+                                    , this._options.minCharSetCoverage);
+
+    };
+    // END CHAR SETS INFO
+    ///////////////////////
+
+    _p._getSupportedLanguages = function(fontIndex) {
+        var coverage = this.getLanguageCoverage(fontIndex)
+          , i, l
+          , result = [], language, support
+          ;
+        for(i=0,l=coverage.length;i<l;i++) {
+            language = coverage[i][0];
+            support = coverage[i][1];
+            if(support === 1)
+                result.push(language);
+        }
+        result.sort();
+        return result;
+    };
+
+    _p._getSupportedLanguagesByCharSets = function(fontIndex) {
+        var languagesSet = new Set()
+          , result = []
+          ;
+        this.getCharSetsInfo(fontIndex).forEach(function(item) {
+            item.ownLanguages.forEach(Set.prototype.add, languagesSet);
+        });
+        languagesSet.forEach(function(item){result.push(item);});
+        result.sort();
+        return result;
+    };
+
+    _p._getNumberGlyphs = function(fontIndex) {
+        return this._data[fontIndex].font.glyphNames.names.length;
+    };
+
+    _p._getFeatures = function(fontIndex) {
+        return FontsData.getFeatures(this._data[fontIndex].font);
+    };
+
+    _p._getFamilyName  = function(fontIndex) {
+        var font = this._data[fontIndex].font
+          , fontFamily
+          ;
+
+        fontFamily = font.names.postScriptName.en
+                        || Object.values(font.names.postScriptName)[0]
+                        || font.names.fontFamily
+                        ;
+        fontFamily = fontFamily.split('-')[0];
+        return fontFamily;
+    };
+
+    _p._getOS2FontWeight = function(fontIndex) {
+        var font = this._data[fontIndex].font;
+        return font.tables.os2.usWeightClass;
+    };
+
+    // Keeping this, maybe we'll have to transform this name further for CSS?
+    _p._getCSSFamilyName = _p._getFamilyName;
+
+    _p._getIsItalic = function(fontIndex) {
+        var font = this._data[fontIndex].font
+          , italicFromOS2 = !!(font.tables.os2.fsSelection & font.fsSelectionValues.ITALIC)
+          , subFamily = this.getSubfamilyName(fontIndex).toLowerCase()
+          , italicFromName = subFamily.indexOf("italic") !== -1
+          ;
+        return italicFromOS2 || italicFromName;
+    };
+
+    _p.getFamiliesData = function() {
+        var cacheKey = 'getFamiliesData';
+        if(cacheKey in this._data.globalCache)
+            return this._data.globalCache[cacheKey];
+
+        var families = Object.create(null)
+          , weightDict, styleDict
+          , fontFamily, fontWeight, fontStyle
+          , fontIndex, l
+          , result
+          ;
+        for(fontIndex=0,l=this._data.length;fontIndex<l;fontIndex++) {
+            fontFamily  = this.getFamilyName(fontIndex);
+            fontWeight = this.getCSSWeight(fontIndex);
+            fontStyle = this.getCSSStyle(fontIndex);
+
+            weightDict = families[fontFamily];
+            if(!weightDict)
+                families[fontFamily] = weightDict = Object.create(null);
+
+            styleDict = weightDict[fontWeight];
+            if(!styleDict)
+                weightDict[fontWeight] = styleDict = Object.create(null);
+
+            if(fontStyle in styleDict) {
+                console.warn('A font with weight ' + fontWeight
+                                + ' and style "'+fontStyle+'"'
+                                + ' has already appeared for '
+                                +'"' +fontFamily+'".\nFirst was the file: '
+                                + styleDict[fontStyle] + ' '
+                                + this.getFileName(styleDict[fontStyle])
+                                + '.\nNow the file: ' + fontIndex + ' '
+                                +  this.getFileName(fontIndex)
+                                + ' is in conflict.\nThis may hint to a bad '
+                                + 'OS/2 table entry.\nSkipping.'
+                                );
+                continue;
+            }
+            // assert(fontStyle not in weightDict)
+            styleDict[fontStyle] = fontIndex;
+        }
+
+        result =  Object.keys(families).sort()
+              .map(function(key){ return [key, this[key]];}, families);
+        this._data.globalCache[cacheKey] = result;
+        return result;
+    };
+
+    // no need to cache these: No underscore will prevent
+    //_installPublicCachedInterface from doing anything.
+    _p.getNumberSupportedLanguages = function(fontIndex) {
+        return this.getSupportedLanguages(fontIndex).length;
+    };
+
+    _p.getNumberSupportedLanguagesByCharSets = function(fontIndex) {
+        return this.getSupportedLanguagesByCharSets(fontIndex).length;
+    };
+
+    // used for inspection tool
+    _p.getUseLaxDetection = function() {
+        var chars, laxData, charList;
+        if(!this._options.useLaxDetection)
+            return 'False';
+        chars = [];
+        charList = [];
+
+        laxData = FontsData.getLaxCharSet(this._options.useLaxDetection);
+        laxData.forEach(function(item) {
+            charList.push(item);
+        });
+        charList.sort();
+
+        charList.forEach(function(item) {
+            var hex = item.toString(16)
+              , formatted = ['"'
+                            , String.fromCodePoint(item)
+                            , '" 0x'
+                            , ('0000' + hex).slice(-Math.max(4, hex.length))
+                            ].join('')
+              ;
+            chars.push(formatted);
+        });
+
+        return 'True: ' + chars.join(', ');
+    };
+
+    _p.getFont = function(fontIndex) {
+        return this._aquireFontData(fontIndex).font;
+    };
+
+    _p.getFileName = function(fontIndex) {
+        return this._aquireFontData(fontIndex).fileName;
+    };
+
+    _p.getOriginalArraybuffer = function(fontIndex) {
+        return this._aquireFontData(fontIndex).originalArraybuffer;
+    };
+
+    _p.getCSSWeight = function(fontIndex) {
+        return weight2cssWeight[this.getOS2FontWeight(fontIndex)];
+    };
+
+    _p.getWeightName = function(fontIndex) {
+        return weight2weightName[this.getOS2FontWeight(fontIndex)];
+    };
+
+    _p.getCSSStyle = function(fontIndex) {
+        return this.getIsItalic(fontIndex) ? 'italic' : 'normal';
+    };
+
+    _p.getStyleName = function(fontIndex) {
+        return this.getWeightName(fontIndex) + (this.getIsItalic(fontIndex) ? ' Italic' : '');
+    };
+
+    _p.getPostScriptName = function(fontIndex) {
+        return this._aquireFontData(fontIndex).font.names.postScriptName;
+    };
+
+    _p.getSubfamilyName = function(fontIndex) {
+        var font = this._data[fontIndex].font
+          , fontFamily, subFamily
+          ;
+
+        fontFamily = font.names.postScriptName.en
+                        || Object.values(font.names.postScriptName)[0]
+                        || font.names.fontFamily
+                        ;
+
+        // delete all before and incuded the first "-", don't use PS subfamily string
+        // but extract from full PS name;
+        // also use the entrie name if no "-" was found
+        if (fontFamily.indexOf("-") > -1) {
+            subFamily = fontFamily.substring(fontFamily.indexOf("-") + 1);
+        } else {
+            subFamily = fontFamily;
+        }
+        return subFamily;
+    };
+
+    _p.getGlyphByName = function(fontIndex, name) {
+        var font = this._aquireFontData(fontIndex).font
+          , glyphIndex = font.glyphNames.nameToGlyphIndex(name)
+          , glyph = font.glyphs.get(glyphIndex)
+          ;
+        return glyph;
+    };
+
+    _p.getFontValue = function(fontIndex, name /* like: "xHeight" */) {
+        var font = this._aquireFontData(fontIndex).font;
+        switch(name){
+            case('xHeight'):
+                return font.tables.os2.sxHeight;
+            case('capHeight'):
+                 return font.tables.os2.sCapHeight;
+            case('ascender'):
+            /*falls through*/
+            case('descender'):
+                return font[name];
+            default:
+                console.warn('getFontValue: don\'t know how to get "'+ name +'".');
+        }
+    };
+
+    function familiesDataReducer(all, item) {
+        var i, l, weightDict, weights, styles, result = [];
+        weightDict = item[1];
+        weights = Object.keys(weightDict).sort();
+        for(i=0,l=weights.length;i<l;i++) {
+            styles = weightDict[weights[i]];
+            if('normal' in styles)
+                result.push(styles.normal);
+            if('italic' in styles)
+                result.push(styles.italic);
+        }
+        return all.concat(result);
+    }
+
+    _p.getFontIndexesInFamilyOrder = function(){
+        var familiesData = this.getFamiliesData();
+        return familiesData.reduce(familiesDataReducer, []);
+    };
+
+    _p.getFontIndexes = function() {
+        var fontIndex, l, result = [];
+        for(fontIndex=0,l=this._data.length;fontIndex<l;fontIndex++)
+            result.push(fontIndex);
+        return result;
+    };
+
+    FontsData._installPublicCachedInterface(_p);
+    return FontsData;
+});
 
 /**
  * @license text 2.0.15 Copyright jQuery Foundation and other contributors.
  * Released under MIT license, http://github.com/requirejs/text/LICENSE
  */
+/*jslint regexp: true */
+/*global require, XMLHttpRequest, ActiveXObject,
+  define, window, process, Packages,
+  java, location, Components, FileUtils */
+
+define('require/text',['module'], function (module) {
+    'use strict';
+
+    var text, fs, Cc, Ci, xpcIsWindows,
+        progIds = ['Msxml2.XMLHTTP', 'Microsoft.XMLHTTP', 'Msxml2.XMLHTTP.4.0'],
+        xmlRegExp = /^\s*<\?xml(\s)+version=[\'\"](\d)*.(\d)*[\'\"](\s)*\?>/im,
+        bodyRegExp = /<body[^>]*>\s*([\s\S]+)\s*<\/body>/im,
+        hasLocation = typeof location !== 'undefined' && location.href,
+        defaultProtocol = hasLocation && location.protocol && location.protocol.replace(/\:/, ''),
+        defaultHostName = hasLocation && location.hostname,
+        defaultPort = hasLocation && (location.port || undefined),
+        buildMap = {},
+        masterConfig = (module.config && module.config()) || {};
+
+    function useDefault(value, defaultValue) {
+        return value === undefined || value === '' ? defaultValue : value;
+    }
+
+    //Allow for default ports for http and https.
+    function isSamePort(protocol1, port1, protocol2, port2) {
+        if (port1 === port2) {
+            return true;
+        } else if (protocol1 === protocol2) {
+            if (protocol1 === 'http') {
+                return useDefault(port1, '80') === useDefault(port2, '80');
+            } else if (protocol1 === 'https') {
+                return useDefault(port1, '443') === useDefault(port2, '443');
+            }
+        }
+        return false;
+    }
+
+    text = {
+        version: '2.0.15',
+
+        strip: function (content) {
+            //Strips <?xml ...?> declarations so that external SVG and XML
+            //documents can be added to a document without worry. Also, if the string
+            //is an HTML document, only the part inside the body tag is returned.
+            if (content) {
+                content = content.replace(xmlRegExp, "");
+                var matches = content.match(bodyRegExp);
+                if (matches) {
+                    content = matches[1];
+                }
+            } else {
+                content = "";
+            }
+            return content;
+        },
+
+        jsEscape: function (content) {
+            return content.replace(/(['\\])/g, '\\$1')
+                .replace(/[\f]/g, "\\f")
+                .replace(/[\b]/g, "\\b")
+                .replace(/[\n]/g, "\\n")
+                .replace(/[\t]/g, "\\t")
+                .replace(/[\r]/g, "\\r")
+                .replace(/[\u2028]/g, "\\u2028")
+                .replace(/[\u2029]/g, "\\u2029");
+        },
+
+        createXhr: masterConfig.createXhr || function () {
+            //Would love to dump the ActiveX crap in here. Need IE 6 to die first.
+            var xhr, i, progId;
+            if (typeof XMLHttpRequest !== "undefined") {
+                return new XMLHttpRequest();
+            } else if (typeof ActiveXObject !== "undefined") {
+                for (i = 0; i < 3; i += 1) {
+                    progId = progIds[i];
+                    try {
+                        xhr = new ActiveXObject(progId);
+                    } catch (e) {}
+
+                    if (xhr) {
+                        progIds = [progId];  // so faster next time
+                        break;
+                    }
+                }
+            }
+
+            return xhr;
+        },
+
+        /**
+         * Parses a resource name into its component parts. Resource names
+         * look like: module/name.ext!strip, where the !strip part is
+         * optional.
+         * @param {String} name the resource name
+         * @returns {Object} with properties "moduleName", "ext" and "strip"
+         * where strip is a boolean.
+         */
+        parseName: function (name) {
+            var modName, ext, temp,
+                strip = false,
+                index = name.lastIndexOf("."),
+                isRelative = name.indexOf('./') === 0 ||
+                             name.indexOf('../') === 0;
+
+            if (index !== -1 && (!isRelative || index > 1)) {
+                modName = name.substring(0, index);
+                ext = name.substring(index + 1);
+            } else {
+                modName = name;
+            }
+
+            temp = ext || modName;
+            index = temp.indexOf("!");
+            if (index !== -1) {
+                //Pull off the strip arg.
+                strip = temp.substring(index + 1) === "strip";
+                temp = temp.substring(0, index);
+                if (ext) {
+                    ext = temp;
+                } else {
+                    modName = temp;
+                }
+            }
+
+            return {
+                moduleName: modName,
+                ext: ext,
+                strip: strip
+            };
+        },
+
+        xdRegExp: /^((\w+)\:)?\/\/([^\/\\]+)/,
+
+        /**
+         * Is an URL on another domain. Only works for browser use, returns
+         * false in non-browser environments. Only used to know if an
+         * optimized .js version of a text resource should be loaded
+         * instead.
+         * @param {String} url
+         * @returns Boolean
+         */
+        useXhr: function (url, protocol, hostname, port) {
+            var uProtocol, uHostName, uPort,
+                match = text.xdRegExp.exec(url);
+            if (!match) {
+                return true;
+            }
+            uProtocol = match[2];
+            uHostName = match[3];
+
+            uHostName = uHostName.split(':');
+            uPort = uHostName[1];
+            uHostName = uHostName[0];
+
+            return (!uProtocol || uProtocol === protocol) &&
+                   (!uHostName || uHostName.toLowerCase() === hostname.toLowerCase()) &&
+                   ((!uPort && !uHostName) || isSamePort(uProtocol, uPort, protocol, port));
+        },
+
+        finishLoad: function (name, strip, content, onLoad) {
+            content = strip ? text.strip(content) : content;
+            if (masterConfig.isBuild) {
+                buildMap[name] = content;
+            }
+            onLoad(content);
+        },
+
+        load: function (name, req, onLoad, config) {
+            //Name has format: some.module.filext!strip
+            //The strip part is optional.
+            //if strip is present, then that means only get the string contents
+            //inside a body tag in an HTML string. For XML/SVG content it means
+            //removing the <?xml ...?> declarations so the content can be inserted
+            //into the current doc without problems.
+
+            // Do not bother with the work if a build and text will
+            // not be inlined.
+            if (config && config.isBuild && !config.inlineText) {
+                onLoad();
+                return;
+            }
+
+            masterConfig.isBuild = config && config.isBuild;
+
+            var parsed = text.parseName(name),
+                nonStripName = parsed.moduleName +
+                    (parsed.ext ? '.' + parsed.ext : ''),
+                url = req.toUrl(nonStripName),
+                useXhr = (masterConfig.useXhr) ||
+                         text.useXhr;
+
+            // Do not load if it is an empty: url
+            if (url.indexOf('empty:') === 0) {
+                onLoad();
+                return;
+            }
+
+            //Load the text. Use XHR if possible and in a browser.
+            if (!hasLocation || useXhr(url, defaultProtocol, defaultHostName, defaultPort)) {
+                text.get(url, function (content) {
+                    text.finishLoad(name, parsed.strip, content, onLoad);
+                }, function (err) {
+                    if (onLoad.error) {
+                        onLoad.error(err);
+                    }
+                });
+            } else {
+                //Need to fetch the resource across domains. Assume
+                //the resource has been optimized into a JS module. Fetch
+                //by the module name + extension, but do not include the
+                //!strip part to avoid file system issues.
+                req([nonStripName], function (content) {
+                    text.finishLoad(parsed.moduleName + '.' + parsed.ext,
+                                    parsed.strip, content, onLoad);
+                });
+            }
+        },
+
+        write: function (pluginName, moduleName, write, config) {
+            if (buildMap.hasOwnProperty(moduleName)) {
+                var content = text.jsEscape(buildMap[moduleName]);
+                write.asModule(pluginName + "!" + moduleName,
+                               "define(function () { return '" +
+                                   content +
+                               "';});\n");
+            }
+        },
+
+        writeFile: function (pluginName, moduleName, req, write, config) {
+            var parsed = text.parseName(moduleName),
+                extPart = parsed.ext ? '.' + parsed.ext : '',
+                nonStripName = parsed.moduleName + extPart,
+                //Use a '.js' file name so that it indicates it is a
+                //script that can be loaded across domains.
+                fileName = req.toUrl(parsed.moduleName + extPart) + '.js';
+
+            //Leverage own load() method to load plugin value, but only
+            //write out values that do not have the strip argument,
+            //to avoid any potential issues with ! in file names.
+            text.load(nonStripName, req, function (value) {
+                //Use own write() method to construct full module value.
+                //But need to create shell that translates writeFile's
+                //write() to the right interface.
+                var textWrite = function (contents) {
+                    return write(fileName, contents);
+                };
+                textWrite.asModule = function (moduleName, contents) {
+                    return write.asModule(moduleName, fileName, contents);
+                };
+
+                text.write(pluginName, nonStripName, textWrite, config);
+            }, config);
+        }
+    };
+
+    if (masterConfig.env === 'node' || (!masterConfig.env &&
+            typeof process !== "undefined" &&
+            process.versions &&
+            !!process.versions.node &&
+            !process.versions['node-webkit'] &&
+            !process.versions['atom-shell'])) {
+        //Using special require.nodeRequire, something added by r.js.
+        fs = require.nodeRequire('fs');
+
+        text.get = function (url, callback, errback) {
+            try {
+                var file = fs.readFileSync(url, 'utf8');
+                //Remove BOM (Byte Mark Order) from utf8 files if it is there.
+                if (file[0] === '\uFEFF') {
+                    file = file.substring(1);
+                }
+                callback(file);
+            } catch (e) {
+                if (errback) {
+                    errback(e);
+                }
+            }
+        };
+    } else if (masterConfig.env === 'xhr' || (!masterConfig.env &&
+            text.createXhr())) {
+        text.get = function (url, callback, errback, headers) {
+            var xhr = text.createXhr(), header;
+            xhr.open('GET', url, true);
+
+            //Allow plugins direct access to xhr headers
+            if (headers) {
+                for (header in headers) {
+                    if (headers.hasOwnProperty(header)) {
+                        xhr.setRequestHeader(header.toLowerCase(), headers[header]);
+                    }
+                }
+            }
+
+            //Allow overrides specified in config
+            if (masterConfig.onXhr) {
+                masterConfig.onXhr(xhr, url);
+            }
+
+            xhr.onreadystatechange = function (evt) {
+                var status, err;
+                //Do not explicitly handle errors, those should be
+                //visible via console output in the browser.
+                if (xhr.readyState === 4) {
+                    status = xhr.status || 0;
+                    if (status > 399 && status < 600) {
+                        //An http 4xx or 5xx error. Signal an error.
+                        err = new Error(url + ' HTTP status: ' + status);
+                        err.xhr = xhr;
+                        if (errback) {
+                            errback(err);
+                        }
+                    } else {
+                        callback(xhr.responseText);
+                    }
+
+                    if (masterConfig.onXhrComplete) {
+                        masterConfig.onXhrComplete(xhr, url);
+                    }
+                }
+            };
+            xhr.send(null);
+        };
+    } else if (masterConfig.env === 'rhino' || (!masterConfig.env &&
+            typeof Packages !== 'undefined' && typeof java !== 'undefined')) {
+        //Why Java, why is this so awkward?
+        text.get = function (url, callback) {
+            var stringBuffer, line,
+                encoding = "utf-8",
+                file = new java.io.File(url),
+                lineSeparator = java.lang.System.getProperty("line.separator"),
+                input = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(file), encoding)),
+                content = '';
+            try {
+                stringBuffer = new java.lang.StringBuffer();
+                line = input.readLine();
+
+                // Byte Order Mark (BOM) - The Unicode Standard, version 3.0, page 324
+                // http://www.unicode.org/faq/utf_bom.html
+
+                // Note that when we use utf-8, the BOM should appear as "EF BB BF", but it doesn't due to this bug in the JDK:
+                // http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4508058
+                if (line && line.length() && line.charAt(0) === 0xfeff) {
+                    // Eat the BOM, since we've already found the encoding on this file,
+                    // and we plan to concatenating this buffer with others; the BOM should
+                    // only appear at the top of a file.
+                    line = line.substring(1);
+                }
+
+                if (line !== null) {
+                    stringBuffer.append(line);
+                }
+
+                while ((line = input.readLine()) !== null) {
+                    stringBuffer.append(lineSeparator);
+                    stringBuffer.append(line);
+                }
+                //Make sure we return a JavaScript string and not a Java string.
+                content = String(stringBuffer.toString()); //String
+            } finally {
+                input.close();
+            }
+            callback(content);
+        };
+    } else if (masterConfig.env === 'xpconnect' || (!masterConfig.env &&
+            typeof Components !== 'undefined' && Components.classes &&
+            Components.interfaces)) {
+        //Avert your gaze!
+        Cc = Components.classes;
+        Ci = Components.interfaces;
+        Components.utils['import']('resource://gre/modules/FileUtils.jsm');
+        xpcIsWindows = ('@mozilla.org/windows-registry-key;1' in Cc);
+
+        text.get = function (url, callback) {
+            var inStream, convertStream, fileObj,
+                readData = {};
+
+            if (xpcIsWindows) {
+                url = url.replace(/\//g, '\\');
+            }
+
+            fileObj = new FileUtils.File(url);
+
+            //XPCOM, you so crazy
+            try {
+                inStream = Cc['@mozilla.org/network/file-input-stream;1']
+                           .createInstance(Ci.nsIFileInputStream);
+                inStream.init(fileObj, 1, 0, false);
+
+                convertStream = Cc['@mozilla.org/intl/converter-input-stream;1']
+                                .createInstance(Ci.nsIConverterInputStream);
+                convertStream.init(inStream, "utf-8", inStream.available(),
+                Ci.nsIConverterInputStream.DEFAULT_REPLACEMENT_CHARACTER);
+
+                convertStream.readString(inStream.available(), readData);
+                convertStream.close();
+                inStream.close();
+                callback(readData.value);
+            } catch (e) {
+                throw new Error((fileObj && fileObj.path || '') + ': ' + e);
+            }
+        };
+    }
+    return text;
+});
+
+
+define('require/text!specimenTools/services/languageCharSets.json',[],function () { return '{"Afrikaans":"aáâbcdeéèêëfghiîïjklmnoôöpqrstuûvwxyzAÁÂBCDEÉÈÊËFGHIÎÏJKLMNOÔÖPQRSTUÛVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Amharic":"ሀሁሂሃሄህሆለሉሊላሌልሎሏሐሑሒሓሔሕሖሗመሙሚማሜምሞሟሠሡሢሣሤሥሦሧረሩሪራሬርሮሯሰሱሲሳሴስሶሷሸሹሺሻሼሽሾሿቀቁቂቃቄቅቆቈቊቋቌቍበቡቢባቤብቦቧቨቩቪቫቬቭቮቯተቱቲታቴትቶቷቸቹቺቻቼችቾቿኀኁኂኃኄኅኆኈኊኋኌኍነኑኒናኔንኖኗኘኙኚኛኜኝኞኟአኡኢኣኤእኦኧከኩኪካኬክኮኰኲኳኴኵኸኹኺኻኼኽኾወዉዊዋዌውዎዐዑዒዓዔዕዖዘዙዚዛዜዝዞዟዠዡዢዣዤዥዦዧየዩዪያዬይዮደዱዲዳዴድዶዷጀጁጂጃጄጅጆጇገጉጊጋጌግጎጐጒጓጔጕጠጡጢጣጤጥጦጧጨጩጪጫጬጭጮጯጰጱጲጳጴጵጶጷጸጹጺጻጼጽጾጿፀፁፂፃፄፅፆፈፉፊፋፌፍፎፏፐፑፒፓፔፕፖፗ‐–,፡፣፤፥፦!?.።‹›«»()[]","Arabic":"ًٌٍَُِّْٰءأؤإئاآبةتثجحخدذرزسشصضطظعغفقكلمنهوىي-‐–—،؛:!؟.\'\\\\\\"()[]","Azerbaijani":"abcçdeəfgğhxıiİjkqlmnoöprsştuüvyzABCÇDEƏFGĞHXIJKQLMNOÖPRSŞTUÜVYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Belarusian":"абвгджзеёійклмнопрстуўфхцчшыьэюяАБВГДЖЗЕЁІЙКЛМНОПРСТУЎФХЦЧШЫЬЭЮЯ-,;:!?.«»()[]{}","Bulgarian":"абвгдежзийклмнопрстуфхцчшщъьюяАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЬЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„()[]§*/″№","Bangla":"়৺অআইঈউঊঋৠঌৡএঐওঔংঃঁক\\\\u09CDষখগঘঙচছজঝঞটঠডBঢণতৎথদধনপফবভমযরলশসহঽািীুূৃৄৢৣেৈোৌ্ৗU-,;:!?.()[]{}","Bosnian":"abcčćdžđefghijklmnoprsštuvzABCČĆDŽĐEFGHIJKLMNOPRSŠTUVZ-,;:!?.()[]{}","Catalan":"·aàbcçdeéèfghiíïjklmnoóòpqrstuúüvwxyzAÀBCÇDEÉÈFGHIÍÏJKLMNOÓÒPQRSTUÚÜVWXYZ-‐–—,;:!¡?¿.…\'‘’\\\\\\"“”«»()[]§@*/\\\\\\\\&#†‡′″","Czech":"aábcčdďeéěfghiíjklmnňoópqrřsštťuúůvwxyýzžAÁBCČDĎEÉĚFGHIÍJKLMNŇOÓPQRŘSŠTŤUÚŮVWXYÝZŽ-‐–,;:!?.…‘‚“„()[]§@*/&","Welsh":"aáàâäbchdeéèêëfgniíìîïjlmoóòôöprstuúùûüwẃẁŵẅyýỳŷÿAÁÀÂÄBCHDEÉÈÊËFGNIÍÌÎÏJLMOÓÒÔÖPRSTUÚÙÛÜWẂẀŴẄYÝỲŶŸ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Danish":"abcdefghijklmnopqrstuvwxyzæøåABCDEFGHIJKLMNOPQRSTUVWXYZÆØÅ-‐–,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†′″","German":"aäbcdefghijklmnoöpqrsßtuüvwxyzAÄBCDEFGHIJKLMNOÖPQRSSSTUÜVWXYZ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Greek":"αάβγδεέζηήθιίϊΐκλμνξοόπρσςτυύϋΰφχψωώΑΆΒΓΔΕΈΖΗΉΘΙΊΪΪ́ΚΛΜΝΞΟΌΠΡΣΤΥΎΫΫ́ΦΧΨΩΏ-‐–—,;:!.…\\\\\\"«»()[]§@*/\\\\\\\\&","English":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Spanish":"aábcdeéfghiíïjklmnñoópqrstuúüvwxyýzAÁBCDEÉFGHIÍÏJKLMNÑOÓPQRSTUÚÜVWXYÝZ-‐–—,;:!¡?¿.…\'‘’\\\\\\"“”«»()[]§@*/\\\\\\\\&#†‡′″","Estonian":"abcdefghijklmnopqrsšzžtuvwõäöüxyABCDEFGHIJKLMNOPQRSŠZŽTUVWÕÄÖÜXY-,;:!?.()[]{}","Basque":"abcçdefghijklmnñopqrstuvwxyzABCÇDEFGHIJKLMNÑOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Persian":"ًٌٍّٔآاءأؤئبپتثجچحخدذرزژسشصضطظعغفقکگلمنوهةی-‐،٫٬؛:!؟.…‹›«»()[]*/\\\\\\\\","Finnish":"abcdefghijklmnopqrsštuvwxyzžåäöABCDEFGHIJKLMNOPQRSŠTUVWXYZŽÅÄÖ‐–,;:!?.…’”»()[]§@*/\\\\\\\\&#","Filipino":"abcdefghijklmnñopqrstuvwxyzABCDEFGHIJKLMNÑOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§*/&#′″","Faroese":"aábdðefghiíjklmnoóprstuúvyýæøAÁBDÐEFGHIÍJKLMNOÓPRSTUÚVYÝÆØ-‐–,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†′″","French":"aàâæbcçdeéèêëfghiîïjklmnoôœpqrstuùûüvwxyÿzAÀÂÆBCÇDEÉÈÊËFGHIÎÏJKLMNOÔŒPQRSTUÙÛÜVWXYŸZ-‐–—,;:!?.…’\\\\\\"“”«»()[]§@*/&#†‡","Irish":"aábcdeéfghiílmnoóprstuúAÁBCDEÉFGHIÍLMNOÓPRSTUÚ-,;:!?.()[]{}","Galician":"aábcdeéfghiíjklmnñoópqrstuúüvwxyzAÁBCDEÉFGHIÍJKLMNÑOÓPQRSTUÚÜVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Gujarati":"઼ૐંઁઃઅઆઇઈઉઊઋૠઍએઐઑઓઔકખગઘઙચછજઝઞટઠડઢણતથદધનપફબભમયરલવશષસહળઽાિીુૂૃૄૅેૈૉોૌ્-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Hebrew":"אבגדהוזחטיכךלמםנןסעפףצץקרשת-‐–—,;:!?.׳\'\\\\\\"()[]/״־","Hindi":"़ॐंँःअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलळवशषसहऽािीुूृॄॅेैॉोौ्-,;:!?.‘’“”()[]{}॰","Croatian":"abcčćdžđefghijklmnoprsštuvzABCČĆDŽĐEFGHIJKLMNOPRSŠTUVZ‐–—,;:!?.…\'‘’‚\\\\\\"“”„()[]@*/′″","Hungarian":"aábcsdzeéfgyhiíjklmnoóöőprtuúüűvAÁBCSDZEÉFGYHIÍJKLMNOÓÖŐPRTUÚÜŰV-–,;:!?.…\'’\\\\\\"”„«»()[]{}⟨⟩§@*/&#~⁒","Armenian":"աբգդեզէըթժիլխծկհձղճմյնշոչպջռսվտրցւփքևօֆԱԲԳԴԵԶԷԸԹԺԻԼԽԾԿՀՁՂՃՄՅՆՇՈՉՊՋՌՍՎՏՐՑՒՓՔԵՒՕՖ֊,՝:՜՞.«»՚՛՟","Indonesian":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ‐–—,;:!?.…\'‘’“”()[]/","Icelandic":"aábdðeéfghiíjklmnoóprstuúvxyýþæöAÁBDÐEÉFGHIÍJKLMNOÓPRSTUÚVXYÝÞÆÖ-‐–—,;:!?.…\'‘‚\\\\\\"“„()[]§@*/&#†‡′″","Italian":"aàbcdeéèfghiìjklmnoóòpqrstuùvwxyzAÀBCDEÉÈFGHIÌJKLMNOÓÒPQRSTUÙVWXYZ-—,;:!?.…\'’\\\\\\"“”«»()[]{}@/","Japanese":"々ゝヽゞヾーぁァあアぃィいイぅゥうウヴぇェえエぉォおオヵかカがガきキぎギくクぐグヶけケげゲこコごゴさサざザしシじジすスずズせセぜゼそソぞゾたタだダちチぢヂっッつツづヅてテでデとトどドなナにニぬヌねネのノはハばバぱパひヒびビぴピふフぶブぷプへヘべベぺペほホぼボぽポまマみミむムめメもモゃャやヤゅュゆユょョよヨらラりリるルれレろロゎヮわワゐヰゑヱをヲんン一丁七万丈三上下不与丑且世丘丙両並中丸丹主久乏乗乙九乱乳乾亀了予争事二互五井亜亡交亥亨享京亭人仁今介仏仕他付仙代令以仮仰仲件任企伊伏伐休会伝伯伴伸伺似但位低住佐体何余作佳併使例侍供依価侮侯侵便係促俊俗保信修俳俵俸俺倉個倍倒候借倣値倫倹偉偏停健側偵偶偽傍傑傘備催債傷傾働像僕僚僧儀億儒償優元兄充兆先光克免兎児党入全八公六共兵具典兼内円冊再冒冗写冠冬冷准凍凝凡処凶凸凹出刀刃分切刈刊刑列初判別利到制刷券刺刻則削前剖剛剣剤副剰割創劇力功加劣助努励労効劾勅勇勉動勘務勝募勢勤勧勲勺匁包化北匠匹区医匿十千升午半卑卒卓協南単博占卯印危即却卵卸厄厘厚原厳去参又及友双反収叔取受叙口古句叫召可台史右号司各合吉同名后吏吐向君吟否含吸吹呈呉告周味呼命和咲哀品員哲唆唇唐唯唱商問啓善喚喜喝喪喫営嗣嘆嘉嘱器噴嚇囚四回因団困囲図固国圏園土圧在地坂均坊坑坪垂型垣埋城域執培基埼堀堂堅堕堤堪報場塀塁塊塑塔塗塚塩塾境墓増墜墨墳墾壁壇壊壌士壬壮声壱売変夏夕外多夜夢大天太夫央失奇奈奉奏契奔奥奨奪奮女奴好如妃妄妊妙妥妨妹妻姉始姓委姫姻姿威娘娠娯婆婚婦婿媒嫁嫌嫡嬢子孔字存孝季孤学孫宅宇守安完宗官宙定宜宝実客宣室宮宰害宴宵家容宿寂寄寅密富寒寛寝察寡寧審寮寸寺対寿封専射将尉尊尋導小少尚就尺尼尽尾尿局居屈届屋展属層履屯山岐岡岩岬岳岸峠峡峰島崇崎崩川州巡巣工左巧巨差己巳巻市布帆希帝帥師席帯帰帳常帽幅幕幣干平年幸幹幻幼幽幾庁広床序底店庚府度座庫庭庶康庸廃廉廊延廷建弁弊式弐弓弔引弘弟弦弧弱張強弾当形彩彫彰影役彼往征径待律後徐徒従得御復循微徳徴徹心必忌忍志忘忙応忠快念怒怖思怠急性怪恋恐恒恥恨恩恭息恵悔悟悠患悦悩悪悲悼情惑惜惨惰想愁愉意愚愛感慈態慌慎慕慢慣慨慮慰慶憂憎憤憩憲憶憾懇懐懲懸戊戌成我戒戦戯戸戻房所扇扉手才打払扱扶批承技抄把抑投抗折抜択披抱抵抹押抽担拍拐拒拓拘拙招拝拠拡括拷拾持指挑挙挟振挿捕捜捨据掃授掌排掘掛採探接控推措掲描提揚換握揮援揺損搬搭携搾摂摘摩撃撤撮撲擁操擦擬支改攻放政故敏救敗教敢散敬数整敵敷文斉斎斗料斜斤斥断新方施旅旋族旗既日旧旨早旬昆昇昌明易昔星映春昨昭是昼時晩普景晴晶暁暇暑暖暗暦暫暮暴曇曜曲更書曹替最月有服朕朗望朝期木未末本札朱朴机朽杉材村束条来杯東松板析林枚果枝枠枢枯架柄某染柔柱柳査栄栓校株核根格栽桃案桑桜桟梅械棄棋棒棚棟森棺植検業極楼楽概構様槽標模権横樹橋機欄欠次欧欲欺款歌歓止正武歩歯歳歴死殉殊残殖殴段殺殻殿母毎毒比毛氏民気水氷永汁求汎汗汚江池決汽沈沖没沢河沸油治沼沿況泉泊泌法泡波泣泥注泰泳洋洗洞津洪活派流浄浅浜浦浪浮浴海浸消涙涯液涼淑淡深混添清渇済渉渋渓減渡渦温測港湖湯湾湿満源準溝溶滅滋滑滝滞滴漁漂漆漏演漠漢漫漬漸潔潜潟潤潮澄激濁濃濫濯瀬火灯灰災炉炊炎炭点為烈無焦然焼煙照煩煮熟熱燃燥爆爵父片版牙牛牧物牲特犠犬犯状狂狩独狭猛猟猪猫献猶猿獄獣獲玄率玉王珍珠班現球理琴環璽瓶甘甚生産用田由甲申男町画界畑畔留畜畝略番異畳疎疑疫疲疾病症痘痛痢痴療癒癖癸発登白百的皆皇皮皿盆益盗盛盟監盤目盲直相盾省看県真眠眺眼着睡督瞬矛矢知短矯石砂研砕砲破硝硫硬碁碑確磁磨礁礎示礼社祈祉祖祚祝神祥票祭禁禄禅禍禎福秀私秋科秒秘租秩称移程税稚種稲稼稿穀穂積穏穫穴究空突窃窒窓窮窯立竜章童端競竹笑笛符第筆等筋筒答策箇算管箱節範築篤簡簿籍米粉粋粒粗粘粛粧精糖糧糸系糾紀約紅紋納純紙級紛素紡索紫累細紳紹紺終組経結絞絡給統絵絶絹継続維綱網綿緊総緑緒線締編緩緯練縁縄縛縦縫縮績繁繊織繕繭繰缶罪置罰署罷羅羊美群義羽翁翌習翻翼老考者耐耕耗耳聖聞聴職肉肌肖肝肢肥肩肪肯育肺胃胆背胎胞胴胸能脂脅脈脚脱脳脹腐腕腰腸腹膚膜膨臓臣臨自臭至致興舌舎舗舞舟航般舶船艇艦良色芋芝花芳芸芽苗若苦英茂茎茶草荒荘荷菊菌菓菜華落葉著葬蒸蓄蔵薄薦薪薫薬藤藩藻虎虐虚虜虞虫蚊蚕蛇蛍蛮融血衆行術街衛衝衡衣表衰衷袋被裁裂装裏裕補裸製複褐褒襟襲西要覆覇見規視覚覧親観角解触言訂計討訓託記訟訪設許訳訴診証詐詔評詞詠試詩詰話該詳誇誉誌認誓誕誘語誠誤説読誰課調談請論諭諮諸諾謀謁謄謙講謝謡謹識譜警議譲護谷豆豊豚象豪貝貞負財貢貧貨販貫責貯貴買貸費貿賀賃賄資賊賓賛賜賞賠賢賦質購贈赤赦走赴起超越趣足距跡路跳践踊踏躍身車軌軍軒軟転軸軽較載輝輩輪輸轄辛辞辰辱農辺込迅迎近返迫迭述迷追退送逃逆透逐逓途通逝速造連逮週進逸遂遅遇遊運遍過道達違遠遣適遭遮遵遷選遺避還邦邪邸郊郎郡部郭郵郷都酉酌配酒酔酢酪酬酵酷酸醜醸釈里重野量金針釣鈍鈴鉄鉛鉢鉱銀銃銅銑銘銭鋭鋳鋼錘錠錬錯録鍛鎖鎮鏡鐘鑑長門閉開閏閑間関閣閥閲闘阪防阻附降限陛院陣除陥陪陰陳陵陶陸険陽隅隆隊階随隔際障隠隣隷隻雄雅集雇雉雌雑離難雨雪雰雲零雷電需震霊霜霧露青静非面革靴韓音韻響頂頃項順預頑頒領頭頻頼題額顔顕願類顧風飛食飢飯飲飼飽飾養餓館首香馬駄駅駆駐騎騒験騰驚骨髄高髪鬼魂魅魔魚鮮鯨鳥鳴鶏鹿麗麦麻黄黒黙鼓鼠鼻齢‾_＿-－‐—―〜・･,，、､;；:：!！?？.．‥…。｡＇‘’\\\\\\"＂“”(（)）[［]］{｛}｝〈〉《》「｢」｣『』【】〔〕‖§¶@＠*＊/／\\\\\\\\＼&＆#＃%％‰†‡′″〃※","Georgian":"აბგდევზთიკლმნოპჟრსტუფქღყშჩცძწჭხჯჰ-‐–—,;:!?.…჻\'‘‚“„«»()[]{}§@*/&#†‡′″№","Kazakh":"аәбвгғдеёжзийкқлмнңоөпрстуұүфхһцчшщъыіьэюяАӘБВГҒДЕЁЖЗИЙКҚЛМНҢОӨПРСТУҰҮФХҺЦЧШЩЪЫІЬЭЮЯ-‐–—,;:!?.…\'‘’\\\\\\"“”«»()[]{}§@*/&#","Khmer":"័ៈ់៉៊៍កខគឃងចឆជឈញដឋឌឍណតថទធនបផពភមយរឫឬលឭឮវសហឡអាឥឦឧឩឪឯឰឱឲឳិីឹឺុូួើឿៀេែៃោៅំះ្-,៖!?.។៕‘’\\\\\\"“”()[]{}៙៚","Kannada":"಼೦೧೨೩೪೫೬೭೮೯ಅಆಇಈಉಊಋೠಌೡಎಏಐಒಓಔಂಃಕಖಗಘಙಚಛಜಝಞಟಠಡಢಣತಥದಧನಪಫಬಭಮಯರಱಲವಶಷಸಹಳಽಾಿೀುೂೃೄೆೇೈೊೋೌ್ೕೖ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]@*/&#′″","Korean":"가각갂갃간갅갆갇갈갉갊갋갌갍갎갏감갑값갓갔강갖갗갘같갚갛개객갞갟갠갡갢갣갤갥갦갧갨갩갪갫갬갭갮갯갰갱갲갳갴갵갶갷갸갹갺갻갼갽갾갿걀걁걂걃걄걅걆걇걈걉걊걋걌걍걎걏걐걑걒걓걔걕걖걗걘걙걚걛걜걝걞걟걠걡걢걣걤걥걦걧걨걩걪걫걬걭걮걯거걱걲걳건걵걶걷걸걹걺걻걼걽걾걿검겁겂것겄겅겆겇겈겉겊겋게겍겎겏겐겑겒겓겔겕겖겗겘겙겚겛겜겝겞겟겠겡겢겣겤겥겦겧겨격겪겫견겭겮겯결겱겲겳겴겵겶겷겸겹겺겻겼경겾겿곀곁곂곃계곅곆곇곈곉곊곋곌곍곎곏곐곑곒곓곔곕곖곗곘곙곚곛곜곝곞곟고곡곢곣곤곥곦곧골곩곪곫곬곭곮곯곰곱곲곳곴공곶곷곸곹곺곻과곽곾곿관괁괂괃괄괅괆괇괈괉괊괋괌괍괎괏괐광괒괓괔괕괖괗괘괙괚괛괜괝괞괟괠괡괢괣괤괥괦괧괨괩괪괫괬괭괮괯괰괱괲괳괴괵괶괷괸괹괺괻괼괽괾괿굀굁굂굃굄굅굆굇굈굉굊굋굌굍굎굏교굑굒굓굔굕굖굗굘굙굚굛굜굝굞굟굠굡굢굣굤굥굦굧굨굩굪굫구국굮굯군굱굲굳굴굵굶굷굸굹굺굻굼굽굾굿궀궁궂궃궄궅궆궇궈궉궊궋권궍궎궏궐궑궒궓궔궕궖궗궘궙궚궛궜궝궞궟궠궡궢궣궤궥궦궧궨궩궪궫궬궭궮궯궰궱궲궳궴궵궶궷궸궹궺궻궼궽궾궿귀귁귂귃귄귅귆귇귈귉귊귋귌귍귎귏귐귑귒귓귔귕귖귗귘귙귚귛규귝귞귟균귡귢귣귤귥귦귧귨귩귪귫귬귭귮귯귰귱귲귳귴귵귶귷그극귺귻근귽귾귿글긁긂긃긄긅긆긇금급긊긋긌긍긎긏긐긑긒긓긔긕긖긗긘긙긚긛긜긝긞긟긠긡긢긣긤긥긦긧긨긩긪긫긬긭긮긯기긱긲긳긴긵긶긷길긹긺긻긼긽긾긿김깁깂깃깄깅깆깇깈깉깊깋까깍깎깏깐깑깒깓깔깕깖깗깘깙깚깛깜깝깞깟깠깡깢깣깤깥깦깧깨깩깪깫깬깭깮깯깰깱깲깳깴깵깶깷깸깹깺깻깼깽깾깿꺀꺁꺂꺃꺄꺅꺆꺇꺈꺉꺊꺋꺌꺍꺎꺏꺐꺑꺒꺓꺔꺕꺖꺗꺘꺙꺚꺛꺜꺝꺞꺟꺠꺡꺢꺣꺤꺥꺦꺧꺨꺩꺪꺫꺬꺭꺮꺯꺰꺱꺲꺳꺴꺵꺶꺷꺸꺹꺺꺻꺼꺽꺾꺿껀껁껂껃껄껅껆껇껈껉껊껋껌껍껎껏껐껑껒껓껔껕껖껗께껙껚껛껜껝껞껟껠껡껢껣껤껥껦껧껨껩껪껫껬껭껮껯껰껱껲껳껴껵껶껷껸껹껺껻껼껽껾껿꼀꼁꼂꼃꼄꼅꼆꼇꼈꼉꼊꼋꼌꼍꼎꼏꼐꼑꼒꼓꼔꼕꼖꼗꼘꼙꼚꼛꼜꼝꼞꼟꼠꼡꼢꼣꼤꼥꼦꼧꼨꼩꼪꼫꼬꼭꼮꼯꼰꼱꼲꼳꼴꼵꼶꼷꼸꼹꼺꼻꼼꼽꼾꼿꽀꽁꽂꽃꽄꽅꽆꽇꽈꽉꽊꽋꽌꽍꽎꽏꽐꽑꽒꽓꽔꽕꽖꽗꽘꽙꽚꽛꽜꽝꽞꽟꽠꽡꽢꽣꽤꽥꽦꽧꽨꽩꽪꽫꽬꽭꽮꽯꽰꽱꽲꽳꽴꽵꽶꽷꽸꽹꽺꽻꽼꽽꽾꽿꾀꾁꾂꾃꾄꾅꾆꾇꾈꾉꾊꾋꾌꾍꾎꾏꾐꾑꾒꾓꾔꾕꾖꾗꾘꾙꾚꾛꾜꾝꾞꾟꾠꾡꾢꾣꾤꾥꾦꾧꾨꾩꾪꾫꾬꾭꾮꾯꾰꾱꾲꾳꾴꾵꾶꾷꾸꾹꾺꾻꾼꾽꾾꾿꿀꿁꿂꿃꿄꿅꿆꿇꿈꿉꿊꿋꿌꿍꿎꿏꿐꿑꿒꿓꿔꿕꿖꿗꿘꿙꿚꿛꿜꿝꿞꿟꿠꿡꿢꿣꿤꿥꿦꿧꿨꿩꿪꿫꿬꿭꿮꿯꿰꿱꿲꿳꿴꿵꿶꿷꿸꿹꿺꿻꿼꿽꿾꿿뀀뀁뀂뀃뀄뀅뀆뀇뀈뀉뀊뀋뀌뀍뀎뀏뀐뀑뀒뀓뀔뀕뀖뀗뀘뀙뀚뀛뀜뀝뀞뀟뀠뀡뀢뀣뀤뀥뀦뀧뀨뀩뀪뀫뀬뀭뀮뀯뀰뀱뀲뀳뀴뀵뀶뀷뀸뀹뀺뀻뀼뀽뀾뀿끀끁끂끃끄끅끆끇끈끉끊끋끌끍끎끏끐끑끒끓끔끕끖끗끘끙끚끛끜끝끞끟끠끡끢끣끤끥끦끧끨끩끪끫끬끭끮끯끰끱끲끳끴끵끶끷끸끹끺끻끼끽끾끿낀낁낂낃낄낅낆낇낈낉낊낋낌낍낎낏낐낑낒낓낔낕낖낗나낙낚낛난낝낞낟날낡낢낣낤낥낦낧남납낪낫났낭낮낯낰낱낲낳내낵낶낷낸낹낺낻낼낽낾낿냀냁냂냃냄냅냆냇냈냉냊냋냌냍냎냏냐냑냒냓냔냕냖냗냘냙냚냛냜냝냞냟냠냡냢냣냤냥냦냧냨냩냪냫냬냭냮냯냰냱냲냳냴냵냶냷냸냹냺냻냼냽냾냿넀넁넂넃넄넅넆넇너넉넊넋넌넍넎넏널넑넒넓넔넕넖넗넘넙넚넛넜넝넞넟넠넡넢넣네넥넦넧넨넩넪넫넬넭넮넯넰넱넲넳넴넵넶넷넸넹넺넻넼넽넾넿녀녁녂녃년녅녆녇녈녉녊녋녌녍녎녏념녑녒녓녔녕녖녗녘녙녚녛녜녝녞녟녠녡녢녣녤녥녦녧녨녩녪녫녬녭녮녯녰녱녲녳녴녵녶녷노녹녺녻논녽녾녿놀놁놂놃놄놅놆놇놈놉놊놋놌농놎놏놐놑높놓놔놕놖놗놘놙놚놛놜놝놞놟놠놡놢놣놤놥놦놧놨놩놪놫놬놭놮놯놰놱놲놳놴놵놶놷놸놹놺놻놼놽놾놿뇀뇁뇂뇃뇄뇅뇆뇇뇈뇉뇊뇋뇌뇍뇎뇏뇐뇑뇒뇓뇔뇕뇖뇗뇘뇙뇚뇛뇜뇝뇞뇟뇠뇡뇢뇣뇤뇥뇦뇧뇨뇩뇪뇫뇬뇭뇮뇯뇰뇱뇲뇳뇴뇵뇶뇷뇸뇹뇺뇻뇼뇽뇾뇿눀눁눂눃누눅눆눇눈눉눊눋눌눍눎눏눐눑눒눓눔눕눖눗눘눙눚눛눜눝눞눟눠눡눢눣눤눥눦눧눨눩눪눫눬눭눮눯눰눱눲눳눴눵눶눷눸눹눺눻눼눽눾눿뉀뉁뉂뉃뉄뉅뉆뉇뉈뉉뉊뉋뉌뉍뉎뉏뉐뉑뉒뉓뉔뉕뉖뉗뉘뉙뉚뉛뉜뉝뉞뉟뉠뉡뉢뉣뉤뉥뉦뉧뉨뉩뉪뉫뉬뉭뉮뉯뉰뉱뉲뉳뉴뉵뉶뉷뉸뉹뉺뉻뉼뉽뉾뉿늀늁늂늃늄늅늆늇늈늉늊늋늌늍늎늏느늑늒늓는늕늖늗늘늙늚늛늜늝늞늟늠늡늢늣늤능늦늧늨늩늪늫늬늭늮늯늰늱늲늳늴늵늶늷늸늹늺늻늼늽늾늿닀닁닂닃닄닅닆닇니닉닊닋닌닍닎닏닐닑닒닓닔닕닖닗님닙닚닛닜닝닞닟닠닡닢닣다닥닦닧단닩닪닫달닭닮닯닰닱닲닳담답닶닷닸당닺닻닼닽닾닿대댁댂댃댄댅댆댇댈댉댊댋댌댍댎댏댐댑댒댓댔댕댖댗댘댙댚댛댜댝댞댟댠댡댢댣댤댥댦댧댨댩댪댫댬댭댮댯댰댱댲댳댴댵댶댷댸댹댺댻댼댽댾댿덀덁덂덃덄덅덆덇덈덉덊덋덌덍덎덏덐덑덒덓더덕덖덗던덙덚덛덜덝덞덟덠덡덢덣덤덥덦덧덨덩덪덫덬덭덮덯데덱덲덳덴덵덶덷델덹덺덻덼덽덾덿뎀뎁뎂뎃뎄뎅뎆뎇뎈뎉뎊뎋뎌뎍뎎뎏뎐뎑뎒뎓뎔뎕뎖뎗뎘뎙뎚뎛뎜뎝뎞뎟뎠뎡뎢뎣뎤뎥뎦뎧뎨뎩뎪뎫뎬뎭뎮뎯뎰뎱뎲뎳뎴뎵뎶뎷뎸뎹뎺뎻뎼뎽뎾뎿돀돁돂돃도독돆돇돈돉돊돋돌돍돎돏돐돑돒돓돔돕돖돗돘동돚돛돜돝돞돟돠돡돢돣돤돥돦돧돨돩돪돫돬돭돮돯돰돱돲돳돴돵돶돷돸돹돺돻돼돽돾돿됀됁됂됃됄됅됆됇됈됉됊됋됌됍됎됏됐됑됒됓됔됕됖됗되됙됚됛된됝됞됟될됡됢됣됤됥됦됧됨됩됪됫됬됭됮됯됰됱됲됳됴됵됶됷됸됹됺됻됼됽됾됿둀둁둂둃둄둅둆둇둈둉둊둋둌둍둎둏두둑둒둓둔둕둖둗둘둙둚둛둜둝둞둟둠둡둢둣둤둥둦둧둨둩둪둫둬둭둮둯둰둱둲둳둴둵둶둷둸둹둺둻둼둽둾둿뒀뒁뒂뒃뒄뒅뒆뒇뒈뒉뒊뒋뒌뒍뒎뒏뒐뒑뒒뒓뒔뒕뒖뒗뒘뒙뒚뒛뒜뒝뒞뒟뒠뒡뒢뒣뒤뒥뒦뒧뒨뒩뒪뒫뒬뒭뒮뒯뒰뒱뒲뒳뒴뒵뒶뒷뒸뒹뒺뒻뒼뒽뒾뒿듀듁듂듃듄듅듆듇듈듉듊듋듌듍듎듏듐듑듒듓듔듕듖듗듘듙듚듛드득듞듟든듡듢듣들듥듦듧듨듩듪듫듬듭듮듯듰등듲듳듴듵듶듷듸듹듺듻듼듽듾듿딀딁딂딃딄딅딆딇딈딉딊딋딌딍딎딏딐딑딒딓디딕딖딗딘딙딚딛딜딝딞딟딠딡딢딣딤딥딦딧딨딩딪딫딬딭딮딯따딱딲딳딴딵딶딷딸딹딺딻딼딽딾딿땀땁땂땃땄땅땆땇땈땉땊땋때땍땎땏땐땑땒땓땔땕땖땗땘땙땚땛땜땝땞땟땠땡땢땣땤땥땦땧땨땩땪땫땬땭땮땯땰땱땲땳땴땵땶땷땸땹땺땻땼땽땾땿떀떁떂떃떄떅떆떇떈떉떊떋떌떍떎떏떐떑떒떓떔떕떖떗떘떙떚떛떜떝떞떟떠떡떢떣떤떥떦떧떨떩떪떫떬떭떮떯떰떱떲떳떴떵떶떷떸떹떺떻떼떽떾떿뗀뗁뗂뗃뗄뗅뗆뗇뗈뗉뗊뗋뗌뗍뗎뗏뗐뗑뗒뗓뗔뗕뗖뗗뗘뗙뗚뗛뗜뗝뗞뗟뗠뗡뗢뗣뗤뗥뗦뗧뗨뗩뗪뗫뗬뗭뗮뗯뗰뗱뗲뗳뗴뗵뗶뗷뗸뗹뗺뗻뗼뗽뗾뗿똀똁똂똃똄똅똆똇똈똉똊똋똌똍똎똏또똑똒똓똔똕똖똗똘똙똚똛똜똝똞똟똠똡똢똣똤똥똦똧똨똩똪똫똬똭똮똯똰똱똲똳똴똵똶똷똸똹똺똻똼똽똾똿뙀뙁뙂뙃뙄뙅뙆뙇뙈뙉뙊뙋뙌뙍뙎뙏뙐뙑뙒뙓뙔뙕뙖뙗뙘뙙뙚뙛뙜뙝뙞뙟뙠뙡뙢뙣뙤뙥뙦뙧뙨뙩뙪뙫뙬뙭뙮뙯뙰뙱뙲뙳뙴뙵뙶뙷뙸뙹뙺뙻뙼뙽뙾뙿뚀뚁뚂뚃뚄뚅뚆뚇뚈뚉뚊뚋뚌뚍뚎뚏뚐뚑뚒뚓뚔뚕뚖뚗뚘뚙뚚뚛뚜뚝뚞뚟뚠뚡뚢뚣뚤뚥뚦뚧뚨뚩뚪뚫뚬뚭뚮뚯뚰뚱뚲뚳뚴뚵뚶뚷뚸뚹뚺뚻뚼뚽뚾뚿뛀뛁뛂뛃뛄뛅뛆뛇뛈뛉뛊뛋뛌뛍뛎뛏뛐뛑뛒뛓뛔뛕뛖뛗뛘뛙뛚뛛뛜뛝뛞뛟뛠뛡뛢뛣뛤뛥뛦뛧뛨뛩뛪뛫뛬뛭뛮뛯뛰뛱뛲뛳뛴뛵뛶뛷뛸뛹뛺뛻뛼뛽뛾뛿뜀뜁뜂뜃뜄뜅뜆뜇뜈뜉뜊뜋뜌뜍뜎뜏뜐뜑뜒뜓뜔뜕뜖뜗뜘뜙뜚뜛뜜뜝뜞뜟뜠뜡뜢뜣뜤뜥뜦뜧뜨뜩뜪뜫뜬뜭뜮뜯뜰뜱뜲뜳뜴뜵뜶뜷뜸뜹뜺뜻뜼뜽뜾뜿띀띁띂띃띄띅띆띇띈띉띊띋띌띍띎띏띐띑띒띓띔띕띖띗띘띙띚띛띜띝띞띟띠띡띢띣띤띥띦띧띨띩띪띫띬띭띮띯띰띱띲띳띴띵띶띷띸띹띺띻라락띾띿란랁랂랃랄랅랆랇랈랉랊랋람랍랎랏랐랑랒랓랔랕랖랗래랙랚랛랜랝랞랟랠랡랢랣랤랥랦랧램랩랪랫랬랭랮랯랰랱랲랳랴략랶랷랸랹랺랻랼랽랾랿럀럁럂럃럄럅럆럇럈량럊럋럌럍럎럏럐럑럒럓럔럕럖럗럘럙럚럛럜럝럞럟럠럡럢럣럤럥럦럧럨럩럪럫러럭럮럯런럱럲럳럴럵럶럷럸럹럺럻럼럽럾럿렀렁렂렃렄렅렆렇레렉렊렋렌렍렎렏렐렑렒렓렔렕렖렗렘렙렚렛렜렝렞렟렠렡렢렣려력렦렧련렩렪렫렬렭렮렯렰렱렲렳렴렵렶렷렸령렺렻렼렽렾렿례롁롂롃롄롅롆롇롈롉롊롋롌롍롎롏롐롑롒롓롔롕롖롗롘롙롚롛로록롞롟론롡롢롣롤롥롦롧롨롩롪롫롬롭롮롯롰롱롲롳롴롵롶롷롸롹롺롻롼롽롾롿뢀뢁뢂뢃뢄뢅뢆뢇뢈뢉뢊뢋뢌뢍뢎뢏뢐뢑뢒뢓뢔뢕뢖뢗뢘뢙뢚뢛뢜뢝뢞뢟뢠뢡뢢뢣뢤뢥뢦뢧뢨뢩뢪뢫뢬뢭뢮뢯뢰뢱뢲뢳뢴뢵뢶뢷뢸뢹뢺뢻뢼뢽뢾뢿룀룁룂룃룄룅룆룇룈룉룊룋료룍룎룏룐룑룒룓룔룕룖룗룘룙룚룛룜룝룞룟룠룡룢룣룤룥룦룧루룩룪룫룬룭룮룯룰룱룲룳룴룵룶룷룸룹룺룻룼룽룾룿뤀뤁뤂뤃뤄뤅뤆뤇뤈뤉뤊뤋뤌뤍뤎뤏뤐뤑뤒뤓뤔뤕뤖뤗뤘뤙뤚뤛뤜뤝뤞뤟뤠뤡뤢뤣뤤뤥뤦뤧뤨뤩뤪뤫뤬뤭뤮뤯뤰뤱뤲뤳뤴뤵뤶뤷뤸뤹뤺뤻뤼뤽뤾뤿륀륁륂륃륄륅륆륇륈륉륊륋륌륍륎륏륐륑륒륓륔륕륖륗류륙륚륛륜륝륞륟률륡륢륣륤륥륦륧륨륩륪륫륬륭륮륯륰륱륲륳르륵륶륷른륹륺륻를륽륾륿릀릁릂릃름릅릆릇릈릉릊릋릌릍릎릏릐릑릒릓릔릕릖릗릘릙릚릛릜릝릞릟릠릡릢릣릤릥릦릧릨릩릪릫리릭릮릯린릱릲릳릴릵릶릷릸릹릺릻림립릾릿맀링맂맃맄맅맆맇마막맊맋만맍많맏말맑맒맓맔맕맖맗맘맙맚맛맜망맞맟맠맡맢맣매맥맦맧맨맩맪맫맬맭맮맯맰맱맲맳맴맵맶맷맸맹맺맻맼맽맾맿먀먁먂먃먄먅먆먇먈먉먊먋먌먍먎먏먐먑먒먓먔먕먖먗먘먙먚먛먜먝먞먟먠먡먢먣먤먥먦먧먨먩먪먫먬먭먮먯먰먱먲먳먴먵먶먷머먹먺먻먼먽먾먿멀멁멂멃멄멅멆멇멈멉멊멋멌멍멎멏멐멑멒멓메멕멖멗멘멙멚멛멜멝멞멟멠멡멢멣멤멥멦멧멨멩멪멫멬멭멮멯며멱멲멳면멵멶멷멸멹멺멻멼멽멾멿몀몁몂몃몄명몆몇몈몉몊몋몌몍몎몏몐몑몒몓몔몕몖몗몘몙몚몛몜몝몞몟몠몡몢몣몤몥몦몧모목몪몫몬몭몮몯몰몱몲몳몴몵몶몷몸몹몺못몼몽몾몿뫀뫁뫂뫃뫄뫅뫆뫇뫈뫉뫊뫋뫌뫍뫎뫏뫐뫑뫒뫓뫔뫕뫖뫗뫘뫙뫚뫛뫜뫝뫞뫟뫠뫡뫢뫣뫤뫥뫦뫧뫨뫩뫪뫫뫬뫭뫮뫯뫰뫱뫲뫳뫴뫵뫶뫷뫸뫹뫺뫻뫼뫽뫾뫿묀묁묂묃묄묅묆묇묈묉묊묋묌묍묎묏묐묑묒묓묔묕묖묗묘묙묚묛묜묝묞묟묠묡묢묣묤묥묦묧묨묩묪묫묬묭묮묯묰묱묲묳무묵묶묷문묹묺묻물묽묾묿뭀뭁뭂뭃뭄뭅뭆뭇뭈뭉뭊뭋뭌뭍뭎뭏뭐뭑뭒뭓뭔뭕뭖뭗뭘뭙뭚뭛뭜뭝뭞뭟뭠뭡뭢뭣뭤뭥뭦뭧뭨뭩뭪뭫뭬뭭뭮뭯뭰뭱뭲뭳뭴뭵뭶뭷뭸뭹뭺뭻뭼뭽뭾뭿뮀뮁뮂뮃뮄뮅뮆뮇뮈뮉뮊뮋뮌뮍뮎뮏뮐뮑뮒뮓뮔뮕뮖뮗뮘뮙뮚뮛뮜뮝뮞뮟뮠뮡뮢뮣뮤뮥뮦뮧뮨뮩뮪뮫뮬뮭뮮뮯뮰뮱뮲뮳뮴뮵뮶뮷뮸뮹뮺뮻뮼뮽뮾뮿므믁믂믃믄믅믆믇믈믉믊믋믌믍믎믏믐믑믒믓믔믕믖믗믘믙믚믛믜믝믞믟믠믡믢믣믤믥믦믧믨믩믪믫믬믭믮믯믰믱믲믳믴믵믶믷미믹믺믻민믽믾믿밀밁밂밃밄밅밆밇밈밉밊밋밌밍밎및밐밑밒밓바박밖밗반밙밚받발밝밞밟밠밡밢밣밤밥밦밧밨방밪밫밬밭밮밯배백밲밳밴밵밶밷밸밹밺밻밼밽밾밿뱀뱁뱂뱃뱄뱅뱆뱇뱈뱉뱊뱋뱌뱍뱎뱏뱐뱑뱒뱓뱔뱕뱖뱗뱘뱙뱚뱛뱜뱝뱞뱟뱠뱡뱢뱣뱤뱥뱦뱧뱨뱩뱪뱫뱬뱭뱮뱯뱰뱱뱲뱳뱴뱵뱶뱷뱸뱹뱺뱻뱼뱽뱾뱿벀벁벂벃버벅벆벇번벉벊벋벌벍벎벏벐벑벒벓범법벖벗벘벙벚벛벜벝벞벟베벡벢벣벤벥벦벧벨벩벪벫벬벭벮벯벰벱벲벳벴벵벶벷벸벹벺벻벼벽벾벿변볁볂볃별볅볆볇볈볉볊볋볌볍볎볏볐병볒볓볔볕볖볗볘볙볚볛볜볝볞볟볠볡볢볣볤볥볦볧볨볩볪볫볬볭볮볯볰볱볲볳보복볶볷본볹볺볻볼볽볾볿봀봁봂봃봄봅봆봇봈봉봊봋봌봍봎봏봐봑봒봓봔봕봖봗봘봙봚봛봜봝봞봟봠봡봢봣봤봥봦봧봨봩봪봫봬봭봮봯봰봱봲봳봴봵봶봷봸봹봺봻봼봽봾봿뵀뵁뵂뵃뵄뵅뵆뵇뵈뵉뵊뵋뵌뵍뵎뵏뵐뵑뵒뵓뵔뵕뵖뵗뵘뵙뵚뵛뵜뵝뵞뵟뵠뵡뵢뵣뵤뵥뵦뵧뵨뵩뵪뵫뵬뵭뵮뵯뵰뵱뵲뵳뵴뵵뵶뵷뵸뵹뵺뵻뵼뵽뵾뵿부북붂붃분붅붆붇불붉붊붋붌붍붎붏붐붑붒붓붔붕붖붗붘붙붚붛붜붝붞붟붠붡붢붣붤붥붦붧붨붩붪붫붬붭붮붯붰붱붲붳붴붵붶붷붸붹붺붻붼붽붾붿뷀뷁뷂뷃뷄뷅뷆뷇뷈뷉뷊뷋뷌뷍뷎뷏뷐뷑뷒뷓뷔뷕뷖뷗뷘뷙뷚뷛뷜뷝뷞뷟뷠뷡뷢뷣뷤뷥뷦뷧뷨뷩뷪뷫뷬뷭뷮뷯뷰뷱뷲뷳뷴뷵뷶뷷뷸뷹뷺뷻뷼뷽뷾뷿븀븁븂븃븄븅븆븇븈븉븊븋브븍븎븏븐븑븒븓블븕븖븗븘븙븚븛븜븝븞븟븠븡븢븣븤븥븦븧븨븩븪븫븬븭븮븯븰븱븲븳븴븵븶븷븸븹븺븻븼븽븾븿빀빁빂빃비빅빆빇빈빉빊빋빌빍빎빏빐빑빒빓빔빕빖빗빘빙빚빛빜빝빞빟빠빡빢빣빤빥빦빧빨빩빪빫빬빭빮빯빰빱빲빳빴빵빶빷빸빹빺빻빼빽빾빿뺀뺁뺂뺃뺄뺅뺆뺇뺈뺉뺊뺋뺌뺍뺎뺏뺐뺑뺒뺓뺔뺕뺖뺗뺘뺙뺚뺛뺜뺝뺞뺟뺠뺡뺢뺣뺤뺥뺦뺧뺨뺩뺪뺫뺬뺭뺮뺯뺰뺱뺲뺳뺴뺵뺶뺷뺸뺹뺺뺻뺼뺽뺾뺿뻀뻁뻂뻃뻄뻅뻆뻇뻈뻉뻊뻋뻌뻍뻎뻏뻐뻑뻒뻓뻔뻕뻖뻗뻘뻙뻚뻛뻜뻝뻞뻟뻠뻡뻢뻣뻤뻥뻦뻧뻨뻩뻪뻫뻬뻭뻮뻯뻰뻱뻲뻳뻴뻵뻶뻷뻸뻹뻺뻻뻼뻽뻾뻿뼀뼁뼂뼃뼄뼅뼆뼇뼈뼉뼊뼋뼌뼍뼎뼏뼐뼑뼒뼓뼔뼕뼖뼗뼘뼙뼚뼛뼜뼝뼞뼟뼠뼡뼢뼣뼤뼥뼦뼧뼨뼩뼪뼫뼬뼭뼮뼯뼰뼱뼲뼳뼴뼵뼶뼷뼸뼹뼺뼻뼼뼽뼾뼿뽀뽁뽂뽃뽄뽅뽆뽇뽈뽉뽊뽋뽌뽍뽎뽏뽐뽑뽒뽓뽔뽕뽖뽗뽘뽙뽚뽛뽜뽝뽞뽟뽠뽡뽢뽣뽤뽥뽦뽧뽨뽩뽪뽫뽬뽭뽮뽯뽰뽱뽲뽳뽴뽵뽶뽷뽸뽹뽺뽻뽼뽽뽾뽿뾀뾁뾂뾃뾄뾅뾆뾇뾈뾉뾊뾋뾌뾍뾎뾏뾐뾑뾒뾓뾔뾕뾖뾗뾘뾙뾚뾛뾜뾝뾞뾟뾠뾡뾢뾣뾤뾥뾦뾧뾨뾩뾪뾫뾬뾭뾮뾯뾰뾱뾲뾳뾴뾵뾶뾷뾸뾹뾺뾻뾼뾽뾾뾿뿀뿁뿂뿃뿄뿅뿆뿇뿈뿉뿊뿋뿌뿍뿎뿏뿐뿑뿒뿓뿔뿕뿖뿗뿘뿙뿚뿛뿜뿝뿞뿟뿠뿡뿢뿣뿤뿥뿦뿧뿨뿩뿪뿫뿬뿭뿮뿯뿰뿱뿲뿳뿴뿵뿶뿷뿸뿹뿺뿻뿼뿽뿾뿿쀀쀁쀂쀃쀄쀅쀆쀇쀈쀉쀊쀋쀌쀍쀎쀏쀐쀑쀒쀓쀔쀕쀖쀗쀘쀙쀚쀛쀜쀝쀞쀟쀠쀡쀢쀣쀤쀥쀦쀧쀨쀩쀪쀫쀬쀭쀮쀯쀰쀱쀲쀳쀴쀵쀶쀷쀸쀹쀺쀻쀼쀽쀾쀿쁀쁁쁂쁃쁄쁅쁆쁇쁈쁉쁊쁋쁌쁍쁎쁏쁐쁑쁒쁓쁔쁕쁖쁗쁘쁙쁚쁛쁜쁝쁞쁟쁠쁡쁢쁣쁤쁥쁦쁧쁨쁩쁪쁫쁬쁭쁮쁯쁰쁱쁲쁳쁴쁵쁶쁷쁸쁹쁺쁻쁼쁽쁾쁿삀삁삂삃삄삅삆삇삈삉삊삋삌삍삎삏삐삑삒삓삔삕삖삗삘삙삚삛삜삝삞삟삠삡삢삣삤삥삦삧삨삩삪삫사삭삮삯산삱삲삳살삵삶삷삸삹삺삻삼삽삾삿샀상샂샃샄샅샆샇새색샊샋샌샍샎샏샐샑샒샓샔샕샖샗샘샙샚샛샜생샞샟샠샡샢샣샤샥샦샧샨샩샪샫샬샭샮샯샰샱샲샳샴샵샶샷샸샹샺샻샼샽샾샿섀섁섂섃섄섅섆섇섈섉섊섋섌섍섎섏섐섑섒섓섔섕섖섗섘섙섚섛서석섞섟선섡섢섣설섥섦섧섨섩섪섫섬섭섮섯섰성섲섳섴섵섶섷세섹섺섻센섽섾섿셀셁셂셃셄셅셆셇셈셉셊셋셌셍셎셏셐셑셒셓셔셕셖셗션셙셚셛셜셝셞셟셠셡셢셣셤셥셦셧셨셩셪셫셬셭셮셯셰셱셲셳셴셵셶셷셸셹셺셻셼셽셾셿솀솁솂솃솄솅솆솇솈솉솊솋소속솎솏손솑솒솓솔솕솖솗솘솙솚솛솜솝솞솟솠송솢솣솤솥솦솧솨솩솪솫솬솭솮솯솰솱솲솳솴솵솶솷솸솹솺솻솼솽솾솿쇀쇁쇂쇃쇄쇅쇆쇇쇈쇉쇊쇋쇌쇍쇎쇏쇐쇑쇒쇓쇔쇕쇖쇗쇘쇙쇚쇛쇜쇝쇞쇟쇠쇡쇢쇣쇤쇥쇦쇧쇨쇩쇪쇫쇬쇭쇮쇯쇰쇱쇲쇳쇴쇵쇶쇷쇸쇹쇺쇻쇼쇽쇾쇿숀숁숂숃숄숅숆숇숈숉숊숋숌숍숎숏숐숑숒숓숔숕숖숗수숙숚숛순숝숞숟술숡숢숣숤숥숦숧숨숩숪숫숬숭숮숯숰숱숲숳숴숵숶숷숸숹숺숻숼숽숾숿쉀쉁쉂쉃쉄쉅쉆쉇쉈쉉쉊쉋쉌쉍쉎쉏쉐쉑쉒쉓쉔쉕쉖쉗쉘쉙쉚쉛쉜쉝쉞쉟쉠쉡쉢쉣쉤쉥쉦쉧쉨쉩쉪쉫쉬쉭쉮쉯쉰쉱쉲쉳쉴쉵쉶쉷쉸쉹쉺쉻쉼쉽쉾쉿슀슁슂슃슄슅슆슇슈슉슊슋슌슍슎슏슐슑슒슓슔슕슖슗슘슙슚슛슜슝슞슟슠슡슢슣스슥슦슧슨슩슪슫슬슭슮슯슰슱슲슳슴습슶슷슸승슺슻슼슽슾슿싀싁싂싃싄싅싆싇싈싉싊싋싌싍싎싏싐싑싒싓싔싕싖싗싘싙싚싛시식싞싟신싡싢싣실싥싦싧싨싩싪싫심십싮싯싰싱싲싳싴싵싶싷싸싹싺싻싼싽싾싿쌀쌁쌂쌃쌄쌅쌆쌇쌈쌉쌊쌋쌌쌍쌎쌏쌐쌑쌒쌓쌔쌕쌖쌗쌘쌙쌚쌛쌜쌝쌞쌟쌠쌡쌢쌣쌤쌥쌦쌧쌨쌩쌪쌫쌬쌭쌮쌯쌰쌱쌲쌳쌴쌵쌶쌷쌸쌹쌺쌻쌼쌽쌾쌿썀썁썂썃썄썅썆썇썈썉썊썋썌썍썎썏썐썑썒썓썔썕썖썗썘썙썚썛썜썝썞썟썠썡썢썣썤썥썦썧써썩썪썫썬썭썮썯썰썱썲썳썴썵썶썷썸썹썺썻썼썽썾썿쎀쎁쎂쎃쎄쎅쎆쎇쎈쎉쎊쎋쎌쎍쎎쎏쎐쎑쎒쎓쎔쎕쎖쎗쎘쎙쎚쎛쎜쎝쎞쎟쎠쎡쎢쎣쎤쎥쎦쎧쎨쎩쎪쎫쎬쎭쎮쎯쎰쎱쎲쎳쎴쎵쎶쎷쎸쎹쎺쎻쎼쎽쎾쎿쏀쏁쏂쏃쏄쏅쏆쏇쏈쏉쏊쏋쏌쏍쏎쏏쏐쏑쏒쏓쏔쏕쏖쏗쏘쏙쏚쏛쏜쏝쏞쏟쏠쏡쏢쏣쏤쏥쏦쏧쏨쏩쏪쏫쏬쏭쏮쏯쏰쏱쏲쏳쏴쏵쏶쏷쏸쏹쏺쏻쏼쏽쏾쏿쐀쐁쐂쐃쐄쐅쐆쐇쐈쐉쐊쐋쐌쐍쐎쐏쐐쐑쐒쐓쐔쐕쐖쐗쐘쐙쐚쐛쐜쐝쐞쐟쐠쐡쐢쐣쐤쐥쐦쐧쐨쐩쐪쐫쐬쐭쐮쐯쐰쐱쐲쐳쐴쐵쐶쐷쐸쐹쐺쐻쐼쐽쐾쐿쑀쑁쑂쑃쑄쑅쑆쑇쑈쑉쑊쑋쑌쑍쑎쑏쑐쑑쑒쑓쑔쑕쑖쑗쑘쑙쑚쑛쑜쑝쑞쑟쑠쑡쑢쑣쑤쑥쑦쑧쑨쑩쑪쑫쑬쑭쑮쑯쑰쑱쑲쑳쑴쑵쑶쑷쑸쑹쑺쑻쑼쑽쑾쑿쒀쒁쒂쒃쒄쒅쒆쒇쒈쒉쒊쒋쒌쒍쒎쒏쒐쒑쒒쒓쒔쒕쒖쒗쒘쒙쒚쒛쒜쒝쒞쒟쒠쒡쒢쒣쒤쒥쒦쒧쒨쒩쒪쒫쒬쒭쒮쒯쒰쒱쒲쒳쒴쒵쒶쒷쒸쒹쒺쒻쒼쒽쒾쒿쓀쓁쓂쓃쓄쓅쓆쓇쓈쓉쓊쓋쓌쓍쓎쓏쓐쓑쓒쓓쓔쓕쓖쓗쓘쓙쓚쓛쓜쓝쓞쓟쓠쓡쓢쓣쓤쓥쓦쓧쓨쓩쓪쓫쓬쓭쓮쓯쓰쓱쓲쓳쓴쓵쓶쓷쓸쓹쓺쓻쓼쓽쓾쓿씀씁씂씃씄씅씆씇씈씉씊씋씌씍씎씏씐씑씒씓씔씕씖씗씘씙씚씛씜씝씞씟씠씡씢씣씤씥씦씧씨씩씪씫씬씭씮씯씰씱씲씳씴씵씶씷씸씹씺씻씼씽씾씿앀앁앂앃아악앆앇안앉않앋알앍앎앏앐앑앒앓암압앖앗았앙앚앛앜앝앞앟애액앢앣앤앥앦앧앨앩앪앫앬앭앮앯앰앱앲앳앴앵앶앷앸앹앺앻야약앾앿얀얁얂얃얄얅얆얇얈얉얊얋얌얍얎얏얐양얒얓얔얕얖얗얘얙얚얛얜얝얞얟얠얡얢얣얤얥얦얧얨얩얪얫얬얭얮얯얰얱얲얳어억얶얷언얹얺얻얼얽얾얿엀엁엂엃엄업없엇었엉엊엋엌엍엎엏에엑엒엓엔엕엖엗엘엙엚엛엜엝엞엟엠엡엢엣엤엥엦엧엨엩엪엫여역엮엯연엱엲엳열엵엶엷엸엹엺엻염엽엾엿였영옂옃옄옅옆옇예옉옊옋옌옍옎옏옐옑옒옓옔옕옖옗옘옙옚옛옜옝옞옟옠옡옢옣오옥옦옧온옩옪옫올옭옮옯옰옱옲옳옴옵옶옷옸옹옺옻옼옽옾옿와왁왂왃완왅왆왇왈왉왊왋왌왍왎왏왐왑왒왓왔왕왖왗왘왙왚왛왜왝왞왟왠왡왢왣왤왥왦왧왨왩왪왫왬왭왮왯왰왱왲왳왴왵왶왷외왹왺왻왼왽왾왿욀욁욂욃욄욅욆욇욈욉욊욋욌욍욎욏욐욑욒욓요욕욖욗욘욙욚욛욜욝욞욟욠욡욢욣욤욥욦욧욨용욪욫욬욭욮욯우욱욲욳운욵욶욷울욹욺욻욼욽욾욿움웁웂웃웄웅웆웇웈웉웊웋워웍웎웏원웑웒웓월웕웖웗웘웙웚웛웜웝웞웟웠웡웢웣웤웥웦웧웨웩웪웫웬웭웮웯웰웱웲웳웴웵웶웷웸웹웺웻웼웽웾웿윀윁윂윃위윅윆윇윈윉윊윋윌윍윎윏윐윑윒윓윔윕윖윗윘윙윚윛윜윝윞윟유육윢윣윤윥윦윧율윩윪윫윬윭윮윯윰윱윲윳윴융윶윷윸윹윺윻으윽윾윿은읁읂읃을읅읆읇읈읉읊읋음읍읎읏읐응읒읓읔읕읖읗의읙읚읛읜읝읞읟읠읡읢읣읤읥읦읧읨읩읪읫읬읭읮읯읰읱읲읳이익읶읷인읹읺읻일읽읾읿잀잁잂잃임입잆잇있잉잊잋잌잍잎잏자작잒잓잔잕잖잗잘잙잚잛잜잝잞잟잠잡잢잣잤장잦잧잨잩잪잫재잭잮잯잰잱잲잳잴잵잶잷잸잹잺잻잼잽잾잿쟀쟁쟂쟃쟄쟅쟆쟇쟈쟉쟊쟋쟌쟍쟎쟏쟐쟑쟒쟓쟔쟕쟖쟗쟘쟙쟚쟛쟜쟝쟞쟟쟠쟡쟢쟣쟤쟥쟦쟧쟨쟩쟪쟫쟬쟭쟮쟯쟰쟱쟲쟳쟴쟵쟶쟷쟸쟹쟺쟻쟼쟽쟾쟿저적젂젃전젅젆젇절젉젊젋젌젍젎젏점접젒젓젔정젖젗젘젙젚젛제젝젞젟젠젡젢젣젤젥젦젧젨젩젪젫젬젭젮젯젰젱젲젳젴젵젶젷져젹젺젻젼젽젾젿졀졁졂졃졄졅졆졇졈졉졊졋졌졍졎졏졐졑졒졓졔졕졖졗졘졙졚졛졜졝졞졟졠졡졢졣졤졥졦졧졨졩졪졫졬졭졮졯조족졲졳존졵졶졷졸졹졺졻졼졽졾졿좀좁좂좃좄종좆좇좈좉좊좋좌좍좎좏좐좑좒좓좔좕좖좗좘좙좚좛좜좝좞좟좠좡좢좣좤좥좦좧좨좩좪좫좬좭좮좯좰좱좲좳좴좵좶좷좸좹좺좻좼좽좾좿죀죁죂죃죄죅죆죇죈죉죊죋죌죍죎죏죐죑죒죓죔죕죖죗죘죙죚죛죜죝죞죟죠죡죢죣죤죥죦죧죨죩죪죫죬죭죮죯죰죱죲죳죴죵죶죷죸죹죺죻주죽죾죿준줁줂줃줄줅줆줇줈줉줊줋줌줍줎줏줐중줒줓줔줕줖줗줘줙줚줛줜줝줞줟줠줡줢줣줤줥줦줧줨줩줪줫줬줭줮줯줰줱줲줳줴줵줶줷줸줹줺줻줼줽줾줿쥀쥁쥂쥃쥄쥅쥆쥇쥈쥉쥊쥋쥌쥍쥎쥏쥐쥑쥒쥓쥔쥕쥖쥗쥘쥙쥚쥛쥜쥝쥞쥟쥠쥡쥢쥣쥤쥥쥦쥧쥨쥩쥪쥫쥬쥭쥮쥯쥰쥱쥲쥳쥴쥵쥶쥷쥸쥹쥺쥻쥼쥽쥾쥿즀즁즂즃즄즅즆즇즈즉즊즋즌즍즎즏즐즑즒즓즔즕즖즗즘즙즚즛즜증즞즟즠즡즢즣즤즥즦즧즨즩즪즫즬즭즮즯즰즱즲즳즴즵즶즷즸즹즺즻즼즽즾즿지직짂짃진짅짆짇질짉짊짋짌짍짎짏짐집짒짓짔징짖짗짘짙짚짛짜짝짞짟짠짡짢짣짤짥짦짧짨짩짪짫짬짭짮짯짰짱짲짳짴짵짶짷째짹짺짻짼짽짾짿쨀쨁쨂쨃쨄쨅쨆쨇쨈쨉쨊쨋쨌쨍쨎쨏쨐쨑쨒쨓쨔쨕쨖쨗쨘쨙쨚쨛쨜쨝쨞쨟쨠쨡쨢쨣쨤쨥쨦쨧쨨쨩쨪쨫쨬쨭쨮쨯쨰쨱쨲쨳쨴쨵쨶쨷쨸쨹쨺쨻쨼쨽쨾쨿쩀쩁쩂쩃쩄쩅쩆쩇쩈쩉쩊쩋쩌쩍쩎쩏쩐쩑쩒쩓쩔쩕쩖쩗쩘쩙쩚쩛쩜쩝쩞쩟쩠쩡쩢쩣쩤쩥쩦쩧쩨쩩쩪쩫쩬쩭쩮쩯쩰쩱쩲쩳쩴쩵쩶쩷쩸쩹쩺쩻쩼쩽쩾쩿쪀쪁쪂쪃쪄쪅쪆쪇쪈쪉쪊쪋쪌쪍쪎쪏쪐쪑쪒쪓쪔쪕쪖쪗쪘쪙쪚쪛쪜쪝쪞쪟쪠쪡쪢쪣쪤쪥쪦쪧쪨쪩쪪쪫쪬쪭쪮쪯쪰쪱쪲쪳쪴쪵쪶쪷쪸쪹쪺쪻쪼쪽쪾쪿쫀쫁쫂쫃쫄쫅쫆쫇쫈쫉쫊쫋쫌쫍쫎쫏쫐쫑쫒쫓쫔쫕쫖쫗쫘쫙쫚쫛쫜쫝쫞쫟쫠쫡쫢쫣쫤쫥쫦쫧쫨쫩쫪쫫쫬쫭쫮쫯쫰쫱쫲쫳쫴쫵쫶쫷쫸쫹쫺쫻쫼쫽쫾쫿쬀쬁쬂쬃쬄쬅쬆쬇쬈쬉쬊쬋쬌쬍쬎쬏쬐쬑쬒쬓쬔쬕쬖쬗쬘쬙쬚쬛쬜쬝쬞쬟쬠쬡쬢쬣쬤쬥쬦쬧쬨쬩쬪쬫쬬쬭쬮쬯쬰쬱쬲쬳쬴쬵쬶쬷쬸쬹쬺쬻쬼쬽쬾쬿쭀쭁쭂쭃쭄쭅쭆쭇쭈쭉쭊쭋쭌쭍쭎쭏쭐쭑쭒쭓쭔쭕쭖쭗쭘쭙쭚쭛쭜쭝쭞쭟쭠쭡쭢쭣쭤쭥쭦쭧쭨쭩쭪쭫쭬쭭쭮쭯쭰쭱쭲쭳쭴쭵쭶쭷쭸쭹쭺쭻쭼쭽쭾쭿쮀쮁쮂쮃쮄쮅쮆쮇쮈쮉쮊쮋쮌쮍쮎쮏쮐쮑쮒쮓쮔쮕쮖쮗쮘쮙쮚쮛쮜쮝쮞쮟쮠쮡쮢쮣쮤쮥쮦쮧쮨쮩쮪쮫쮬쮭쮮쮯쮰쮱쮲쮳쮴쮵쮶쮷쮸쮹쮺쮻쮼쮽쮾쮿쯀쯁쯂쯃쯄쯅쯆쯇쯈쯉쯊쯋쯌쯍쯎쯏쯐쯑쯒쯓쯔쯕쯖쯗쯘쯙쯚쯛쯜쯝쯞쯟쯠쯡쯢쯣쯤쯥쯦쯧쯨쯩쯪쯫쯬쯭쯮쯯쯰쯱쯲쯳쯴쯵쯶쯷쯸쯹쯺쯻쯼쯽쯾쯿찀찁찂찃찄찅찆찇찈찉찊찋찌찍찎찏찐찑찒찓찔찕찖찗찘찙찚찛찜찝찞찟찠찡찢찣찤찥찦찧차착찪찫찬찭찮찯찰찱찲찳찴찵찶찷참찹찺찻찼창찾찿챀챁챂챃채책챆챇챈챉챊챋챌챍챎챏챐챑챒챓챔챕챖챗챘챙챚챛챜챝챞챟챠챡챢챣챤챥챦챧챨챩챪챫챬챭챮챯챰챱챲챳챴챵챶챷챸챹챺챻챼챽챾챿첀첁첂첃첄첅첆첇첈첉첊첋첌첍첎첏첐첑첒첓첔첕첖첗처척첚첛천첝첞첟철첡첢첣첤첥첦첧첨첩첪첫첬청첮첯첰첱첲첳체첵첶첷첸첹첺첻첼첽첾첿쳀쳁쳂쳃쳄쳅쳆쳇쳈쳉쳊쳋쳌쳍쳎쳏쳐쳑쳒쳓쳔쳕쳖쳗쳘쳙쳚쳛쳜쳝쳞쳟쳠쳡쳢쳣쳤쳥쳦쳧쳨쳩쳪쳫쳬쳭쳮쳯쳰쳱쳲쳳쳴쳵쳶쳷쳸쳹쳺쳻쳼쳽쳾쳿촀촁촂촃촄촅촆촇초촉촊촋촌촍촎촏촐촑촒촓촔촕촖촗촘촙촚촛촜총촞촟촠촡촢촣촤촥촦촧촨촩촪촫촬촭촮촯촰촱촲촳촴촵촶촷촸촹촺촻촼촽촾촿쵀쵁쵂쵃쵄쵅쵆쵇쵈쵉쵊쵋쵌쵍쵎쵏쵐쵑쵒쵓쵔쵕쵖쵗쵘쵙쵚쵛최쵝쵞쵟쵠쵡쵢쵣쵤쵥쵦쵧쵨쵩쵪쵫쵬쵭쵮쵯쵰쵱쵲쵳쵴쵵쵶쵷쵸쵹쵺쵻쵼쵽쵾쵿춀춁춂춃춄춅춆춇춈춉춊춋춌춍춎춏춐춑춒춓추축춖춗춘춙춚춛출춝춞춟춠춡춢춣춤춥춦춧춨충춪춫춬춭춮춯춰춱춲춳춴춵춶춷춸춹춺춻춼춽춾춿췀췁췂췃췄췅췆췇췈췉췊췋췌췍췎췏췐췑췒췓췔췕췖췗췘췙췚췛췜췝췞췟췠췡췢췣췤췥췦췧취췩췪췫췬췭췮췯췰췱췲췳췴췵췶췷췸췹췺췻췼췽췾췿츀츁츂츃츄츅츆츇츈츉츊츋츌츍츎츏츐츑츒츓츔츕츖츗츘츙츚츛츜츝츞츟츠측츢츣츤츥츦츧츨츩츪츫츬츭츮츯츰츱츲츳츴층츶츷츸츹츺츻츼츽츾츿칀칁칂칃칄칅칆칇칈칉칊칋칌칍칎칏칐칑칒칓칔칕칖칗치칙칚칛친칝칞칟칠칡칢칣칤칥칦칧침칩칪칫칬칭칮칯칰칱칲칳카칵칶칷칸칹칺칻칼칽칾칿캀캁캂캃캄캅캆캇캈캉캊캋캌캍캎캏캐캑캒캓캔캕캖캗캘캙캚캛캜캝캞캟캠캡캢캣캤캥캦캧캨캩캪캫캬캭캮캯캰캱캲캳캴캵캶캷캸캹캺캻캼캽캾캿컀컁컂컃컄컅컆컇컈컉컊컋컌컍컎컏컐컑컒컓컔컕컖컗컘컙컚컛컜컝컞컟컠컡컢컣커컥컦컧컨컩컪컫컬컭컮컯컰컱컲컳컴컵컶컷컸컹컺컻컼컽컾컿케켁켂켃켄켅켆켇켈켉켊켋켌켍켎켏켐켑켒켓켔켕켖켗켘켙켚켛켜켝켞켟켠켡켢켣켤켥켦켧켨켩켪켫켬켭켮켯켰켱켲켳켴켵켶켷켸켹켺켻켼켽켾켿콀콁콂콃콄콅콆콇콈콉콊콋콌콍콎콏콐콑콒콓코콕콖콗콘콙콚콛콜콝콞콟콠콡콢콣콤콥콦콧콨콩콪콫콬콭콮콯콰콱콲콳콴콵콶콷콸콹콺콻콼콽콾콿쾀쾁쾂쾃쾄쾅쾆쾇쾈쾉쾊쾋쾌쾍쾎쾏쾐쾑쾒쾓쾔쾕쾖쾗쾘쾙쾚쾛쾜쾝쾞쾟쾠쾡쾢쾣쾤쾥쾦쾧쾨쾩쾪쾫쾬쾭쾮쾯쾰쾱쾲쾳쾴쾵쾶쾷쾸쾹쾺쾻쾼쾽쾾쾿쿀쿁쿂쿃쿄쿅쿆쿇쿈쿉쿊쿋쿌쿍쿎쿏쿐쿑쿒쿓쿔쿕쿖쿗쿘쿙쿚쿛쿜쿝쿞쿟쿠쿡쿢쿣쿤쿥쿦쿧쿨쿩쿪쿫쿬쿭쿮쿯쿰쿱쿲쿳쿴쿵쿶쿷쿸쿹쿺쿻쿼쿽쿾쿿퀀퀁퀂퀃퀄퀅퀆퀇퀈퀉퀊퀋퀌퀍퀎퀏퀐퀑퀒퀓퀔퀕퀖퀗퀘퀙퀚퀛퀜퀝퀞퀟퀠퀡퀢퀣퀤퀥퀦퀧퀨퀩퀪퀫퀬퀭퀮퀯퀰퀱퀲퀳퀴퀵퀶퀷퀸퀹퀺퀻퀼퀽퀾퀿큀큁큂큃큄큅큆큇큈큉큊큋큌큍큎큏큐큑큒큓큔큕큖큗큘큙큚큛큜큝큞큟큠큡큢큣큤큥큦큧큨큩큪큫크큭큮큯큰큱큲큳클큵큶큷큸큹큺큻큼큽큾큿킀킁킂킃킄킅킆킇킈킉킊킋킌킍킎킏킐킑킒킓킔킕킖킗킘킙킚킛킜킝킞킟킠킡킢킣키킥킦킧킨킩킪킫킬킭킮킯킰킱킲킳킴킵킶킷킸킹킺킻킼킽킾킿타탁탂탃탄탅탆탇탈탉탊탋탌탍탎탏탐탑탒탓탔탕탖탗탘탙탚탛태택탞탟탠탡탢탣탤탥탦탧탨탩탪탫탬탭탮탯탰탱탲탳탴탵탶탷탸탹탺탻탼탽탾탿턀턁턂턃턄턅턆턇턈턉턊턋턌턍턎턏턐턑턒턓턔턕턖턗턘턙턚턛턜턝턞턟턠턡턢턣턤턥턦턧턨턩턪턫턬턭턮턯터턱턲턳턴턵턶턷털턹턺턻턼턽턾턿텀텁텂텃텄텅텆텇텈텉텊텋테텍텎텏텐텑텒텓텔텕텖텗텘텙텚텛템텝텞텟텠텡텢텣텤텥텦텧텨텩텪텫텬텭텮텯텰텱텲텳텴텵텶텷텸텹텺텻텼텽텾텿톀톁톂톃톄톅톆톇톈톉톊톋톌톍톎톏톐톑톒톓톔톕톖톗톘톙톚톛톜톝톞톟토톡톢톣톤톥톦톧톨톩톪톫톬톭톮톯톰톱톲톳톴통톶톷톸톹톺톻톼톽톾톿퇀퇁퇂퇃퇄퇅퇆퇇퇈퇉퇊퇋퇌퇍퇎퇏퇐퇑퇒퇓퇔퇕퇖퇗퇘퇙퇚퇛퇜퇝퇞퇟퇠퇡퇢퇣퇤퇥퇦퇧퇨퇩퇪퇫퇬퇭퇮퇯퇰퇱퇲퇳퇴퇵퇶퇷퇸퇹퇺퇻퇼퇽퇾퇿툀툁툂툃툄툅툆툇툈툉툊툋툌툍툎툏툐툑툒툓툔툕툖툗툘툙툚툛툜툝툞툟툠툡툢툣툤툥툦툧툨툩툪툫투툭툮툯툰툱툲툳툴툵툶툷툸툹툺툻툼툽툾툿퉀퉁퉂퉃퉄퉅퉆퉇퉈퉉퉊퉋퉌퉍퉎퉏퉐퉑퉒퉓퉔퉕퉖퉗퉘퉙퉚퉛퉜퉝퉞퉟퉠퉡퉢퉣퉤퉥퉦퉧퉨퉩퉪퉫퉬퉭퉮퉯퉰퉱퉲퉳퉴퉵퉶퉷퉸퉹퉺퉻퉼퉽퉾퉿튀튁튂튃튄튅튆튇튈튉튊튋튌튍튎튏튐튑튒튓튔튕튖튗튘튙튚튛튜튝튞튟튠튡튢튣튤튥튦튧튨튩튪튫튬튭튮튯튰튱튲튳튴튵튶튷트특튺튻튼튽튾튿틀틁틂틃틄틅틆틇틈틉틊틋틌틍틎틏틐틑틒틓틔틕틖틗틘틙틚틛틜틝틞틟틠틡틢틣틤틥틦틧틨틩틪틫틬틭틮틯티틱틲틳틴틵틶틷틸틹틺틻틼틽틾틿팀팁팂팃팄팅팆팇팈팉팊팋파팍팎팏판팑팒팓팔팕팖팗팘팙팚팛팜팝팞팟팠팡팢팣팤팥팦팧패팩팪팫팬팭팮팯팰팱팲팳팴팵팶팷팸팹팺팻팼팽팾팿퍀퍁퍂퍃퍄퍅퍆퍇퍈퍉퍊퍋퍌퍍퍎퍏퍐퍑퍒퍓퍔퍕퍖퍗퍘퍙퍚퍛퍜퍝퍞퍟퍠퍡퍢퍣퍤퍥퍦퍧퍨퍩퍪퍫퍬퍭퍮퍯퍰퍱퍲퍳퍴퍵퍶퍷퍸퍹퍺퍻퍼퍽퍾퍿펀펁펂펃펄펅펆펇펈펉펊펋펌펍펎펏펐펑펒펓펔펕펖펗페펙펚펛펜펝펞펟펠펡펢펣펤펥펦펧펨펩펪펫펬펭펮펯펰펱펲펳펴펵펶펷편펹펺펻펼펽펾펿폀폁폂폃폄폅폆폇폈평폊폋폌폍폎폏폐폑폒폓폔폕폖폗폘폙폚폛폜폝폞폟폠폡폢폣폤폥폦폧폨폩폪폫포폭폮폯폰폱폲폳폴폵폶폷폸폹폺폻폼폽폾폿퐀퐁퐂퐃퐄퐅퐆퐇퐈퐉퐊퐋퐌퐍퐎퐏퐐퐑퐒퐓퐔퐕퐖퐗퐘퐙퐚퐛퐜퐝퐞퐟퐠퐡퐢퐣퐤퐥퐦퐧퐨퐩퐪퐫퐬퐭퐮퐯퐰퐱퐲퐳퐴퐵퐶퐷퐸퐹퐺퐻퐼퐽퐾퐿푀푁푂푃푄푅푆푇푈푉푊푋푌푍푎푏푐푑푒푓푔푕푖푗푘푙푚푛표푝푞푟푠푡푢푣푤푥푦푧푨푩푪푫푬푭푮푯푰푱푲푳푴푵푶푷푸푹푺푻푼푽푾푿풀풁풂풃풄풅풆풇품풉풊풋풌풍풎풏풐풑풒풓풔풕풖풗풘풙풚풛풜풝풞풟풠풡풢풣풤풥풦풧풨풩풪풫풬풭풮풯풰풱풲풳풴풵풶풷풸풹풺풻풼풽풾풿퓀퓁퓂퓃퓄퓅퓆퓇퓈퓉퓊퓋퓌퓍퓎퓏퓐퓑퓒퓓퓔퓕퓖퓗퓘퓙퓚퓛퓜퓝퓞퓟퓠퓡퓢퓣퓤퓥퓦퓧퓨퓩퓪퓫퓬퓭퓮퓯퓰퓱퓲퓳퓴퓵퓶퓷퓸퓹퓺퓻퓼퓽퓾퓿픀픁픂픃프픅픆픇픈픉픊픋플픍픎픏픐픑픒픓픔픕픖픗픘픙픚픛픜픝픞픟픠픡픢픣픤픥픦픧픨픩픪픫픬픭픮픯픰픱픲픳픴픵픶픷픸픹픺픻피픽픾픿핀핁핂핃필핅핆핇핈핉핊핋핌핍핎핏핐핑핒핓핔핕핖핗하학핚핛한핝핞핟할핡핢핣핤핥핦핧함합핪핫핬항핮핯핰핱핲핳해핵핶핷핸핹핺핻핼핽핾핿햀햁햂햃햄햅햆햇했행햊햋햌햍햎햏햐햑햒햓햔햕햖햗햘햙햚햛햜햝햞햟햠햡햢햣햤향햦햧햨햩햪햫햬햭햮햯햰햱햲햳햴햵햶햷햸햹햺햻햼햽햾햿헀헁헂헃헄헅헆헇허헉헊헋헌헍헎헏헐헑헒헓헔헕헖헗험헙헚헛헜헝헞헟헠헡헢헣헤헥헦헧헨헩헪헫헬헭헮헯헰헱헲헳헴헵헶헷헸헹헺헻헼헽헾헿혀혁혂혃현혅혆혇혈혉혊혋혌혍혎혏혐협혒혓혔형혖혗혘혙혚혛혜혝혞혟혠혡혢혣혤혥혦혧혨혩혪혫혬혭혮혯혰혱혲혳혴혵혶혷호혹혺혻혼혽혾혿홀홁홂홃홄홅홆홇홈홉홊홋홌홍홎홏홐홑홒홓화확홖홗환홙홚홛활홝홞홟홠홡홢홣홤홥홦홧홨황홪홫홬홭홮홯홰홱홲홳홴홵홶홷홸홹홺홻홼홽홾홿횀횁횂횃횄횅횆횇횈횉횊횋회획횎횏횐횑횒횓횔횕횖횗횘횙횚횛횜횝횞횟횠횡횢횣횤횥횦횧효횩횪횫횬횭횮횯횰횱횲횳횴횵횶횷횸횹횺횻횼횽횾횿훀훁훂훃후훅훆훇훈훉훊훋훌훍훎훏훐훑훒훓훔훕훖훗훘훙훚훛훜훝훞훟훠훡훢훣훤훥훦훧훨훩훪훫훬훭훮훯훰훱훲훳훴훵훶훷훸훹훺훻훼훽훾훿휀휁휂휃휄휅휆휇휈휉휊휋휌휍휎휏휐휑휒휓휔휕휖휗휘휙휚휛휜휝휞휟휠휡휢휣휤휥휦휧휨휩휪휫휬휭휮휯휰휱휲휳휴휵휶휷휸휹휺휻휼휽휾휿흀흁흂흃흄흅흆흇흈흉흊흋흌흍흎흏흐흑흒흓흔흕흖흗흘흙흚흛흜흝흞흟흠흡흢흣흤흥흦흧흨흩흪흫희흭흮흯흰흱흲흳흴흵흶흷흸흹흺흻흼흽흾흿힀힁힂힃힄힅힆힇히힉힊힋힌힍힎힏힐힑힒힓힔힕힖힗힘힙힚힛힜힝힞힟힠힡힢힣‾_＿-－‐—―〜・,，、;；:：!！¡?？¿.．‥…。·＇‘’\\\\\\"＂“”(（)）[［]］{｛}｝〈〉《》「」『』【】〔〕§¶@＠*＊/／\\\\\\\\＼&＆#＃%％‰†‡′″〃※","Kyrgyz":"абгдеёжзийклмнӊоөпрстуүхчшъыэюяАБГДЕЁЖЗИЙКЛМНӉОӨПРСТУҮХЧШЪЫЭЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Lao":"່້໊໋໌ໍໆກຂຄງຈສຊຍດຕຖທນບປຜຝພຟມຢຣລວຫໜໝອຮຯະັາຳິີຶືຸູົຼຽເແໂໃໄ-,;:!?.()[]{}","Lithuanian":"aąbcčdeęėfghiįyjklmnoprsštuųūvzžAĄBCČDEĘĖFGHIĮYJKLMNOPRSŠTUŲŪVZŽ-‐–—,;:!?.…“„()[]{}","Latvian":"aābcčdeēfgģhiījkķlļmnņoprsštuūvzžAĀBCČDEĒFGĢHIĪJKĶLĻMNŅOPRSŠTUŪVZŽ-‐–—,;:!?.…\'‘’‚\\\\\\"“”„()[]§@*/&#†‡′″","Macedonian":"абвгдѓежзѕијклљмнњопрстќуфхцчџшАБВГДЃЕЖЗЅИЈКЛЉМНЊОПРСТЌУФХЦЧЏШ-‐–—,;:!?.…‘‚“„()[]{}","Malayalam":"‌ഃഅആഇഈഉഊഋൠഌൡഎഏഐഒഓഔകൿഖഗഘങചഛജഝഞടഠഡഢണൺതഥദധനൻപഫബഭമംയരർലൽവശഷസഹളൾഴറാിീുൂൃെേൈൊോൌൗ്-,;:!?.\'‘’\\\\\\"“”()[]{}","Mongolian":"абвгдеёжзийклмноөпрстуүфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОӨПРСТУҮФХЦЧШЩЪЫЬЭЮЯ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Marathi":"़ॐंँःअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसहळऽािीुूृॄॅेैॉोौ्-‐–—,;:!?.…\'‘’\\\\\\"“”()[]@*/&#′″","Malay":"aiubcdzefghjklmnyopqrstvwxAIUBCDZEFGHJKLMNYOPQRSTVWX-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Burmese":"ကခဂဃငစဆဇဈဉညဋဌဍဎဏတထဒဓနပဖဗဘမယရလဝသဟဠအဣဤဥဦဧဩဪာါိီုူေဲံဿျြွှ့္်း၊။‘’“”","Norwegian Bokmål":"aàbcdeéfghijklmnoóòôpqrstuvwxyzæøåAÀBCDEÉFGHIJKLMNOÓÒÔPQRSTUVWXYZÆØÅ-–,;:!?.\'\\\\\\"«»()[]{}§@*/\\\\\\\\","Nepali":"़ँंःॐअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलळवशषसहऽािीुूृॄॅेैॉोौ्-,;:!?.()[]{}","Dutch":"aáäbcdeéëfghiíïj\\\\u031klmnoóöpqrstúüvwxyzAÁÄBCDEÉËFGHIÍÏJUKLMNOÓÖPQRSTÚÜVWXYZ-‐–—,;:!?.…\'‘’\\"“”()[]§@*/&#†‡′″","Punjabi":"ੱੰ਼੦੧੨੩੪੫੬੭੮੯ੴੳਉਊਓਅਆਐਔੲਇਈਏਸ\\\\u0A3Cਹਕਖਗਘਙਚਛਜਝਞਟਠਡਢਣਤਥਦਧਨਪਫਬਭਮਯਰਲਵੜ੍ਾਿੀੁੂੇੈੋੌU-‐–—,;:!?.\'‘’\\"“”()[]/&′″","Polish":"aąbcćdeęfghijklłmnńoóprsśtuwyzźżAĄBCĆDEĘFGHIJKLŁMNŃOÓPRSŚTUWYZŹŻ-‐–—,;:!?.…\'\\\\\\"”„«»()[]{}§@*/&#%†‡′″°~","Portuguese":"aáàâãbcçdeéêfghiíjklmnoóòôõpqrstuúvwxyzAÁÀÂÃBCÇDEÉÊFGHIÍJKLMNOÓÒÔÕPQRSTUÚVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Romanian":"aăâbcdefghiîjklmnoprsștțuvxzAĂÂBCDEFGHIÎJKLMNOPRSȘTȚUVXZ-‐–—,;:!?.…\'‘\\\\\\"“”„«»()[]@*/","Russian":"абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Sinhala":"අආඇඈඉඊඋඌඍඑඒඓඔඕඖංඃකඛගඝඞඟචඡජඣඥඤටඨඩඪණඬතථදධනඳපඵබභමඹයරලවශෂසහළෆාැෑිීුූෘෲෟෙේෛොෝෞ්-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Slovak":"aáäbcčdďeéfghiíjklĺľmnňoóôpqrŕsštťuúvwxyýzžAÁÄBCČDĎEÉFGHIÍJKLĹĽMNŇOÓÔPQRŔSŠTŤUÚVWXYÝZŽ-‐–,;:!?.…‘‚“„()[]§@*/&","Slovenian":"abcčdefghijklmnoprsštuvzžABCČDEFGHIJKLMNOPRSŠTUVZŽ-,;:!?.()[]{}","Albanian":"abcçdheëfgjiklmnopqrstuvxyzABCÇDHEËFGJIKLMNOPQRSTUVXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”«»()[]§@*/&#′″~","Serbian":"абвгдђежзијклљмнњопрстћуфхцчџшАБВГДЂЕЖЗИЈКЛЉМНЊОПРСТЋУФХЦЧЏШ-‐–,;:!?.…‘‚“„()[]{}*#","Swedish":"aàbcdeéfghijklmnopqrstuvwxyzåäöAÀBCDEÉFGHIJKLMNOPQRSTUVWXYZÅÄÖ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Swahili":"abchdefgijklmnoprstuvwyzABCHDEFGIJKLMNOPRSTUVWYZ-,;:!?.()[]{}","Tamil":"அஆஇஈஉஊஎஏஐஒஓஔஃகஙசஞடணதநபமயரலவழளறனஜஷஸஹாிீுூெேைொோௌ்-,;:!?.()[]{}","Telugu":"అఆఇఈఉఊఋౠఌౡఎఏఐఒఓఔఁంఃకఖగఘఙచఛజఝఞటఠడఢణతథదధనపఫబభమయరఱలవశషసహళాిీుూృౄెేైొోౌ్ౕౖ-,;:!?.\'‘’\\\\\\"“”()[]{}","Thai":"ฯๆ๎์็่้๊๋กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรฤลฦวศษสหฬอฮํะัาๅำิีึืุูเแโใไฺ!\\\\\\"#\'()*,-./:@[]‐–—‘’“”…′″","Tongan":"aáāeéēfhiíīklmngoóōpstuúūvʻAÁĀEÉĒFHIÍĪKLMNGOÓŌPSTUÚŪV-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Turkish":"abcçdefgğhıiİjklmnoöprsştuüvyzABCÇDEFGĞHIJKLMNOÖPRSŞTUÜVYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Ukrainian":"абвгґдеєжзиіїйклмнопрстуфхцчшщьюяʼАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ-–,;:!?.\'\\\\\\"“„«»()[]{}§@*/\\\\\\\\№","Urdu":"اأآبپتٹثجچحخدڈذرڑزژسشصضطظعغفقکگلمنںوؤہۂھءیئےةه،؍٫٬؛:؟.۔()[]","Uzbek":"abdefghijklmnopqrstuvxyzʻcʼABDEFGHIJKLMNOPQRSTUVXYZC-‐–—,;:!?.…\'‘’\\\\\\"“”„«»()[]{}§@*/&#′″","Vietnamese":"aàảãáạăằẳẵắặâầẩẫấậbcdđeèẻẽéẹêềểễếệfghiìỉĩíịjklmnoòỏõóọôồổỗốộơờởỡớợpqrstuùủũúụưừửữứựvwxyỳỷỹýỵzAÀẢÃÁẠĂẰẲẴẮẶÂẦẨẪẤẬBCDĐEÈẺẼÉẸÊỀỂỄẾỆFGHIÌỈĨÍỊJKLMNOÒỎÕÓỌÔỒỔỖỐỘƠỜỞỠỚỢPQRSTUÙỦŨÚỤƯỪỬỮỨỰVWXYỲỶỸÝỴZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Cantonese":"一丁七丈三上下丌不丑且世丘丙丟並中串丸丹主乃久么之乎乏乖乘乙九也乾亂了予事二于云互五井些亞亡交亥亦亨享京亮人什仁仇今介仍仔他付仙代令以仰仲件任份企伊伍伐休伙伯估伴伸似伽但佈佉位低住佔何余佛作你佩佳使來例供依侯侵便係促俄俊俗保俠信修俱俾個倍們倒候倚借倫值假偉偏做停健側偵偶偷傑備傢傣傲傳傷傻傾僅像僑僧價儀億儒儘優允元兄充兇先光克免兒兔入內全兩八公六兮共兵其具典兼冊再冒冠冬冰冷准凌凝凡凰凱出函刀分切刊列初判別利刪到制刷刺刻則剌前剛剩剪副割創劃劇劉劍力功加助努劫勁勇勉勒動務勝勞勢勤勵勸勿包匈化北匹區十千升午半卒卓協南博卜卡卯印危即卷卻厄厘厚原厭厲去參又及友反叔取受口古句另只叫召叭可台史右司吃各合吉吊同名后吐向吒君吝吞吟吠否吧含吳吵吸吹吾呀呂呆告呢周味呵呼命和咖咦咧咪咬咱哀品哇哈哉哎員哥哦哩哪哭哲唉唐唔唬售唯唱唷唸商啊問啟啡啥啦啪喀喂善喇喊喔喜喝喬單喵嗎嗚嗨嗯嘆嘉嘗嘛嘴嘻嘿器噴嚇嚴囉四回因困固圈國圍園圓圖團圜土在圭地圾址均坎坐坡坤坦坪垂垃型埃城埔域執培基堂堅堆堡堪報場塊塔塗塞填塵境增墨墮壁壇壓壘壞壢士壬壯壽夏夕外多夜夠夢夥大天太夫央失夷夸夾奇奈奉奎奏契奔套奧奪奮女奴奶她好如妙妝妥妨妮妳妹妻姆姊始姐姑姓委姿威娃娘娛婁婆婚婦媒媽嫌嫩子孔字存孝孟季孤孩孫學它宅宇守安宋完宏宗官宙定宛宜客宣室宮害家容宿寂寄寅密富寒寞察寢實寧寨審寫寬寮寵寶封射將專尊尋對導小少尖尚尤就尺尼尾局屁居屆屋屏展屠層屬山岡岩岸峰島峽崇崙崴嵐嶺川州巡工左巧巨巫差己已巳巴巷市布希帕帖帛帝帥師席帳帶常帽幅幕幣幫干平年幸幹幻幼幽幾庇床序底店庚府度座庫庭康庸廉廖廠廢廣廳延廷建弄式引弗弘弟弦弱張強彈彊彌彎彝彞形彥彩彬彭彰影役彼往征待很律後徐徑徒得從復微徵德徹心必忌忍志忘忙忠快念忽怎怒怕怖思怡急性怨怪恆恐恢恥恨恩恭息恰悅悉悔悟悠您悲悶情惑惜惠惡惱想惹愁愈愉意愚愛感慈態慕慘慢慣慧慮慰慶慾憂憐憑憲憶憾懂應懶懷懼戀戈戊戌成我戒或截戰戲戴戶房所扁扇手才扎打托扣扥扭扯批找承技抄把抓投抗折披抬抱抵抹抽拆拉拋拍拏拒拔拖招拜括拳拼拾拿持指按挑挖挪振挺捐捕捨捲捷掃授掉掌排掛採探接控推措描提插揚換握揮援損搖搜搞搬搭搶摘摩摸撐撒撞撣撥播撾撿擁擇擊擋操擎擔據擠擦擬擴擺擾攝支收改攻放政故效敍敏救敗敘教敝敢散敦敬整敵數文斐斗料斯新斷方於施旁旅旋族旗既日旦早旭旺昂昆昇昌明昏易星映春昨昭是時晉晒晚晨普景晴晶智暑暖暗暫暴曆曉曰曲更書曼曾替最會月有朋服朗望朝期木未末本札朱朵杉李材村杜束杯杰東松板析林果枝架柏某染柔查柬柯柳柴校核根格桃案桌桑梁梅條梨梯械梵棄棉棋棒棚森椅植椰楊楓楚業極概榜榮構槍樂樓標樞模樣樹橋機橫檀檔檢欄權次欣欲欺欽款歉歌歐歡止正此步武歲歷歸死殊殘段殺殼毀毅母每毒比毛毫氏民氣水永求汗汝江池污汪汶決汽沃沈沉沒沖沙河油治沿況泉泊法泡波泥注泰泳洋洗洛洞洩洪洲活洽派流浦浩浪浮海涇消涉涯液涵涼淑淚淡淨深混淺清減渡測港游湖湯源準溝溪溫滄滅滋滑滴滾滿漂漏演漠漢漫漲漸潔潘潛潮澤澳激濃濟濤濫濱瀏灌灣火灰災炎炮炸為烈烏烤無焦然煙煞照煩熊熟熱燃燈燒營爆爐爛爪爬爭爵父爸爺爽爾牆片版牌牙牛牠牧物牲特牽犧犯狀狂狐狗狠狼猛猜猴猶獄獅獎獨獲獸獻玄率玉王玩玫玲玻珊珍珠珥班現球理琉琪琴瑙瑜瑞瑟瑤瑪瑰環瓜瓦瓶甘甚甜生產用田由甲申男甸界留畢略番畫異當疆疏疑疼病痕痛痴瘋療癡癸登發白百的皆皇皮盃益盛盜盟盡監盤盧目盲直相盼盾省眉看真眠眼眾睛睡督瞧瞭矛矣知短石砂砍研砲破硬碎碗碟碧碩碰確碼磁磨磯礎礙示社祕祖祚祛祝神祥票祿禁禍禎福禪禮秀私秋科秒秘租秤秦移稅程稍種稱稿穆穌積穩究穹空穿突窗窩窮窶立站竟章童端競竹笑笛符笨第筆等筋答策简算管箭箱節範篇築簡簫簽簿籃籌籍籤米粉粗粵精糊糕糟系糾紀約紅納紐純紙級紛素索紫累細紹終組結絕絡給統絲經綜綠維綱網緊緒線緣編緩緬緯練縛縣縮縱總績繁繆織繞繪繳繼續缸缺罕罪置罰署罵罷羅羊美羞群義羽翁習翔翰翹翻翼耀老考者而耍耐耗耳耶聊聖聚聞聯聰聲職聽肉肚股肥肩肯育背胎胖胞胡胸能脆脫腓腔腦腰腳腿膽臉臘臣臥臨自臭至致臺與興舉舊舌舍舒舞舟航般船艦良色艾芝芬花芳若苦英茅茫茲茶草荒荷荼莉莊莎莫菜菩華菲萄萊萬落葉著葛葡蒂蒙蒲蒼蓋蓮蔕蔡蔣蕭薄薦薩薪藉藍藏藝藤藥蘆蘇蘭虎處虛號虧蛇蛋蛙蜂蜜蝶融螢蟲蟹蠍蠻血行術街衛衝衡衣表袋被裁裂裕補裝裡製複褲西要覆見規視親覺覽觀角解觸言訂計訊討訓託記訥訪設許訴註証評詞詢試詩話該詳誇誌認誓誕語誠誤說誰課誼調談請諒論諸諺諾謀謂講謝證識譜警譯議護譽讀變讓讚谷豆豈豐象豪豬貌貓貝貞負財貢貨貪貫責貴買費貼賀資賈賓賜賞賢賣賤賦質賭賴賺購賽贈贊贏赤赫走起超越趕趙趣趨足跌跎跑距跟跡路跳踏踢蹟蹤躍身躲車軌軍軒軟較載輔輕輛輝輩輪輯輸轉轟辛辦辨辭辯辰辱農迅迎近返迦迪迫述迴迷追退送逃逆透逐途這通逛逝速造逢連週進逸逼遇遊運遍過道達違遙遜遠適遭遮遲遷選遺避邀邁還邊邏那邦邪邱郎部郭郵都鄂鄉鄭鄰酉配酒酷酸醉醒醜醫采釋里重野量金針釣鈴鉢銀銅銖銘銳銷鋒鋼錄錢錦錫錯鍋鍵鍾鎊鎖鎮鏡鐘鐵鑑長門閃閉開閏閒間閣閱闆闊闍闐關闡防阻阿陀附降限院陣除陪陰陳陵陶陷陸陽隆隊階隔際障隨險隱隻雄雅集雉雖雙雜雞離難雨雪雲零雷電需震霍霧露霸霹靂靈青靖靜非靠面革靼鞋韃韋韓音韻響頁頂項順須預頑頓頗領頞頭頻顆題額顏願類顧顯風飄飛食飯飲飽飾餅養餐餘館首香馬駐駕駛騎騙騷驅驗驚骨體高髮鬆鬥鬧鬱鬼魁魂魅魔魚魯鮮鳥鳳鳴鴻鵝鷹鹿麗麥麵麻麼黃黎黑默點黨鼓鼠鼻齊齋齒齡龍龜‾﹉﹊﹋﹌_＿﹍﹎﹏︳︴-－﹣‐–︲—﹘︱,，﹐、﹑;；﹔:：﹕!！﹗?？﹖.．﹒‥︰…。·＇‘’\\\\\\"＂“”〝〞(（﹙︵)）﹚︶[［]］{｛﹛︷}｝﹜︸〈︿〉﹀《︽》︾「﹁」﹂『﹃』﹄【︻】︼〔﹝︹〕﹞︺§@＠﹫*＊﹡/／\\\\\\\\＼﹨&＆﹠#＃﹟%％﹪‰†‡‧′″‵〃※","Chinese":"一丁七万丈三上下丌不与丑专且世丘丙业东丝丢两严丧个中丰串临丸丹为主丽举乃久么义之乌乍乎乏乐乔乖乘乙九也习乡书买乱乾了予争事二于亏云互五井亚些亡交亥亦产亨享京亮亲人亿什仁仅仇今介仍从仔他付仙代令以仪们仰仲件价任份仿企伊伍伏伐休众优伙会伟传伤伦伯估伴伸似伽但位低住佐佑体何余佛作你佤佩佳使例供依侠侦侧侨侬侯侵便促俄俊俗保信俩修俱俾倍倒候倚借倦值倾假偌偏做停健偶偷储催傲傻像僧儒儿允元兄充兆先光克免兑兔党入全八公六兮兰共关兴兵其具典兹养兼兽内冈册再冒写军农冠冬冰冲决况冷准凌减凝几凡凤凭凯凰出击函刀分切刊刑划列刘则刚创初判利别到制刷券刺刻剂前剑剧剩剪副割力劝办功加务劣动助努劫励劲劳势勇勉勋勒勤勾勿包匆匈化北匙匹区医十千升午半华协卒卓单卖南博占卡卢卫卯印危即却卷厂厄厅历厉压厌厍厚原去县参又叉及友双反发叔取受变叙口古句另只叫召叭可台史右叶号司叹吃各合吉吊同名后吐向吓吗君吝吟否吧含听启吵吸吹吻吾呀呆呈告呐员呜呢呦周味呵呼命和咖咦咧咨咪咬咯咱哀品哇哈哉响哎哟哥哦哩哪哭哲唉唐唤唬售唯唱唷商啊啡啥啦啪喀喂善喇喊喏喔喜喝喵喷喻嗒嗨嗯嘉嘛嘴嘻嘿器四回因团园困围固国图圆圈土圣在圭地圳场圾址均坎坐坑块坚坛坜坡坤坦坪垂垃型垒埃埋城埔域培基堂堆堕堡堪塑塔塞填境增墨壁壤士壬壮声处备复夏夕外多夜够夥大天太夫央失头夷夸夹夺奇奈奉奋奏契奔奖套奥女奴奶她好如妇妈妖妙妥妨妮妹妻姆姊始姐姑姓委姿威娃娄娘娜娟娱婆婚媒嫁嫌嫩子孔孕字存孙孜孝孟季孤学孩宁它宇守安宋完宏宗官宙定宛宜宝实审客宣室宪害宴家容宽宾宿寂寄寅密寇富寒寝寞察寡寨寸对寻导寿封射将尊小少尔尖尘尚尝尤就尺尼尽尾局屁层居屋屏展属屠山岁岂岗岘岚岛岳岸峡峰崇崩崴川州巡工左巧巨巫差己已巳巴巷币市布帅师希帐帕帖帝带席帮常帽幅幕干平年并幸幻幼幽广庆床序库应底店庙庚府庞废度座庭康庸廉廖延廷建开异弃弄弊式引弗弘弟张弥弦弯弱弹强归当录彝形彩彬彭彰影彷役彻彼往征径待很律後徐徒得循微徵德心必忆忌忍志忘忙忠忧快念忽怀态怎怒怕怖思怡急性怨怪总恋恐恢恨恩恭息恰恶恼悄悉悔悟悠患您悲情惑惜惠惧惨惯想惹愁愈愉意愚感愧慈慎慕慢慧慰憾懂懒戈戊戌戏成我戒或战截戴户房所扁扇手才扎扑打托扣执扩扫扬扭扮扯批找承技抄把抑抓投抗折抢护报披抬抱抵抹抽担拆拉拍拒拔拖拘招拜拟拥拦拨择括拳拷拼拾拿持指按挑挖挝挡挤挥挪振挺捉捐捕损捡换据捷授掉掌排探接控推掩措掸描提插握援搜搞搬搭摄摆摊摔摘摩摸撒撞播操擎擦支收改攻放政故效敌敏救教敝敢散敦敬数敲整文斋斐斗料斜斥断斯新方於施旁旅旋族旗无既日旦旧旨早旭时旺昂昆昌明昏易星映春昨昭是显晃晋晒晓晚晨普景晴晶智暂暑暖暗暮暴曰曲更曹曼曾替最月有朋服朗望朝期木未末本札术朱朵机杀杂权杉李材村杜束条来杨杯杰松板极构析林果枝枢枪枫架柏某染柔查柬柯柳柴标栋栏树校样核根格桃框案桌桑档桥梁梅梦梯械梵检棉棋棒棚森椅植椰楚楼概榜模樱檀欠次欢欣欧欲欺款歉歌止正此步武歪死殊残段毅母每毒比毕毛毫氏民气氛水永求汇汉汗汝江池污汤汪汶汽沃沈沉沙沟没沧河油治沿泉泊法泛泡波泣泥注泰泳泽洋洗洛洞津洪洲活洽派流浅测济浏浑浓浙浦浩浪浮浴海涅消涉涛涨涯液涵淋淑淘淡深混添清渐渡渣温港渴游湖湾源溜溪滋滑满滥滨滴漂漏演漠漫潘潜潮澎澳激灌火灭灯灰灵灿炉炎炮炸点烂烈烤烦烧热焦然煌煞照煮熊熟燃燕爆爪爬爱爵父爷爸爽片版牌牙牛牡牢牧物牲牵特牺犯状犹狂狐狗狠独狮狱狼猛猜猪献猴玄率玉王玛玩玫环现玲玻珀珊珍珠班球理琊琪琳琴琼瑙瑜瑞瑟瑰瑶璃瓜瓦瓶甘甚甜生用田由甲申电男甸画畅界留略番疆疏疑疗疯疲疼疾病痕痛痴癸登白百的皆皇皮盈益监盒盖盘盛盟目直相盼盾省眉看真眠眼着睛睡督瞧矛矣知短石矶码砂砍研破础硕硬确碍碎碗碟碧碰磁磅磨示礼社祖祚祝神祥票祯祸禁禅福离秀私秋种科秒秘租秤秦秩积称移稀程稍税稣稳稿穆究穷穹空穿突窗窝立站竞竟章童端竹笑笔笛符笨第等筋筑答策筹签简算管箭箱篇篮簿籍米类粉粒粗粤粹精糊糕糖糟系素索紧紫累繁红约级纪纯纲纳纵纷纸纽线练组细织终绍经结绕绘给络绝统继绩绪续维绵综绿缅缓编缘缠缩缴缶缸缺罐网罕罗罚罢罪置署羊美羞群羯羽翁翅翔翘翠翰翻翼耀老考者而耍耐耗耳耶聊职联聘聚聪肉肖肚股肤肥肩肯育胁胆背胎胖胜胞胡胶胸能脆脑脱脸腊腐腓腰腹腾腿臂臣自臭至致舌舍舒舞舟航般舰船良色艺艾节芒芝芦芬芭花芳苍苏苗若苦英茂范茨茫茶草荐荒荣药荷莉莎莪莫莱莲获菜菩菲萄萍萤营萧萨落著葛葡蒂蒋蒙蓉蓝蓬蔑蔡薄薪藉藏藤虎虑虫虹虽虾蚁蛇蛋蛙蛮蜂蜜蝶融蟹蠢血行街衡衣补表袋被袭裁裂装裕裤西要覆见观规视览觉角解言誉誓警计订认讨让训议讯记讲讷许论设访证评识诉词译试诗诚话诞询该详语误说请诸诺读课谁调谅谈谊谋谓谜谢谨谱谷豆象豪貌贝贞负贡财责贤败货质贩贪购贯贱贴贵贸费贺贼贾资赋赌赏赐赔赖赚赛赞赠赢赤赫走赵起趁超越趋趣足跃跌跑距跟路跳踏踢踩身躲车轨轩转轮软轰轻载较辅辆辈辉辑输辛辞辨辩辰辱边达迁迅过迈迎运近返还这进远违连迟迦迪迫述迷追退送适逃逆选逊透逐递途通逛逝速造逢逸逻逼遇遍道遗遭遮遵避邀邓那邦邪邮邱邻郎郑部郭都鄂酉酋配酒酷酸醉醒采释里重野量金针钓钟钢钦钱钻铁铃铜铢铭银铺链销锁锅锋错锡锦键锺镇镜镭长门闪闭问闰闲间闷闹闻阁阅阐阔队阮防阳阴阵阶阻阿陀附际陆陈降限院除险陪陵陶陷隆随隐隔障难雄雅集雉雨雪雯雳零雷雾需震霍霖露霸霹青靖静非靠面革靼鞋鞑韦韩音页顶项顺须顽顾顿预领颇频颗题额风飘飙飞食餐饭饮饰饱饼馆首香馨马驱驶驻驾验骑骗骚骤骨高鬼魂魅魔鱼鲁鲜鸟鸡鸣鸭鸿鹅鹤鹰鹿麦麻黄黎黑默鼓鼠鼻齐齿龄龙龟﹉﹊﹋﹌_＿﹍﹎﹏︳︴-－﹣‐–—︱―,，﹐、﹑;；﹔:：﹕!！﹗?？﹖.．﹒‥︰…。·＇‘’\\\\\\"＂“”〝〞(（﹙︵)）﹚︶[［]］{｛﹛︷}｝﹜︸〈︿〉﹀《︽》︾「﹁」﹂『﹃』﹄【︻】︼〔﹝︹〕﹞︺〖〗‖§@＠﹫*＊﹡/／\\\\\\\\＼﹨&＆﹠#＃﹟%％﹪‰′″‵〃※","Zulu":"abhcdlyefgqxijkpmntsoruvwzABHCDLYEFGQXIJKPMNTSORUVWZ-,;:!?.()[]{}"}\n';});
+
+
+define('require/text!specimenTools/services/googleFontsCharSets.json',[],function () { return '{"Oriya":["।॥ଁଂଃଅଆଇଈଉଊଋଌଏଐଓଔକଖଗଘଙଚଛଜଝଞଟଠଡଢଣତଥଦଧନପଫବଭମଯରଲଳଵଶଷସହ଼ଽାିୀୁୂୃୄେୈୋୌ୍ୖୗଡ଼ଢ଼ୟୠୡୢୣ୦୧୨୩୪୫୬୭୮୯୰ୱ​‌‍◌",[],["Latin"],35],"Gurmukhi":["।॥ਁਂਃਅਆਇਈਉਊਏਐਓਔਕਖਗਘਙਚਛਜਝਞਟਠਡਢਣਤਥਦਧਨਪਫਬਭਮਯਰਲਲ਼ਵਸ਼ਸਹ਼ਾਿੀੁੂੇੈੋੌ੍ੑਖ਼ਗ਼ਜ਼ੜਫ਼੦੧੨੩੪੫੬੭੮੯ੰੱੲੳੴੵ​‌‍₹◌☬꠰꠱꠲꠳꠴꠵꠶꠷꠸꠹",["Punjabi"],["Latin"],27],"Kannada":["।॥ಂಃಅಆಇಈಉಊಋಌಎಏಐಒಓಔಕಖಗಘಙಚಛಜಝಞಟಠಡಢಣತಥದಧನಪಫಬಭಮಯರಱಲಳವಶಷಸಹ಼ಽಾಿೀುೂೃೄೆೇೈೊೋೌ್ೕೖೞೠೡೢೣ೦೧೨೩೪೫೬೭೮೯ೱೲ​‌‍₹◌",["Kannada"],["Latin"],30],"Malayalam":["̣̇।॥ംഃഅആഇഈഉഊഋഌഎഏഐഒഓഔകഖഗഘങചഛജഝഞടഠഡഢണതഥദധനഩപഫബഭമയരറലളഴവശഷസഹഺഽാിീുൂൃൄെേൈൊോൌ്ൎൗൠൡൢൣ൦൧൨൩൪൫൬൭൮൯൰൱൲൳൴൵൹ൺൻർൽൾൿ​‌‍₹◌",["Malayalam"],["Latin"],33],"Bengali":["।॥ঁংঃঅআইঈউঊঋঌএঐওঔকখগঘঙচছজঝঞটঠডঢণতথদধনপফবভমযরলশষসহ়ঽািীুূৃৄেৈোৌ্ৎৗড়ঢ়য়ৠৡৢৣ০১২৩৪৫৬৭৮৯ৰৱ৲৳৴৵৶৷৸৹৺৻​‌‍₹◌",["Bangla"],["Latin"],8],"Japanese":["　、。〃々〆〇〈〉《》「」『』【】〒〓〔〕〜ぁあぃいぅうぇえぉおかがきぎくぐけげこごさざしじすずせぜそぞただちぢっつづてでとどなにぬねのはばぱひびぴふぶぷへべぺほぼぽまみむめもゃやゅゆょよらりるれろゎわゐゑをん゛゜ゝゞァアィイゥウェエォオカガキギクグケゲコゴサザシジスズセゼソゾタダチヂッツヅテデトドナニヌネノハバパヒビピフブプヘベペホボポマミムメモャヤュユョヨラリルレロヮワヰヱヲンヴヵヶ・ーヽヾ一丁七万丈三上下不与丐丑且丕世丗丘丙丞両並个中丱串丶丸丹主丼丿乂乃久之乍乎乏乕乖乗乘乙九乞也乢乱乳乾亀亂亅了予争亊事二于云互五井亘亙些亜亞亟亠亡亢交亥亦亨享京亭亮亰亳亶人什仁仂仄仆仇今介仍从仏仔仕他仗付仙仝仞仟代令以仭仮仰仲件价任企伉伊伍伎伏伐休会伜伝伯估伴伶伸伺似伽佃但佇位低住佐佑体何佗余佚佛作佝佞佩佯佰佳併佶佻佼使侃來侈例侍侏侑侖侘供依侠価侫侭侮侯侵侶便係促俄俊俎俐俑俔俗俘俚俛保俟信俣俤俥修俯俳俵俶俸俺俾倅倆倉個倍倏們倒倔倖候倚借倡倣値倥倦倨倩倪倫倬倭倶倹偃假偈偉偏偐偕偖做停健偬偲側偵偶偸偽傀傅傍傑傘備傚催傭傲傳傴債傷傾僂僅僉僊働像僑僕僖僚僞僣僥僧僭僮僵價僻儀儁儂億儉儒儔儕儖儘儚償儡優儲儷儺儻儼儿兀允元兄充兆兇先光克兌免兎児兒兔党兜兢入全兩兪八公六兮共兵其具典兼冀冂内円冉冊册再冏冐冑冒冓冕冖冗写冠冢冤冥冦冨冩冪冫冬冰冱冲决冴况冶冷冽凄凅准凉凋凌凍凖凛凜凝几凡処凧凩凪凭凰凱凵凶凸凹出函凾刀刃刄分切刈刊刋刎刑刔列初判別刧利刪刮到刳制刷券刹刺刻剃剄則削剋剌前剏剔剖剛剞剣剤剥剩剪副剰剱割剳剴創剽剿劃劇劈劉劍劑劒劔力功加劣助努劫劬劭励労劵効劼劾勁勃勅勇勉勍勒動勗勘務勝勞募勠勢勣勤勦勧勲勳勵勸勹勺勾勿匁匂包匆匈匍匏匐匕化北匙匚匝匠匡匣匪匯匱匳匸匹区医匿區十千卅卆升午卉半卍卑卒卓協南単博卜卞占卦卩卮卯印危即却卵卷卸卻卿厂厄厖厘厚原厠厥厦厨厩厭厮厰厳厶去参參又叉及友双反収叔取受叙叛叟叡叢口古句叨叩只叫召叭叮可台叱史右叶号司叺吁吃各合吉吊吋同名后吏吐向君吝吟吠否吩含听吭吮吶吸吹吻吼吽吾呀呂呆呈呉告呎呑呟周呪呰呱味呵呶呷呻呼命咀咄咆咋和咎咏咐咒咢咤咥咨咫咬咯咲咳咸咼咽咾哀品哂哄哇哈哉哘員哢哥哦哨哩哭哮哲哺哽唄唆唇唏唐唔唖售唯唱唳唸唹唾啀啄啅商啌問啓啖啗啜啝啣啻啼啾喀喃善喇喉喊喋喘喙喚喜喝喞喟喧喨喩喪喫喬單喰営嗄嗅嗇嗔嗚嗜嗟嗣嗤嗷嗹嗽嗾嘆嘉嘔嘖嘗嘘嘛嘩嘯嘱嘲嘴嘶嘸噂噌噎噐噛噤器噪噫噬噴噸噺嚀嚆嚇嚊嚏嚔嚠嚢嚥嚮嚴嚶嚼囀囁囂囃囈囎囑囓囗囘囚四回因団囮困囲図囹固国囿圀圃圄圈圉國圍圏園圓圖團圜土圦圧在圭地圷圸圻址坂均坊坎坏坐坑坡坤坦坩坪坿垂垈垉型垓垠垢垣垤垪垰垳埀埃埆埋城埒埓埔埖埜域埠埣埴執培基埼堀堂堅堆堊堋堕堙堝堡堤堪堯堰報場堵堺堽塀塁塊塋塑塒塔塗塘塙塚塞塢塩填塰塲塵塹塾境墅墓増墜墟墨墫墮墳墸墹墺墻墾壁壅壇壊壌壑壓壕壗壘壙壜壞壟壤壥士壬壮壯声壱売壷壹壺壻壼壽夂変夊夏夐夕外夘夙多夛夜夢夥大天太夫夬夭央失夲夷夸夾奄奇奈奉奎奏奐契奔奕套奘奚奠奢奥奧奨奩奪奬奮女奴奸好妁如妃妄妊妍妓妖妙妛妝妣妥妨妬妲妹妻妾姆姉始姐姑姓委姙姚姜姥姦姨姪姫姶姻姿威娃娉娑娘娚娜娟娠娥娩娯娵娶娼婀婁婆婉婚婢婦婪婬婿媒媚媛媼媽媾嫁嫂嫉嫋嫌嫐嫖嫗嫡嫣嫦嫩嫺嫻嬉嬋嬌嬖嬢嬪嬬嬰嬲嬶嬾孀孃孅子孑孔孕字存孚孛孜孝孟季孤孥学孩孫孰孱孳孵學孺宀它宅宇守安宋完宍宏宕宗官宙定宛宜宝実客宣室宥宦宮宰害宴宵家宸容宿寂寃寄寅密寇寉富寐寒寓寔寛寝寞察寡寢寤寥實寧寨審寫寮寰寳寵寶寸寺対寿封専射尅将將專尉尊尋對導小少尓尖尚尠尢尤尨尭就尸尹尺尻尼尽尾尿局屁居屆屈届屋屍屎屏屐屑屓展属屠屡層履屬屮屯山屶屹岌岐岑岔岡岨岩岫岬岱岳岶岷岸岻岼岾峅峇峙峠峡峨峩峪峭峯峰島峺峻峽崇崋崎崑崔崕崖崗崘崙崚崛崟崢崩嵋嵌嵎嵐嵒嵜嵩嵬嵯嵳嵶嶂嶄嶇嶋嶌嶐嶝嶢嶬嶮嶷嶺嶼嶽巉巌巍巒巓巖巛川州巡巣工左巧巨巫差己已巳巴巵巷巻巽巾市布帆帋希帑帖帙帚帛帝帥師席帯帰帳帶帷常帽幀幃幄幅幇幌幎幔幕幗幟幡幢幣幤干平年幵并幸幹幺幻幼幽幾广庁広庄庇床序底庖店庚府庠度座庫庭庵庶康庸廁廂廃廈廉廊廏廐廓廖廚廛廝廟廠廡廢廣廨廩廬廰廱廳廴延廷廸建廻廼廾廿弁弃弄弉弊弋弌弍式弐弑弓弔引弖弗弘弛弟弥弦弧弩弭弯弱張強弸弼弾彁彈彊彌彎彑当彖彗彙彜彝彡形彦彩彪彫彬彭彰影彳彷役彼彿往征徂徃径待徇很徊律後徐徑徒従得徘徙從徠御徨復循徭微徳徴徹徼徽心必忌忍忖志忘忙応忝忠忤快忰忱念忸忻忽忿怎怏怐怒怕怖怙怛怜思怠怡急怦性怨怩怪怫怯怱怺恁恂恃恆恊恋恍恐恒恕恙恚恟恠恢恣恤恥恨恩恪恫恬恭息恰恵恷悁悃悄悉悋悌悍悒悔悖悗悚悛悟悠患悦悧悩悪悲悳悴悵悶悸悼悽情惆惇惑惓惘惚惜惟惠惡惣惧惨惰惱想惴惶惷惹惺惻愀愁愃愆愈愉愍愎意愕愚愛感愡愧愨愬愴愼愽愾愿慂慄慇慈慊態慌慍慎慓慕慘慙慚慝慟慢慣慥慧慨慫慮慯慰慱慳慴慵慶慷慾憂憇憊憎憐憑憔憖憙憚憤憧憩憫憬憮憲憶憺憾懃懆懇懈應懊懋懌懍懐懣懦懲懴懶懷懸懺懼懽懾懿戀戈戉戊戌戍戎成我戒戔或戚戛戝戞戟戡戦截戮戯戰戲戳戴戸戻房所扁扇扈扉手才扎打払托扛扞扠扣扨扮扱扶批扼找承技抂抃抄抉把抑抒抓抔投抖抗折抛抜択披抬抱抵抹抻押抽拂担拆拇拈拉拊拌拍拏拐拑拒拓拔拗拘拙招拜拝拠拡括拭拮拯拱拳拵拶拷拾拿持挂指挈按挌挑挙挟挧挨挫振挺挽挾挿捉捌捍捏捐捕捗捜捧捨捩捫据捲捶捷捺捻掀掃授掉掌掎掏排掖掘掛掟掠採探掣接控推掩措掫掬掲掴掵掻掾揀揃揄揆揉描提插揖揚換握揣揩揮援揶揺搆損搏搓搖搗搜搦搨搬搭搴搶携搾摂摎摘摧摩摯摶摸摺撃撈撒撓撕撚撞撤撥撩撫播撮撰撲撹撻撼擁擂擅擇操擒擔擘據擠擡擢擣擦擧擬擯擱擲擴擶擺擽擾攀攅攘攜攝攣攤攪攫攬支攴攵收攷攸改攻放政故效敍敏救敕敖敗敘教敝敞敢散敦敬数敲整敵敷數斂斃文斈斉斌斎斐斑斗料斛斜斟斡斤斥斧斫斬断斯新斷方於施旁旃旄旅旆旋旌族旒旗旙旛无旡既日旦旧旨早旬旭旱旺旻昂昃昆昇昊昌明昏易昔昜星映春昧昨昭是昴昵昶昼昿晁時晃晄晉晋晏晒晝晞晟晢晤晦晧晨晩普景晰晴晶智暁暃暄暇暈暉暎暑暖暗暘暝暢暦暫暮暴暸暹暼暾曁曄曇曉曖曙曚曜曝曠曦曩曰曲曳更曵曷書曹曼曽曾替最會月有朋服朏朔朕朖朗望朝朞期朦朧木未末本札朮朱朴朶朷朸机朽朿杁杆杉李杏材村杓杖杙杜杞束杠条杢杣杤来杪杭杯杰東杲杳杵杷杼松板枅枇枉枋枌析枕林枚果枝枠枡枢枦枩枯枳枴架枷枸枹柁柄柆柊柎柏某柑染柔柘柚柝柞柢柤柧柩柬柮柯柱柳柴柵査柾柿栂栃栄栓栖栗栞校栢栩株栫栲栴核根格栽桀桁桂桃框案桍桎桐桑桓桔桙桜桝桟档桧桴桶桷桾桿梁梃梅梍梏梓梔梗梛條梟梠梢梦梧梨梭梯械梱梳梵梶梹梺梼棄棆棉棊棋棍棒棔棕棗棘棚棟棠棡棣棧森棯棲棹棺椀椁椄椅椈椋椌植椎椏椒椙椚椛検椡椢椣椥椦椨椪椰椴椶椹椽椿楊楓楔楕楙楚楜楝楞楠楡楢楪楫業楮楯楳楴極楷楸楹楼楽楾榁概榊榎榑榔榕榛榜榠榧榮榱榲榴榻榾榿槁槃槇槊構槌槍槎槐槓様槙槝槞槧槨槫槭槲槹槻槽槿樂樅樊樋樌樒樓樔樗標樛樞樟模樢樣権横樫樮樵樶樸樹樺樽橄橇橈橋橘橙機橡橢橦橲橸橿檀檄檍檎檐檗檜檠檢檣檪檬檮檳檸檻櫁櫂櫃櫑櫓櫚櫛櫞櫟櫨櫪櫺櫻欄欅權欒欖欝欟欠次欣欧欲欷欸欹欺欽款歃歇歉歌歎歐歓歔歙歛歟歡止正此武歩歪歯歳歴歸歹死歿殀殃殄殆殉殊残殍殕殖殘殞殤殪殫殯殱殲殳殴段殷殺殻殼殿毀毅毆毋母毎毒毓比毘毛毟毫毬毯毳氈氏民氓气気氛氣氤水氷永氾汀汁求汎汐汕汗汚汝汞江池汢汨汪汰汲汳決汽汾沁沂沃沈沌沍沐沒沓沖沙沚沛没沢沫沮沱河沸油沺治沼沽沾沿況泄泅泉泊泌泓法泗泙泛泝泡波泣泥注泪泯泰泱泳洋洌洒洗洙洛洞洟津洩洪洫洲洳洵洶洸活洽派流浄浅浙浚浜浣浤浦浩浪浬浮浴海浸浹涅消涌涎涓涕涙涛涜涯液涵涸涼淀淅淆淇淋淌淑淒淕淘淙淞淡淤淦淨淪淫淬淮深淳淵混淹淺添清渇済渉渊渋渓渕渙渚減渝渟渠渡渣渤渥渦温渫測渭渮港游渺渾湃湊湍湎湖湘湛湟湧湫湮湯湲湶湾湿満溂溌溏源準溘溜溝溟溢溥溪溯溲溶溷溺溽滂滄滅滉滋滌滑滓滔滕滝滞滬滯滲滴滷滸滾滿漁漂漆漉漏漑漓演漕漠漢漣漫漬漱漲漸漾漿潁潅潔潘潛潜潟潤潦潭潮潯潰潴潸潺潼澀澁澂澄澆澎澑澗澡澣澤澪澱澳澹激濁濂濃濆濔濕濘濛濟濠濡濤濫濬濮濯濱濳濶濺濾瀁瀉瀋瀏瀑瀕瀘瀚瀛瀝瀞瀟瀦瀧瀬瀰瀲瀾灌灑灘灣火灯灰灸灼災炉炊炎炒炙炬炭炮炯炳炸点為烈烋烏烙烝烟烱烹烽焉焔焙焚焜無焦然焼煉煌煎煕煖煙煢煤煥煦照煩煬煮煽熄熈熊熏熔熕熙熟熨熬熱熹熾燃燈燉燎燐燒燔燕燗營燠燥燦燧燬燭燮燵燹燻燼燿爆爍爐爛爨爪爬爭爰爲爵父爺爻爼爽爾爿牀牆片版牋牌牒牘牙牛牝牟牡牢牧物牲牴特牽牾犀犁犂犇犒犖犠犢犧犬犯犲状犹狂狃狄狆狎狐狒狗狙狛狠狡狢狩独狭狷狸狹狼狽猊猖猗猛猜猝猟猥猩猪猫献猯猴猶猷猾猿獄獅獎獏獗獣獨獪獰獲獵獸獺獻玄率玉王玖玩玲玳玻珀珂珈珊珍珎珞珠珥珪班珮珱珸現球琅理琉琢琥琲琳琴琵琶琺琿瑁瑕瑙瑚瑛瑜瑞瑟瑠瑣瑤瑩瑪瑯瑰瑳瑶瑾璃璋璞璢璧環璽瓊瓏瓔瓜瓠瓢瓣瓦瓧瓩瓮瓰瓱瓲瓶瓷瓸甃甄甅甌甍甎甑甓甕甘甚甜甞生産甥甦用甫甬田由甲申男甸町画甼畄畆畉畊畋界畍畏畑畔留畚畛畜畝畠畢畤略畦畧畩番畫畭異畳畴當畷畸畿疂疆疇疉疊疋疎疏疑疔疚疝疣疥疫疱疲疳疵疸疹疼疽疾痂痃病症痊痍痒痔痕痘痙痛痞痢痣痩痰痲痳痴痺痼痾痿瘁瘉瘋瘍瘟瘠瘡瘢瘤瘧瘰瘴瘻療癆癇癈癌癒癖癘癜癡癢癧癨癩癪癬癰癲癶癸発登發白百皀皃的皆皇皈皋皎皐皓皖皙皚皮皰皴皷皸皹皺皿盂盃盆盈益盍盒盖盗盛盜盞盟盡監盤盥盧盪目盲直相盻盾省眄眇眈眉看県眛眞真眠眤眥眦眩眷眸眺眼着睇睚睛睡督睥睦睨睫睹睾睿瞋瞎瞑瞞瞠瞥瞬瞭瞰瞳瞶瞹瞻瞼瞽瞿矇矍矗矚矛矜矢矣知矧矩短矮矯石矼砂砌砒研砕砠砥砦砧砲破砺砿硅硝硫硬硯硲硴硼碁碆碇碌碍碎碑碓碕碗碚碣碧碩碪碯碵確碼碾磁磅磆磊磋磐磑磔磚磧磨磬磯磴磽礁礇礎礑礒礙礦礪礫礬示礼社祀祁祇祈祉祐祓祕祖祗祚祝神祟祠祢祥票祭祷祺祿禀禁禄禅禊禍禎福禝禦禧禪禮禰禳禹禺禽禾禿秀私秉秋科秒秕秘租秡秣秤秦秧秩秬称移稀稈程稍税稔稗稘稙稚稜稟稠種稱稲稷稻稼稽稾稿穀穂穃穆穉積穎穏穐穗穡穢穣穩穫穰穴究穹空穽穿突窃窄窈窒窓窕窖窗窘窟窩窪窮窯窰窶窺窿竃竄竅竇竈竊立竍竏竒竓竕站竚竜竝竟章竡竢竣童竦竪竭端竰競竸竹竺竿笂笄笆笈笊笋笏笑笘笙笛笞笠笥符笨第笳笵笶笹筅筆筈等筋筌筍筏筐筑筒答策筝筥筧筬筮筰筱筴筵筺箆箇箋箍箏箒箔箕算箘箙箚箜箝箟管箪箭箱箴箸節篁範篆篇築篋篌篏篝篠篤篥篦篩篭篳篶篷簀簇簍簑簒簓簔簗簟簡簣簧簪簫簷簸簽簾簿籀籃籌籍籏籐籔籖籘籟籠籤籥籬米籵籾粁粂粃粉粋粍粐粒粕粗粘粛粟粡粢粤粥粧粨粫粭粮粱粲粳粹粽精糀糂糅糊糎糒糖糘糜糞糟糠糢糧糯糲糴糶糸糺系糾紀紂約紅紆紊紋納紐純紕紗紘紙級紛紜素紡索紫紬紮累細紲紳紵紹紺紿終絃組絅絆絋経絎絏結絖絛絞絡絢絣給絨絮統絲絳絵絶絹絽綉綏經継続綛綜綟綢綣綫綬維綮綯綰綱網綴綵綸綺綻綽綾綿緇緊緋総緑緒緕緘線緜緝緞締緡緤編緩緬緯緲練緻縁縄縅縉縊縋縒縛縞縟縡縢縣縦縫縮縱縲縵縷縹縺縻總績繁繃繆繊繋繍織繕繖繙繚繝繞繦繧繩繪繭繰繹繻繼繽繿纂纃纈纉續纎纏纐纒纓纔纖纛纜缶缸缺罅罌罍罎罐网罔罕罘罟罠罧罨罩罪罫置罰署罵罷罸罹羂羃羅羆羇羈羊羌美羔羚羝羞羣群羨義羮羯羲羶羸羹羽翁翅翆翊翌習翔翕翠翡翦翩翫翰翳翹翻翼耀老考耄者耆耋而耐耒耕耗耘耙耜耡耨耳耶耻耽耿聆聊聒聖聘聚聞聟聡聢聨聯聰聲聳聴聶職聹聽聾聿肄肅肆肇肉肋肌肓肖肘肚肛肝股肢肥肩肪肬肭肯肱育肴肺胃胄胆背胎胖胙胚胛胝胞胡胤胥胯胱胴胸胼能脂脅脆脇脈脉脊脚脛脣脩脯脱脳脹脾腆腋腎腐腑腓腔腕腟腥腦腫腮腰腱腴腸腹腺腿膀膂膃膈膊膏膓膕膚膜膝膠膣膤膨膩膰膳膵膸膺膽膾膿臀臂臆臈臉臍臑臓臘臙臚臟臠臣臥臧臨自臭至致臺臻臼臾舁舂舅與興舉舊舌舍舎舐舒舖舗舘舛舜舞舟舩航舫般舮舳舵舶舷舸船艀艇艘艙艚艝艟艢艤艦艨艪艫艮良艱色艶艷艸艾芋芍芒芙芝芟芥芦芫芬芭芯花芳芸芹芻芽苅苑苒苓苔苗苙苛苜苞苟苡苣若苦苧苫英苳苴苹苺苻茂范茄茅茆茉茎茖茗茘茜茣茨茫茯茱茲茴茵茶茸茹荀荅草荊荏荐荒荘荳荵荷荻荼莅莇莉莊莎莓莖莚莞莟莠莢莨莪莫莱莵莽菁菅菊菌菎菓菖菘菜菟菠菩菫華菰菱菲菴菷菻菽萃萄萇萋萌萍萎萓萠萢萩萪萬萱萵萸萼落葆葉葎著葛葡葢董葦葩葫葬葭葮葯葱葵葷葹葺蒂蒄蒋蒐蒔蒙蒜蒟蒡蒭蒲蒸蒹蒻蒼蒿蓁蓄蓆蓉蓊蓋蓍蓐蓑蓖蓙蓚蓬蓮蓴蓼蓿蔀蔆蔑蔓蔔蔕蔗蔘蔚蔟蔡蔦蔬蔭蔵蔽蕀蕁蕃蕈蕉蕊蕋蕎蕕蕗蕘蕚蕣蕨蕩蕪蕭蕷蕾薀薄薇薈薊薐薑薔薗薙薛薜薤薦薨薩薪薫薬薮薯薹薺藁藉藍藏藐藕藜藝藤藥藩藪藷藹藺藻藾蘂蘆蘇蘊蘋蘓蘖蘗蘚蘢蘭蘯蘰蘿虍虎虐虔處虚虜虞號虧虫虱虹虻蚊蚋蚌蚓蚕蚣蚤蚩蚪蚫蚯蚰蚶蛄蛆蛇蛉蛋蛍蛎蛔蛙蛛蛞蛟蛤蛩蛬蛭蛮蛯蛸蛹蛻蛾蜀蜂蜃蜆蜈蜉蜊蜍蜑蜒蜘蜚蜜蜥蜩蜴蜷蜻蜿蝉蝋蝌蝎蝓蝕蝗蝙蝟蝠蝣蝦蝨蝪蝮蝴蝶蝸蝿螂融螟螢螫螯螳螺螻螽蟀蟄蟆蟇蟋蟐蟒蟠蟯蟲蟶蟷蟹蟻蟾蠅蠍蠎蠏蠑蠕蠖蠡蠢蠣蠧蠱蠶蠹蠻血衂衄衆行衍衒術街衙衛衝衞衡衢衣表衫衰衲衵衷衽衾衿袁袂袈袋袍袒袖袗袙袞袢袤被袮袰袱袴袵袷袿裁裂裃裄装裏裔裕裘裙補裝裟裡裨裲裳裴裸裹裼製裾褂褄複褊褌褐褒褓褝褞褥褪褫褶褸褻襁襃襄襌襍襖襞襟襠襤襦襪襭襯襲襴襷襾西要覃覆覇覈覊見規覓視覗覘覚覡覦覧覩親覬覯覲観覺覽覿觀角觚觜觝解触觧觴觸言訂訃計訊訌討訐訓訖託記訛訝訟訣訥訪設許訳訴訶診註証詁詆詈詐詑詒詔評詛詞詠詢詣試詩詫詬詭詮詰話該詳詼誂誄誅誇誉誌認誑誓誕誘誚語誠誡誣誤誥誦誨説読誰課誹誼調諂諄談請諌諍諏諒論諚諛諜諞諠諡諢諤諦諧諫諭諮諱諳諷諸諺諾謀謁謂謄謇謌謎謐謔謖謗謙謚講謝謠謡謦謨謫謬謳謹謾譁證譌譎譏譖識譚譛譜譟警譫譬譯議譱譲譴護譽讀讃變讌讎讐讒讓讖讙讚谷谺谿豁豆豈豊豌豎豐豕豚象豢豪豫豬豸豹豺豼貂貅貉貊貌貍貎貔貘貝貞負財貢貧貨販貪貫責貭貮貯貰貲貳貴貶買貸費貼貽貿賀賁賂賃賄資賈賊賍賎賑賓賚賛賜賞賠賢賣賤賦質賭賺賻購賽贄贅贇贈贊贋贍贏贐贓贔贖赤赦赧赫赭走赱赳赴起趁超越趙趣趨足趺趾跂跋跌跏跖跚跛距跟跡跣跨跪跫路跳践跼跿踈踉踊踏踐踝踞踟踪踰踴踵蹂蹄蹇蹈蹉蹊蹌蹐蹕蹙蹟蹠蹣蹤蹲蹴蹶蹼躁躄躅躇躊躋躍躑躓躔躙躡躪身躬躯躰躱躾軅軆軈車軋軌軍軒軛軟転軣軫軸軻軼軽軾較輅載輊輌輒輓輔輕輙輛輜輝輟輦輩輪輯輳輸輹輻輾輿轂轄轅轆轉轌轍轎轗轜轟轡轢轣轤辛辜辞辟辣辧辨辭辮辯辰辱農辷辺辻込辿迂迄迅迎近返迚迢迥迦迩迪迫迭迯述迴迷迸迹迺追退送逃逅逆逋逍逎透逐逑逓途逕逖逗這通逝逞速造逡逢連逧逮週進逵逶逸逹逼逾遁遂遅遇遉遊運遍過遏遐遑遒道達違遖遘遙遜遞遠遡遣遥遨適遭遮遯遲遵遶遷選遺遼遽避邀邁邂邃還邇邉邊邏邑那邦邨邪邯邱邵邸郁郊郎郛郡郢郤部郭郵郷都鄂鄒鄙鄭鄰鄲酉酊酋酌配酎酒酔酖酘酢酣酥酩酪酬酲酳酵酷酸醂醇醉醋醍醐醒醗醜醢醤醪醫醯醴醵醸醺釀釁釆采釈釉釋里重野量釐金釖釘釛釜針釟釡釣釦釧釵釶釼釿鈍鈎鈑鈔鈕鈞鈩鈬鈴鈷鈿鉄鉅鉈鉉鉋鉐鉗鉚鉛鉞鉢鉤鉦鉱鉾銀銃銅銑銓銕銖銘銚銛銜銭銷銹鋏鋒鋤鋩鋪鋭鋲鋳鋸鋺鋼錆錏錐錘錙錚錠錢錣錦錨錫錬錮錯録錵錺錻鍄鍋鍍鍔鍖鍛鍜鍠鍬鍮鍵鍼鍾鎌鎔鎖鎗鎚鎧鎬鎭鎮鎰鎹鏃鏈鏐鏑鏖鏗鏘鏝鏡鏤鏥鏨鐃鐇鐐鐓鐔鐘鐙鐚鐡鐫鐵鐶鐸鐺鑁鑄鑑鑒鑓鑚鑛鑞鑠鑢鑪鑰鑵鑷鑼鑽鑾鑿钁長門閂閃閇閉閊開閏閑間閔閖閘閙閠関閣閤閥閧閨閭閲閹閻閼閾闃闇闊闌闍闔闕闖闘關闡闢闥阜阡阨阪阮阯防阻阿陀陂附陋陌降陏限陛陜陝陞陟院陣除陥陦陪陬陰陲陳陵陶陷陸険陽隅隆隈隊隋隍階随隔隕隗隘隙際障隠隣隧隨險隰隱隲隴隶隷隸隹隻隼雀雁雄雅集雇雉雋雌雍雎雑雕雖雙雛雜離難雨雪雫雰雲零雷雹電需霄霆震霈霊霍霎霏霑霓霖霙霜霞霤霧霪霰露霸霹霽霾靂靄靆靈靉青靖静靜非靠靡面靤靦靨革靫靭靱靴靹靺靼鞁鞄鞅鞆鞋鞍鞏鞐鞘鞜鞠鞣鞦鞨鞫鞭鞳鞴韃韆韈韋韓韜韭韮韲音韵韶韻響頁頂頃項順須頌頏預頑頒頓頗領頚頡頤頬頭頴頷頸頻頼頽顆顋題額顎顏顔顕願顛類顧顫顯顰顱顳顴風颪颯颱颶飃飄飆飛飜食飢飩飫飭飮飯飲飴飼飽飾餃餅餉養餌餐餒餓餔餘餝餞餠餡餤館餬餮餽餾饂饅饉饋饌饐饑饒饕饗首馗馘香馥馨馬馭馮馳馴馼駁駄駅駆駈駐駑駒駕駘駛駝駟駢駭駮駱駲駸駻駿騁騅騎騏騒験騙騨騫騰騷騾驀驂驃驅驍驕驗驚驛驟驢驤驥驩驪驫骨骭骰骸骼髀髄髏髑髓體高髞髟髢髣髦髪髫髭髮髯髱髴髷髻鬆鬘鬚鬟鬢鬣鬥鬧鬨鬩鬪鬮鬯鬱鬲鬻鬼魁魂魃魄魅魍魎魏魑魔魘魚魯魴鮃鮎鮑鮒鮓鮖鮗鮟鮠鮨鮪鮫鮭鮮鮴鮹鯀鯆鯉鯊鯏鯑鯒鯔鯖鯛鯡鯢鯣鯤鯨鯰鯱鯲鯵鰄鰆鰈鰉鰊鰌鰍鰐鰒鰓鰔鰕鰛鰡鰤鰥鰭鰮鰯鰰鰲鰹鰺鰻鰾鱆鱇鱈鱒鱗鱚鱠鱧鱶鱸鳥鳧鳩鳫鳬鳰鳳鳴鳶鴃鴆鴇鴈鴉鴎鴒鴕鴛鴟鴣鴦鴨鴪鴫鴬鴻鴾鴿鵁鵄鵆鵈鵐鵑鵙鵜鵝鵞鵠鵡鵤鵬鵯鵲鵺鶇鶉鶏鶚鶤鶩鶫鶯鶲鶴鶸鶺鶻鷁鷂鷄鷆鷏鷓鷙鷦鷭鷯鷲鷸鷹鷺鷽鸚鸛鸞鹵鹸鹹鹽鹿麁麈麋麌麑麒麓麕麗麝麟麥麦麩麪麭麸麹麺麻麼麾麿黄黌黍黎黏黐黒黔默黙黛黜黝點黠黥黨黯黴黶黷黹黻黼黽鼇鼈鼎鼓鼕鼠鼡鼬鼻鼾齊齋齎齏齒齔齟齠齡齢齣齦齧齪齬齲齶齷龍龕龜龝龠！＃＄％＆（）＊＋，．／０１２３４５６７８９：；＜＝＞？＠ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ［］＾＿｀ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ｛｜｝￣￥",[],["Latin"],29],"Hebrew":["ְֱֲֳִֵֶַָֹֺֻּ־׀ׁׂ׃ׇאבגדהוזחטיךכלםמןנסעףפץצקרשת׳״₪◌שׁשׂשּׁשּׂאַאָאּבּגּדּהּוּזּטּיּךּכּלּמּנּסּףּפּצּקּרּשּתּוֹ",["Hebrew"],["Latin"],28],"Tamil":["।॥ஂஃஅஆஇஈஉஊஎஏஐஒஓஔகஙசஜஞடணதநனபமயரறலளழவஶஷஸஹாிீுூெேைொோௌ்ௐௗ௦௧௨௩௪௫௬௭௮௯௰௱௲௳௴௵௶௷௸௹௺​‌‍₹◌",["Tamil"],["Latin"],37],"Sinhala":["।॥ංඃඅආඇඈඉඊඋඌඍඎඏඐඑඒඓඔඕඖකඛගඝඞඟචඡජඣඤඥඦටඨඩඪණඬතථදධනඳපඵබභමඹයරලවශෂසහළෆ්ාැෑිීුූෘෙේෛොෝෞෟෲෳ෴​‌‍◌",["Sinhala"],["Latin"],36],"Greek":["ͰͱͲͳʹ͵Ͷͷ͸͹ͺͻͼͽ;Ϳ΀΁΂΃΄΅Ά·ΈΉΊ΋Ό΍ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ΢ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώϏϐϑϒϓϔϕϖϗϘϙϚϛϜϝϞϟϠϡϢϣϤϥϦϧϨϩϪϫϬϭϮϯϰϱϲϳϴϵ϶ϷϸϹϺϻϼϽϾϿ",[],["Latin"],21],"Latin Pro Optional":["",[],[],2],"Latin Plus Optional":["",[],[],1],"Latin Pro":["ɰʹʺʻʾʿˈˊˋˌπḈḉḌḍḎḏḔḕḖḗḜḝḠḡḤḥḪḫḮḯḶḷḺḻṂṃṄṅṆṇṈṉṌṍṎṏṐṑṒṓṚṛṞṟṠṡṢṣṤṥṦṧṨṩṬṭṮṯṸṹṺṻẎẏẒẓẗ    ​‐‒―′″⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉ℓΩ℮∂∅∆∏∑√∞∫◊",["Tongan","Uzbek"],["Latin Plus"],4],"Cyrillic Historical":["ѠѡѤѥѦѧѨѩѬѭѮѯѰѱѶѷѸѹѺѻѼѽѾѿҀҁ҂҃҄҅҆҇҈҉Ꙍꙍ",[],["Cyrillic Plus","Latin Plus"],14],"Cyrillic Plus Locl":["",[],["Cyrillic Plus","Latin Plus"],11],"Cyrillic Pro":["ҊҋҌҍҎҏҔҕҞҟҨҩҬҭҴҵҼҽҾҿӃӄӅӆӇӈӉӊӍӎӚӛӠӡӪӫӬӭӺӻӼӽӾӿԐԑԒԓԤԥԦԧԨԩԮԯ",["Kyrgyz"],["Cyrillic Plus","Latin Plus"],12],"Cyrillic Plus":["ʼ̀́̄̈̋ЀЁЂЃЄЅІЇЈЉЊЋЌЍЎЏАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяѐёђѓєѕіїјљњћќѝўџѢѣѪѫѲѳѴѵҐґҒғҖҗҘҙҚқҜҝҠҡҢңҤҥҪҫҮүҰұҲҳҶҷҸҹҺһӀӁӂӋӌӏӐӑӒӓӔӕӖӗӘәӜӝӞӟӢӣӤӥӦӧӨөӮӯӰӱӲӳӴӵӶӷӸӹԚԛԜԝ₮₴₸№",["Belarusian","Bulgarian","Kazakh","Macedonian","Mongolian","Russian","Serbian","Ukrainian"],["Latin Plus"],9],"Latin Plus":[" !\\"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĴĵĶķĸĹĺĻļĽľĿŀŁłŃńŅņŇňŊŋŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽžƏƒƠơƯưǄǅǆǇǈǉǊǋǌǦǧǪǫǺǻǼǽǾǿȀȁȂȃȄȅȆȇȈȉȊȋȌȍȎȏȐȑȒȓȔȕȖȗȘșȚțȪȫȬȭȰȱȲȳȷəʼˆˇˉ˘˙˚˛˜˝̧̨̛̣̤̦̮̱̀́̂̃̄̆̇̈̉̊̋̌̏̑̒ẀẁẂẃẄẅẞẠạẢảẤấẦầẨẩẪẫẬậẮắẰằẲẳẴẵẶặẸẹẺẻẼẽẾếỀềỂểỄễỆệỈỉỊịỌọỎỏỐốỒồỔổỖỗỘộỚớỜờỞởỠỡỢợỤụỦủỨứỪừỬửỮữỰựỲỳỴỵỶỷỸỹ–—‘’‚“”„†‡•…‰‹›⁄⁴₡₣₤₦₧₩₫€₭₱₲₵₹₺₼₽№™−∕∙≈≠≤≥ﬀﬁﬂﬃﬄ",["Afrikaans","Albanian","Azerbaijani","Basque","Bosnian","Catalan","Croatian","Czech","Danish","Dutch","English","Estonian","Faroese","Filipino","Finnish","French","Galician","German","Hungarian","Icelandic","Indonesian","Irish","Italian","Latvian","Lithuanian","Malay","Norwegian Bokmål","Polish","Portuguese","Romanian","Slovak","Slovenian","Spanish","Swahili","Swedish","Turkish","Vietnamese","Welsh","Zulu"],[],0],"Latin Expert":["⅓⅔⅛⅜⅝⅞←↑→↓■□▲△▶▷▼▽◀◁◆◇",[],["Latin Plus","Latin Pro"],6],"Greek Expert":["",[],["Greek Core","Greek Plus","Latin Plus"],25],"Greek Plus":["͂̓̈́ͅͺἀἁἂἃἄἅἆἇἈἉἊἋἌἍἎἏἐἑἒἓἔἕἘἙἚἛἜἝἠἡἢἣἤἥἦἧἨἩἪἫἬἭἮἯἰἱἲἳἴἵἶἷἸἹἺἻἼἽἾἿὀὁὂὃὄὅὈὉὊὋὌὍὐὑὒὓὔὕὖὗὙὛὝὟὠὡὢὣὤὥὦὧὨὩὪὫὬὭὮὯὰάὲέὴήὶίὸόὺύὼώᾀᾁᾂᾃᾄᾅᾆᾇᾈᾉᾊᾋᾌᾍᾎᾏᾐᾑᾒᾓᾔᾕᾖᾗᾘᾙᾚᾛᾜᾝᾞᾟᾠᾡᾢᾣᾤᾥᾦᾧᾨᾩᾪᾫᾬᾭᾮᾯᾰᾱᾲᾳᾴᾶᾷᾸᾹᾺΆᾼ᾽ι᾿῀῁ῂῃῄῆῇῈΈῊΉῌ῍῎῏ῐῑῒΐῖῗῘῙῚΊ῝῞῟ῠῡῢΰῤῥῦῧῨῩῪΎῬ῭΅`ῲῳῴῶῷῸΌῺΏῼ´῾",[],["Greek Core","Latin Plus"],23],"Greek Coptic":["ϢϣϤϥϦϧϨϩϪϫϬϭϮϯⲀⲁⲂⲃⲄⲅⲆⲇⲈⲉⲊⲋⲌⲍⲎⲏⲐⲑⲒⲓⲔⲕⲖⲗⲘⲙⲚⲛⲜⲝⲞⲟⲠⲡⲢⲣⲤⲥⲦⲧⲨⲩⲪⲫⲬⲭⲮⲯⲰⲱⲲⲳⲴⲵⲶⲷⲸⲹⲺⲻⲼⲽⲾⲿⳀⳁⳂⳃⳄⳅⳆⳇⳈⳉⳊⳋⳌⳍⳎⳏⳐⳑⳒⳓⳔⳕⳖⳗⳘⳙⳚⳛⳜⳝⳞⳟⳠⳡⳢⳣⳤ⳥⳦⳧⳨⳩⳪ⳫⳬⳭⳮ⳯⳰⳱Ⳳⳳ⳹⳺⳻⳼⳽⳾⳿",[],[],20],"Greek Pro":["˙̣͙̅͜ϚϛϜϝϞϟϠϡ‖※‿⁂⁖⁘⁙⁚⁛⁜⁝⁞⁺⁻⁼₊₋₌ℵℶ⊗⋮⏑⏒⏓⏔⏕⏖⏗⏘⏙⫽⸀⸁⸂⸃⸄⸅⸆⸇⸈⸉⸊⸋⸌⸍⸎⸏⸐⸑⸒⸓⸔⸕⸖⸗〈〉《》「」〚〛𝑙𝔐𝔓𝔖𝔭",[],[],17],"Greek Core":["ʹ͵;΄΅Ά·ΈΉΊΌΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώϏϗ",["Greek"],["Latin Plus"],22],"Greek Ancient Musical Symbols":["𝀀𝀁𝀂𝀃𝀄𝀅𝀆𝀇𝀈𝀉𝀊𝀋𝀌𝀍𝀎𝀏𝀐𝀑𝀒𝀓𝀔𝀕𝀖𝀗𝀘𝀙𝀚𝀛𝀜𝀝𝀞𝀟𝀠𝀡𝀢𝀣𝀤𝀥𝀦𝀧𝀨𝀩𝀪𝀫𝀬𝀭𝀮𝀯𝀰𝀱𝀲𝀳𝀴𝀵𝀶𝀷𝀸𝀹𝀺𝀻𝀼𝀽𝀾𝀿𝁀𝁁𝁂𝁃𝁄𝁅𝁆𝁇𝁈𝁉𝁊𝁋𝁌𝁍𝁎𝁏𝁐𝁑𝁒𝁓𝁔𝁕𝁖𝁗𝁘𝁙𝁚𝁛𝁜𝁝𝁞𝁟𝁠𝁡𝁢𝁣𝁤𝁥𝁦𝁧𝁨𝁩𝁪𝁫𝁬𝁭𝁮𝁯𝁰𝁱𝁲𝁳𝁴𝁵𝁶𝁷𝁸𝁹𝁺𝁻𝁼𝁽𝁾𝁿𝂀𝂁𝂂𝂃𝂄𝂅𝂆𝂇𝂈𝂉𝂊𝂋𝂌𝂍𝂎𝂏𝂐𝂑𝂒𝂓𝂔𝂕𝂖𝂗𝂘𝂙𝂚𝂛𝂜𝂝𝂞𝂟𝂠𝂡𝂢𝂣𝂤𝂥𝂦𝂧𝂨𝂩𝂪𝂫𝂬𝂭𝂮𝂯𝂰𝂱𝂲𝂳𝂴𝂵𝂶𝂷𝂸𝂹𝂺𝂻𝂼𝂽𝂾𝂿𝃀𝃁𝃂𝃃𝃄𝃅𝃆𝃇𝃈𝃉𝃊𝃋𝃌𝃍𝃎𝃏𝃐𝃑𝃒𝃓𝃔𝃕𝃖𝃗𝃘𝃙𝃚𝃛𝃜𝃝𝃞𝃟𝃠𝃡𝃢𝃣𝃤𝃥𝃦𝃧𝃨𝃩𝃪𝃫𝃬𝃭𝃮𝃯𝃰𝃱𝃲𝃳𝃴𝃵𝈀𝈁𝈂𝈃𝈄𝈅𝈆𝈇𝈈𝈉𝈊𝈋𝈌𝈍𝈎𝈏𝈐𝈑𝈒𝈓𝈔𝈕𝈖𝈗𝈘𝈙𝈚𝈛𝈜𝈝𝈞𝈟𝈠𝈡𝈢𝈣𝈤𝈥𝈦𝈧𝈨𝈩𝈪𝈫𝈬𝈭𝈮𝈯𝈰𝈱𝈲𝈳𝈴𝈵𝈶𝈷𝈸𝈹𝈺𝈻𝈼𝈽𝈾𝈿𝉀𝉁𝉂𝉃𝉄𝉅",[],[],18],"Greek Archaic":["ͰͱͲͳͶͷͻͼͽϐϑϒϓϔϕϖϘϙϰϱϲϳϴϵ϶ϷϸϹϺϻϼϽϾϿ□★☉☊☋☌☍☧☩☽☾☿♀♁♂♃♄♅♆♇♈♉♊♋♌♍♎♏♐♑♒♓⟀⟁𐅀𐅁𐅂𐅃𐅄𐅅𐅆𐅇𐅈𐅉𐅊𐅋𐅌𐅍𐅎𐅏𐅐𐅑𐅒𐅓𐅔𐅕𐅖𐅗𐅘𐅙𐅚𐅛𐅜𐅝𐅞𐅟𐅠𐅡𐅢𐅣𐅤𐅥𐅦𐅧𐅨𐅩𐅪𐅫𐅬𐅭𐅮𐅯𐅰𐅱𐅲𐅳𐅴𐅵𐅶𐅷𐅸𐅹𐅺𐅻𐅼𐅽𐅾𐅿𐆀𐆁𐆂𐆃𐆄𐆅𐆆𐆇𐆈𐆉𐆊",[],[],19],"Cyrillic Extended":["ѠѡѢѣѤѥѦѧѨѩѪѫѬѭѮѯѰѱѲѳѴѵѶѷѸѹѺѻѼѽѾѿҀҁ҂҃҄҅҆҇҈҉ҊҋҌҍҎҏҒғҔҕҖҗҘҙҚқҜҝҞҟҠҡҢңҤҥҦҧҨҩҪҫҬҭҮүҲҳҴҵҶҷҸҹҺһҼҽҾҿӀӁӂӃӄӅӆӇӈӉӊӋӌӍӎӏӐӑӒӓӔӕӖӗӘәӚӛӜӝӞӟӠӡӢӣӤӥӦӧӨөӪӫӬӭӮӯӰӱӲӳӴӵӶӷӸӹӺӻӼӽӾӿԀԁԂԃԄԅԆԇԈԉԊԋԌԍԎԏԐԑԒԓԔԕԖԗԘԙԚԛԜԝԞԟԠԡԢԣԤԥԦԧԨԩԪԫԬԭԮԯ₴ⷠⷡⷢⷣⷤⷥⷦⷧⷨⷩⷪⷫⷬⷭⷮⷯⷰⷱⷲⷳⷴⷵⷶⷷⷸⷹⷺⷻⷼⷽⷾⷿꙀꙁꙂꙃꙄꙅꙆꙇꙈꙉꙊꙋꙌꙍꙎꙏꙐꙑꙒꙓꙔꙕꙖꙗꙘꙙꙚꙛꙜꙝꙞꙟꙠꙡꙢꙣꙤꙥꙦꙧꙨꙩꙪꙫꙬꙭꙮ꙯꙰꙱꙲꙳ꙴꙵꙶꙷꙸꙹꙺꙻ꙼꙽꙾ꙿꚀꚁꚂꚃꚄꚅꚆꚇꚈꚉꚊꚋꚌꚍꚎꚏꚐꚑꚒꚓꚔꚕꚖꚗꚘꚙꚚꚛꚜꚝꚞꚟ",["Kazakh","Kyrgyz","Mongolian"],["Latin","Cyrillic"],13],"Latin":["\\u0000\\r !\\"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿıŒœˆ˚˜–—‘’‚“”„•…‹›⁄⁴€−∕",["Afrikaans","Albanian","Basque","Catalan","Danish","Dutch","English","Faroese","Filipino","Galician","German","Icelandic","Indonesian","Irish","Italian","Malay","Norwegian Bokmål","Portuguese","Spanish","Swahili","Swedish","Zulu"],[],3],"Vietnamese":["ĂăẠạẢảẤấẦầẨẩẪẫẬậẮắẰằẲẳẴẵẶặẸẹẺẻẼẽẾếỀềỂểỄễỆệỈỉỊịỌọỎỏỐốỒồỔổỖỗỘộỚớỜờỞởỠỡỢợỤụỦủỨứỪừỬửỮữỰựỲỳỴỵỶỷỸỹ₫",[],["Latin"],40],"Thai":["กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรฤลฦวศษสหฬอฮฯะัาำิีึืฺุู฿เแโใไๅๆ็่้๊๋์ํ๎๏๐๑๒๓๔๕๖๗๘๙๚๛​‌‍◌",["Thai"],["Latin"],39],"Myanmar":["ကခဂဃငစဆဇဈဉညဋဌဍဎဏတထဒဓနပဖဗဘမယရလဝသဟဠအဣဤဥဦဧဩဪါာိီုူေဲံ့း္်ျြွှဿ၀၁၂၃၄၅၆၇၈၉၊။၌၍၎၏​‌‍◌",["Burmese"],["Latin"],34],"Khmer":["\\u0000\\r !\\"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_abcdefghijklmnopqrstuvwxyz{|}~«­»កខគឃងចឆជឈញដឋឌឍណតថទធនបផពភមយរលវឝឞសហឡអឣឤឥឦឧឨឩឪឫឬឭឮឯឰឱឲឳាិីឹឺុូួើឿៀេែៃោៅំះៈ៉៊់៌៍៎៏័៑្៓។៕៖ៗ៘៙៚៛៝០១២៣៤៥៦៧៨៩​‌◌",["Swahili","Zulu"],[],31],"Cyrillic":["ЀЁЂЃЄЅІЇЈЉЊЋЌЍЎЏАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяѐёђѓєѕіїјљњћќѝўџҐґҰұ№",["Belarusian","Bulgarian","Macedonian","Russian","Serbian"],["Latin"],10],"Greek Extended":["ἀἁἂἃἄἅἆἇἈἉἊἋἌἍἎἏἐἑἒἓἔἕ἖἗ἘἙἚἛἜἝ἞἟ἠἡἢἣἤἥἦἧἨἩἪἫἬἭἮἯἰἱἲἳἴἵἶἷἸἹἺἻἼἽἾἿὀὁὂὃὄὅ὆὇ὈὉὊὋὌὍ὎὏ὐὑὒὓὔὕὖὗ὘Ὑ὚Ὓ὜Ὕ὞ὟὠὡὢὣὤὥὦὧὨὩὪὫὬὭὮὯὰάὲέὴήὶίὸόὺύὼώ὾὿ᾀᾁᾂᾃᾄᾅᾆᾇᾈᾉᾊᾋᾌᾍᾎᾏᾐᾑᾒᾓᾔᾕᾖᾗᾘᾙᾚᾛᾜᾝᾞᾟᾠᾡᾢᾣᾤᾥᾦᾧᾨᾩᾪᾫᾬᾭᾮᾯᾰᾱᾲᾳᾴ᾵ᾶᾷᾸᾹᾺΆᾼ᾽ι᾿῀῁ῂῃῄ῅ῆῇῈΈῊΉῌ῍῎῏ῐῑῒΐ῔῕ῖῗῘῙῚΊ῜῝῞῟ῠῡῢΰῤῥῦῧῨῩῪΎῬ῭΅`῰῱ῲῳῴ῵ῶῷῸΌῺΏῼ´῾῿",[],["Latin","Greek"],24],"Gujarati":["।॥ઁંઃઅઆઇઈઉઊઋઌઍએઐઑઓઔકખગઘઙચછજઝઞટઠડઢણતથદધનપફબભમયરલળવશષસહ઼ઽાિીુૂૃૄૅેૈૉોૌ્ૐૠૡૢૣ૦૧૨૩૪૫૬૭૮૯૰૱​‌‍₹◌꠰꠱꠲꠳꠴꠵꠶꠷꠸꠹",["Gujarati"],["Latin"],26],"Telugu":["॒॑।॥ఀఁంఃఅఆఇఈఉఊఋఌఎఏఐఒఓఔకఖగఘఙచఛజఝఞటఠడఢణతథదధనపఫబభమయరఱలళఴవశషసహఽాిీుూృౄెేైొోౌ్ౕౖౘౙౚౠౡౢౣ౦౧౨౩౪౫౬౭౮౯౸౹౺౻౼౽౾౿᳚‌‍◌",["Telugu"],["Latin"],38],"Arabic":["؀؁؂؃؋،؍؛؞؟ءآأؤإئابةتثجحخدذرزسشصضطظعغـفقكلمنهوىيًٌٍَُِّْٕٖٓٔٗ٘ٙ٠١٢٣٤٥٦٧٨٩٪٫٬٭ٰٱٹپچڈڑژڜڢڤڥڧڨکگںھۀہۂۃیےۓ۔۝۞۩۰۱۲۳۴۵۶۷۸۹‌‍‎‐‑–—‘’‚“”„•‹›⁄⁴€−∕ﭐﭑﭖﭗﭘﭙﭦﭧﭨﭩﭪﭫﭬﭭﭺﭻﭼﭽﮈﮉﮊﮋﮌﮍﮎﮏﮐﮑﮒﮓﮔﮕﮞﮟﮠﮡﮢﮣﮤﮥﮦﮧﮨﮩﮪﮫﮬﮭﮮﮯﮰﮱﯨﯩﯼﯽﯾﯿ﴾﴿ﷲﷺ﷼﷽ﺀﺁﺂﺃﺄﺅﺆﺇﺈﺉﺊﺋﺌﺍﺎﺏﺐﺑﺒﺓﺔﺕﺖﺗﺘﺙﺚﺛﺜﺝﺞﺟﺠﺡﺢﺣﺤﺥﺦﺧﺨﺩﺪﺫﺬﺭﺮﺯﺰﺱﺲﺳﺴﺵﺶﺷﺸﺹﺺﺻﺼﺽﺾﺿﻀﻁﻂﻃﻄﻅﻆﻇﻈﻉﻊﻋﻌﻍﻎﻏﻐﻑﻒﻓﻔﻕﻖﻗﻘﻙﻚﻛﻜﻝﻞﻟﻠﻡﻢﻣﻤﻥﻦﻧﻨﻩﻪﻫﻬﻭﻮﻯﻰﻱﻲﻳﻴﻵﻶﻷﻸﻹﻺﻻﻼ",["Arabic","Persian","Urdu"],["Latin"],7],"Latin Extended":["ĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİĲĳĴĵĶķĸĹĺĻļĽľĿŀŁłŃńŅņŇňŉŊŋŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽžſƀƁƂƃƄƅƆƇƈƉƊƋƌƍƎƏƐƑƒƓƔƕƖƗƘƙƚƛƜƝƞƟƠơƢƣƤƥƦƧƨƩƪƫƬƭƮƯưƱƲƳƴƵƶƷƸƹƺƻƼƽƾƿǀǁǂǃǄǅǆǇǈǉǊǋǌǍǎǏǐǑǒǓǔǕǖǗǘǙǚǛǜǝǞǟǠǡǢǣǤǥǦǧǨǩǪǫǬǭǮǯǰǱǲǳǴǵǶǷǸǹǺǻǼǽǾǿȀȁȂȃȄȅȆȇȈȉȊȋȌȍȎȏȐȑȒȓȔȕȖȗȘșȚțȜȝȞȟȠȡȢȣȤȥȦȧȨȩȪȫȬȭȮȯȰȱȲȳȴȵȶȷȸȹȺȻȼȽȾȿɀɁɂɃɄɅɆɇɈɉɊɋɌɍɎɏḀḁḂḃḄḅḆḇḈḉḊḋḌḍḎḏḐḑḒḓḔḕḖḗḘḙḚḛḜḝḞḟḠḡḢḣḤḥḦḧḨḩḪḫḬḭḮḯḰḱḲḳḴḵḶḷḸḹḺḻḼḽḾḿṀṁṂṃṄṅṆṇṈṉṊṋṌṍṎṏṐṑṒṓṔṕṖṗṘṙṚṛṜṝṞṟṠṡṢṣṤṥṦṧṨṩṪṫṬṭṮṯṰṱṲṳṴṵṶṷṸṹṺṻṼṽṾṿẀẁẂẃẄẅẆẇẈẉẊẋẌẍẎẏẐẑẒẓẔẕẖẗẘẙẚẛẜẝẞẟỲỳỴỵỶỷỸỹỺỻỼỽỾỿ₠₡₢₣₤₥₦₧₨₩₪₫₭₮₯₰₱₲₳₴₵₶₷₸₹₺₻₼₽₾₿⃀⃁⃂⃃⃄⃅⃆⃇⃈⃉⃊⃋⃌⃍⃎⃏ⱠⱡⱢⱣⱤⱥⱦⱧⱨⱩⱪⱫⱬⱭⱮⱯⱰⱱⱲⱳⱴⱵⱶⱷⱸⱹⱺⱻⱼⱽⱾⱿ꜠꜡ꜢꜣꜤꜥꜦꜧꜨꜩꜪꜫꜬꜭꜮꜯꜰꜱꜲꜳꜴꜵꜶꜷꜸꜹꜺꜻꜼꜽꜾꜿꝀꝁꝂꝃꝄꝅꝆꝇꝈꝉꝊꝋꝌꝍꝎꝏꝐꝑꝒꝓꝔꝕꝖꝗꝘꝙꝚꝛꝜꝝꝞꝟꝠꝡꝢꝣꝤꝥꝦꝧꝨꝩꝪꝫꝬꝭꝮꝯꝰꝱꝲꝳꝴꝵꝶꝷꝸꝹꝺꝻꝼꝽꝾꝿꞀꞁꞂꞃꞄꞅꞆꞇꞈ꞉꞊ꞋꞌꞍꞎꞏꞐꞑꞒꞓꞔꞕꞖꞗꞘꞙꞚꞛꞜꞝꞞꞟꞠꞡꞢꞣꞤꞥꞦꞧꞨꞩꞪꞫꞬꞭꞮꞯꞰꞱꞲꞳꞴꞵꞶꞷꞸꞹꞺꞻꞼꞽꞾꞿꟀꟁꟂꟃꟄꟅꟆꟇꟈꟉꟊꟋꟌꟍ꟎꟏Ꟑꟑ꟒ꟓ꟔ꟕꟖꟗꟘꟙꟚꟛꟜ꟝꟞꟟꟠꟡꟢꟣꟤꟥꟦꟧꟨꟩꟪꟫꟬꟭꟮꟯꟰꟱ꟲꟳꟴꟵꟶꟷꟸꟹꟺꟻꟼꟽꟾꟿ",["Bosnian","Croatian","Czech","Estonian","Finnish","French","Hungarian","Latvian","Lithuanian","Polish","Romanian","Slovak","Slovenian","Turkish","Welsh"],["Latin"],5],"Lao":["ກຂຄງຈຊຍດຕຖທນບປຜຝພຟມຢຣລວສຫອຮຯະັາຳິີຶືຸູົຼຽເແໂໃໄໆ່້໊໋໌ໍ໐໑໒໓໔໕໖໗໘໙ໜໝໞໟ​◌",["Lao"],["Latin"],32],"Ethiopic":["ሀሁሂሃሄህሆሇለሉሊላሌልሎሏሐሑሒሓሔሕሖሗመሙሚማሜምሞሟሠሡሢሣሤሥሦሧረሩሪራሬርሮሯሰሱሲሳሴስሶሷሸሹሺሻሼሽሾሿቀቁቂቃቄቅቆቇቈቊቋቌቍቐቑቒቓቔቕቖቘቚቛቜቝበቡቢባቤብቦቧቨቩቪቫቬቭቮቯተቱቲታቴትቶቷቸቹቺቻቼችቾቿኀኁኂኃኄኅኆኇኈኊኋኌኍነኑኒናኔንኖኗኘኙኚኛኜኝኞኟአኡኢኣኤእኦኧከኩኪካኬክኮኯኰኲኳኴኵኸኹኺኻኼኽኾዀዂዃዄዅወዉዊዋዌውዎዏዐዑዒዓዔዕዖዘዙዚዛዜዝዞዟዠዡዢዣዤዥዦዧየዩዪያዬይዮዯደዱዲዳዴድዶዷዸዹዺዻዼዽዾዿጀጁጂጃጄጅጆጇገጉጊጋጌግጎጏጐጒጓጔጕጘጙጚጛጜጝጞጟጠጡጢጣጤጥጦጧጨጩጪጫጬጭጮጯጰጱጲጳጴጵጶጷጸጹጺጻጼጽጾጿፀፁፂፃፄፅፆፇፈፉፊፋፌፍፎፏፐፑፒፓፔፕፖፗፘፙፚ፟፠፡።፣፤፥፦፧፨፩፪፫፬፭፮፯፰፱፲፳፴፵፶፷፸፹፺፻፼ᎀᎁᎂᎃᎄᎅᎆᎇᎈᎉᎊᎋᎌᎍᎎᎏ᎐᎑᎒᎓᎔᎕᎖᎗᎘᎙ⶀⶁⶂⶃⶄⶅⶆⶇⶈⶉⶊⶋⶌⶍⶎⶏⶐⶑⶒⶓⶔⶕⶖⶠⶡⶢⶣⶤⶥⶦⶨⶩⶪⶫⶬⶭⶮⶰⶱⶲⶳⶴⶵⶶⶸⶹⶺⶻⶼⶽⶾⷀⷁⷂⷃⷄⷅⷆⷈⷉⷊⷋⷌⷍⷎⷐⷑⷒⷓⷔⷕⷖⷘⷙⷚⷛⷜⷝⷞ﻿",["Amharic"],["Latin"],16],"Devanagari":["ʼऀँंःऄअआइईउऊऋऌऍऎएऐऑऒओऔकखगघङचछजझञटठडढणतथदधनऩपफबभमयरऱलळऴवशषसहऺऻ़ऽािीुूृॄॅॆेैॉॊोौ्ॎॏॐ॒॑॓॔ॕॖॗक़ख़ग़ज़ड़ढ़फ़य़ॠॡॢॣ।॥०१२३४५६७८९॰ॱॲॳॴॵॶॷॸॹॺॻॼॽॾॿ᳐᳑᳒᳓᳔᳕᳖᳗᳘᳙᳜᳝᳞᳟᳚᳛᳠᳡᳢᳣᳤᳥᳦᳧᳨ᳩᳪᳫᳬ᳭ᳮᳯᳰᳱᳲᳳ᳴ᳵᳶ᳸᳹​‌‍⁄₨₹◌꠰꠱꠲꠳꠴꠵꠶꠷꠸꠹꣠꣡꣢꣣꣤꣥꣦꣧꣨꣩꣪꣫꣬꣭꣮꣯꣰꣱ꣲꣳꣴꣵꣶꣷ꣸꣹꣺ꣻ",["Hindi","Marathi","Nepali"],["Latin"],15]}\n';});
+
+define('specimenTools/services/WebfontProvider',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+
+    /**
+     * WebFontProvider takes the original arraybuffer of the loaded fonts
+     * and adds it as a Web-Font—i.e. as loaded with @font-face—to the
+     * document.
+     *
+     * The values for CSS 'font-style', 'font-weight' and 'font-family'
+     * are taken from the font directly, via the FontData service and
+     * there via opentype.js.
+     *
+     * The public method `setStyleOfElement(fontIndex, element)`
+     * sets the element.style so that the web font with fontIndex is
+     * displayed.
+     *
+     * The public method `getStyleProperties(fontIndex)` returns a string
+     * of CSS properties that would make the font with fontIndex being
+     * displayed.
+     */
+    function WebFontProvider(window, pubsub, fontData, options) {
+        Parent.call(this, options);
+        this._window = window;
+        this._pubSub = pubsub;
+        this._fontData = fontData;
+        this._pubSub.subscribe('loadFont', this._onLoadFont.bind(this));
+        this._data = [];
+        this._blobs = [];
+
+        this.__stylesheet = null;
+    }
+
+    var _p = WebFontProvider.prototype = Object.create(Parent.prototype);
+    _p.constructor = WebFontProvider;
+
+    WebFontProvider.defaultOptions = {
+    };
+
+    Object.defineProperty(_p, '_styleSheet', {
+        get: function() {
+            if(!this.__stylesheet) {
+                var elem = this._window.document.createElement('style');
+                // seems like Webkit needs this,it won't do any harm anyways.
+                elem.appendChild(this._window.document.createTextNode(''));
+                this._window.document.head.appendChild(elem);
+                this.__stylesheet = elem.sheet;
+            }
+            return this.__stylesheet;
+        }
+    });
+
+    _p._makeWebfont = function(fontIndex) {
+        var arrBuff = this._fontData.getOriginalArraybuffer(fontIndex)
+          , familyName = this._fontData.getCSSFamilyName(fontIndex)
+          , weight = this._fontData.getCSSWeight(fontIndex)
+          , style = this._fontData.getCSSStyle(fontIndex)
+          , fontface, url, blob, styleData
+          ;
+
+        this._data[fontIndex] = styleData = Object.create(null);
+        styleData['font-style'] = style;
+        styleData['font-weight'] = weight;
+        styleData['font-family'] = familyName;
+        Object.defineProperty(styleData, '_props', {
+            value: null
+          , enumerable: false
+          , writable: true
+        });
+
+        if('FontFace' in this._window) {
+            // more modern and direct
+            fontface = new this._window.FontFace(familyName, arrBuff,{
+                        weight: weight
+                      , style: style
+                    });
+            this._window.document.fonts.add( fontface );
+        }
+        else {
+            // oldschool, a bit bloated
+            blob = new this._window.Blob([arrBuff], { type: 'font/opentype' });
+            this._blobs[fontIndex] = blob;
+            url = this._window.URL.createObjectURL(blob);
+            this._styleSheet.insertRule([
+                    '@font-face {'
+                , this.getStyleProperties(fontIndex)
+                , 'src: url(' + url + ');'
+                , '}'
+                ].join(''), this._styleSheet.cssRules.length);
+        }
+    };
+
+    _p._onLoadFont = function(fontIndex) {
+        this._makeWebfont(fontIndex);
+    };
+
+    /**
+     * use this in the style attribute or in css rules
+     */
+    _p.getStyleProperties = function(fontIndex) {
+        var data = this._data[fontIndex]
+          , props, propName
+          ;
+        if(!data)
+            throw new Error('FontIndex "' + fontIndex + '" is not loaded.');
+        props = data._props;
+        if(!props) {
+            props = [];
+            for(propName in data)
+                props.push(propName, ': ', data[propName], ';');
+            props = props.join('');
+        }
+        return props;
+    };
+
+    _p.setStyleOfElement = function(fontIndex, element) {
+        var data = this._data[fontIndex]
+          , propName
+          ;
+        if(!data)
+            throw new Error('FontIndex "' + fontIndex + '" is not loaded.');
+        for(propName in data)
+            element.style[this._cssName2jsName(propName)] = data[propName];
+    };
+
+    return WebFontProvider;
+});
+
+define('Atem-Errors/errors',[],function() {
+    "use strict";
+    //metapolator errors
+    var errors = Object.create(null);
+
+    /**
+     * save three lines of coding for each error with this factory
+     *
+     * and observe that extending Error is uncool
+     */
+    var makeError = function(namespace, name, Constructor, Parent)
+    {
+        if(Parent === undefined)
+            Parent = Error;
+
+        if(Constructor === undefined) {
+            Constructor = function(message, stack) {
+                if(message !== undefined) {
+                    this.name = name + 'Error';
+                    this.message = message || "(no error message)";
+                }
+
+                if(!stack && typeof Error.captureStackTrace === 'function')
+                    Error.captureStackTrace(this, Constructor);
+                else {
+                    this.stack = stack || (new Error()).stack || '(no stack available)';
+                }
+            };
+        }
+        Constructor.prototype = Object.create(Parent.prototype);
+        Constructor.prototype.constructor = Constructor;
+
+        namespace[name] = Constructor;
+    };
+    errors.makeError = makeError;
+
+    /**
+     * Some generally useful errors
+     */
+    makeError(errors, 'Error');
+    makeError(errors, 'Unhandled');
+    makeError(errors, 'Type', undefined, TypeError);
+    makeError(errors, 'Assertion', undefined, errors.Error);
+    makeError(errors, 'Value', undefined, errors.Error);
+    makeError(errors, 'Key', undefined, errors.Error);
+    makeError(errors, 'NotImplemented', undefined, errors.Error);
+    makeError(errors, 'Deprecated', undefined, errors.Error);
+    makeError(errors, 'AbstractInterface', undefined, errors.Error);
+    makeError(errors, 'Event', undefined, errors.Error);
+    makeError(errors, 'Emitter', undefined, errors.Event);
+    makeError(errors, 'Receiver', undefined, errors.Event);
+
+
+    /**
+     * if expression is false, throw an Assertion
+     * pass a message to explain yourself
+     **/
+    errors.assert = function(exp, message) {
+        if (!exp) {
+            throw new errors.Assertion(message);
+        }
+    };
+    errors.warn = function(message) {
+        if(typeof console !== 'undefined' && console.warn)
+            console.warn('WARNING: ' + message);
+    };
+
+    /**
+     * ES6/Promises have the fundamental flaw, that, if there is no
+     * Error handler attached, an unhandled error stays unnoticed and
+     * just disappears.
+     * Because handling all Errors always correctly is not possible at
+     * any given time e.g. a program may still be under construction for
+     * example, this is a default handler to mark a promise as unhandled.
+     *
+     * Using this error-handler at the very end of the promise chain
+     * ensures that the unhandled Proxy exception is not just disappearing
+     * unnoticed by the main program.
+     */
+    function unhandledPromise(originalError) {
+        var error = new errors.Unhandled(originalError+'\n'+originalError.stack);
+        error.originalError = originalError;
+        // use setTimout to escape the catch all that es6/Promise applies
+        // and that silences unhandled errors
+        setTimeout(function unhandledError(){throw error;}, 0);
+    }
+    errors.unhandledPromise = unhandledPromise;
+
+    Object.freeze(errors)
+    return errors;
+});
 
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
@@ -125,6 +11198,99 @@
  * Coordinates are usually expressed as (x, y) tuples, but generally any
  * sequence of length 2 will do.
  */
+define('Atem-Pen-Case/tools/decomposeSuperSegments',['Atem-Errors/errors'], function(errors){
+    "use strict";
+    var assert = errors.assert;
+
+    /**
+     * Split the SuperBezier described by 'points' into a list of regular
+     * bezier segments. The 'points' argument must be a list with length
+     * 3 or greater, containing [x, y] coordinates. The last point is the
+     * destination on-curve point, the rest of the points are off-curve points.
+     * The start point should not be supplied.
+     *
+     * This function returns a list of [pt1, pt2, pt3] lists, which each
+     * specify a regular curveto-style bezier segment.
+     */
+    function decomposeSuperBezierSegment(points) {
+        var n = points.length - 1,
+            bezierSegments = [],
+            pt1 = points[0],
+            pt2 = null,
+            pt3 = null,
+            i, j, nDivisions, factor, temp1, temp2, temp;
+
+        assert(n > 1, 'Expecting at least 3 Points here');
+
+        for (i=2;i<=n;i++)
+        {
+            // calculate points in between control points.
+            nDivisions = Math.min(i, 3, n - i + 2);
+            // used to be d = float(nDivisions) in the python source but
+            // in js all numbers are float and there is no integer division
+            // thing like in the older versions of python:
+            //    e.g. 2 / 3 = 0 but 2 / 3.0 = 0.6666666666666666
+            // so I'll use nDivision throughout
+            for (j=1;j<nDivisions;j++)
+            {
+                factor = j / nDivisions;
+                temp1 = points[i-1];
+                temp2 = points[i-2];
+                temp = [
+                    temp2[0] + factor * (temp1[0] - temp2[0]),
+                    temp2[1] + factor * (temp1[1] - temp2[1])
+                ];
+                if (pt2 === null) {
+                    pt2 = temp;
+                } else {
+                    pt3 = [
+                        0.5 * (pt2[0] + temp[0]),
+                        0.5 * (pt2[1] + temp[1])
+                    ];
+                    bezierSegments.push([pt1, pt2, pt3]);
+                    pt1 = temp;
+                    pt2 = null;
+                    pt3 = null;
+                }
+            }
+        }
+        bezierSegments.push([pt1, points[points.length-2], points[points.length-1]]);
+        return bezierSegments;
+    }
+
+   /**
+    * Split the quadratic curve segment described by 'points' into a list
+    * of "atomic" quadratic segments. The 'points' argument must be a list
+    * with length 2 or greater, containing [x, y] coordinates. The last point
+    * is the destination on-curve point, the rest of the points are off-curve
+    * points. The start point should not be supplied.
+    *
+    * This function returns a list of [pt1, pt2] lists, which each specify a
+    * plain quadratic bezier segment.
+    */
+    function decomposeQuadraticSegment(points) {
+        var n = points.length - 1,
+            quadSegments = [],
+            i, x, y, nx, ny, impliedPt;
+        assert(n > 0, 'Expecting at least 2 Points here');
+        for (i=0;i<n-1;i++)
+        {
+            //the keys of the list are strings, what makes i+1 == '01'
+            x = points[i][0];
+            y = points[i][1];
+            nx = points[i+1][0];
+            ny = points[i+1][1];
+            impliedPt = [0.5 * (x + nx), 0.5 * (y + ny)];
+            quadSegments.push([points[i], impliedPt]);
+        }
+        quadSegments.push( [points[points.length-2], points[points.length-1]] );
+        return quadSegments;
+    }
+    return {
+        decomposeSuperBezierSegment: decomposeSuperBezierSegment,
+        decomposeQuadraticSegment: decomposeQuadraticSegment
+    };
+});
 
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
@@ -137,6 +11303,113 @@
  *
  * I even copied the docstrings and comments! (These may still refer to the Python code)
  */
+define('Atem-Pen-Case/pens/AbstractPen',[
+    'Atem-Errors/errors'
+], function(
+    errors
+) {
+    "use strict";
+    //shortcuts
+    var NotImplementedError = errors.NotImplemented;
+
+    /*constructor*/
+    function AbstractPen (){}
+    var _p = AbstractPen.prototype;
+
+    /*inheritance*/
+    //pass
+
+    /*definition*/
+        /**
+         * Begin a new sub path, set the current point to 'pt'. You must
+         * end each sub path with a call to pen.closePath() or pen.endPath().
+         */
+        _p.moveTo = function(pt)
+        {
+            throw new NotImplementedError('AbstractPen has not implemented'
+            +' moveTo');
+        };
+        /**
+         * Draw a straight line from the current point to 'pt'.
+         */
+        _p.lineTo = function(pt)
+        {
+             throw new NotImplementedError('AbstractPen has not implemented'
+            +' lineTo');
+        };
+        /**
+         * Draw a cubic bezier with an arbitrary number of control points.
+         *
+         * The last point specified is on-curve, all others are off-curve
+         * (control) points. If the number of control points is > 2, the
+         * segment is split into multiple bezier segments. This works
+         * like this:
+         *
+         * Let n be the number of control points (which is the number of
+         * arguments to this call minus 1). If n==2, a plain vanilla cubic
+         * bezier is drawn. If n==1, we fall back to a quadratic segment and
+         * if n==0 we draw a straight line. It gets interesting when n>2:
+         * n-1 PostScript-style cubic segments will be drawn as if it were
+         * one curve. See decomposeSuperBezierSegment().
+         *
+         * The conversion algorithm used for n>2 is inspired by NURB
+         * splines, and is conceptually equivalent to the TrueType "implied
+         * points" principle. See also decomposeQuadraticSegment().
+         */
+        _p.curveTo = function(/* *points */)
+        {
+            throw new NotImplementedError('AbstractPen has not implemented'
+            +' curveTo');
+        };
+        /**
+         * Draw a whole string of quadratic curve segments.
+         *
+         * The last point specified is on-curve, all others are off-curve
+         * points.
+         *
+         * This method implements TrueType-style curves, breaking up curves
+         * using 'implied points': between each two consequtive off-curve points,
+         * there is one implied point exactly in the middle between them. See
+         * also decomposeQuadraticSegment().
+         *
+         * The last argument (normally the on-curve point) may be None.
+         * This is to support contours that have NO on-curve points (a rarely
+         * seen feature of TrueType outlines).
+         */
+        _p.qCurveTo = function (/* *points */)
+        {
+            throw new NotImplementedError('AbstractPen has not implemented'
+            +' qCurveTo');
+        };
+        /**
+         * Close the current sub path. You must call either pen.closePath()
+         * or pen.endPath() after each sub path.
+         */
+        _p.closePath = function()
+        {
+            //pass
+        };
+        /**
+         * End the current sub path, but don't close it. You must call
+         * either pen.closePath() or pen.endPath() after each sub path.
+         */
+        _p.endPath = function()
+        {
+            //pass
+        };
+        /**
+         * Add a sub glyph. The 'transformation' argument must be a 6-tuple
+         * containing an affine transformation, or a Transform object from the
+         * fontTools.misc.transform module. More precisely: it should be a
+         * sequence containing 6 numbers.
+         */
+        _p.addComponent = function(glyphName, transformation)
+        {
+            throw new NotImplementedError('AbstractPen has not implemented'
+            +' addComponent');
+        };
+    return AbstractPen;
+});
 
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
@@ -196,6 +11469,378 @@
  *     >>>
  */
 
+define(
+    'Atem-Math-Tools/transform',['Atem-Errors/errors'],
+    function(errors)
+{
+    "use strict";
+    /*shortcuts*/
+    var KeyError = errors.Key;
+
+    /*constants*/
+    var EPSILON = 1e-15,
+        ONE_EPSILON = 1 - EPSILON,
+        MINUS_ONE_EPSILON = -1 + EPSILON;
+
+    /*helpers*/
+    function _normSinCos(v)
+    {
+        if (Math.abs(v) < EPSILON)
+            v = 0;
+        else if (v > ONE_EPSILON)
+            v = 1;
+        else if (v < MINUS_ONE_EPSILON)
+            v = -1;
+        return v;
+    }
+
+    /*constructor*/
+    /**
+    * 2x2 transformation matrix plus offset, a.k.a. Affine transform.
+    * All transforming methods, eg. rotate(), return a new Transform instance.
+    *
+    * Examples: //in python still
+    *    >>> t = Transform()
+    *    >>> t
+    *    <Transform [1 0 0 1 0 0]>
+    *    >>> t.scale(2)
+    *    <Transform [2 0 0 2 0 0]>
+    *    >>> t.scale(2.5, 5.5)
+    *    <Transform [2.5 0.0 0.0 5.5 0 0]>
+    *    >>>
+    *    >>> t.scale(2, 3).transformPoint((100, 100))
+    *    (200, 300)
+    */
+    function Transform(transformation /* [xx=1, xy=0, yx=0, yy=1, dx=0, dy=0] */) {
+        //can't change easily after creation
+        var affine = [1, 0, 0, 1, 0, 0];
+
+        /**
+         * the next two methods are just accessors to the local affine value
+         **/
+        this.__get = function (key)
+        {
+            if(affine[key] === undefined)
+                throw new KeyError('The key ' + key + 'does not exist in' + this);
+            return affine[key];
+        };
+        this.__affine = function()
+        {
+            //return a copy
+            return affine.slice(0);
+        };
+
+        if(transformation === undefined)
+            return;
+        for(var i = 0; i < 6; i++) {
+            if(transformation[i] === undefined || transformation[i] === null)
+                continue;
+            affine[i] = transformation[i];
+        }
+    }
+    var _p = Transform.prototype;
+
+    /*definition*/
+        /**
+         * Transform a point.
+         *
+         *  Example:
+         *      >>> t = Transform()
+         *      >>> t = t.scale(2.5, 5.5)
+         *      >>> t.transformPoint((100, 100))
+         *      (250.0, 550.0)
+         */
+    _p.transformPoint = function( pt )
+        {
+            var xx = this[0],
+                xy = this[1],
+                yx = this[2],
+                yy = this[3],
+                dx = this[4],
+                dy = this[5],
+                x = pt[0],
+                y = pt[1];
+            return [xx*x + yx*y + dx, xy*x + yy*y + dy];
+        };
+        /**
+         * Transform a list of points.
+         *
+         * Example: //in python
+         *      >>> t = Scale(2, 3)
+         *      >>> t.transformPoints([(0, 0), (0, 100), (100, 100), (100, 0)])
+         *      [(0, 0), (0, 300), (200, 300), (200, 0)]
+         *      >>>
+         */
+    _p.transformPoints = function(points)
+        {
+            return points.map(this.transformPoint, this);
+        };
+        /**
+         * Return a new transformation, translated (offset) by x, y.
+         *
+         * Example:
+         *      >>> t = Transform()
+         *      >>> t.translate(20, 30)
+         *      <Transform [1 0 0 1 20 30]>
+         *      >>>
+         */
+    _p.translate = function(x, y)
+        {
+            x = x || 0;
+            y = y || 0;
+            return this.transform([1, 0, 0, 1, x, y ]);
+        };
+        /**
+         * Return a new transformation, scaled by x, y. The 'y' argument
+         * may be undefined, which implies to use the x value for y as well.
+         *
+         * Example:
+         *      >>> t = Transform()
+         *      >>> t.scale(5)
+         *      <Transform [5 0 0 5 0 0]>
+         *      >>> t.scale(5, 6)
+         *      <Transform [5 0 0 6 0 0]>
+         *      >>>
+         */
+    _p.scale = function(x, y)
+        {
+            if(x === undefined)
+                x = 1;
+            if(y === undefined || y === null)
+                y = x;
+            return this.transform([x, 0, 0, y, 0, 0]);
+        };
+        /**
+         * Return a new transformation, rotated by 'angle' (radians).
+         *
+         * Example: //python
+         *      >>> import math
+         *      >>> t = Transform()
+         *      >>> t.rotate(math.pi / 2)
+         *      <Transform [0 1 -1 0 0 0]>
+         *      >>>
+         */
+    _p.rotate = function(angle)
+        {
+            var c = _normSinCos(Math.cos(angle)),
+                s = _normSinCos(Math.sin(angle));
+            return this.transform([c, s, -s, c, 0, 0]);
+        };
+        /**
+         * Return a new transformation, skewed by x and y.
+         *
+         * Example:
+         *      >>> import math
+         *      >>> t = Transform()
+         *      >>> t.skew(math.pi / 4)
+         *      <Transform [1.0 0.0 1.0 1.0 0 0]>
+         *      >>>
+         */
+    _p.skew = function(x, y)
+        {
+            x = x || 0;
+            y = y || 0;
+            return this.transform([1, Math.tan(y), Math.tan(x), 1, 0, 0]);
+        };
+        /**
+         * Return a new transformation, transformed by another
+         * transformation.
+         *
+         * Example:
+         *      >>> t = Transform(2, 0, 0, 3, 1, 6)
+         *      >>> t.transform((4, 3, 2, 1, 5, 6))
+         *      <Transform [8 9 4 3 11 24]>
+         *      >>>
+         */
+    _p.transform = function(other)
+        {
+            var xx1 = other[0],
+                xy1 = other[1],
+                yx1 = other[2],
+                yy1 = other[3],
+                dx1 = other[4],
+                dy1 = other[5],
+                xx2 = this[0],
+                xy2 = this[1],
+                yx2 = this[2],
+                yy2 = this[3],
+                dx2 = this[4],
+                dy2 = this[5];
+            return new Transform([
+                xx1*xx2 + xy1*yx2,
+                xx1*xy2 + xy1*yy2,
+                yx1*xx2 + yy1*yx2,
+                yx1*xy2 + yy1*yy2,
+                xx2*dx1 + yx2*dy1 + dx2,
+                xy2*dx1 + yy2*dy1 + dy2
+            ]);
+        };
+        /**
+         * Return a new transformation, which is the other transformation
+         * transformed by self. self.reverseTransform(other) is equivalent to
+         * other.transform(self).
+         *
+         * Example:
+         *      >>> t = Transform(2, 0, 0, 3, 1, 6)
+         *      >>> t.reverseTransform((4, 3, 2, 1, 5, 6))
+         *      <Transform [8 6 6 3 21 15]>
+         *      >>> Transform(4, 3, 2, 1, 5, 6).transform((2, 0, 0, 3, 1, 6))
+         *      <Transform [8 6 6 3 21 15]>
+         *      >>>
+         */
+    _p.reverseTransform = function(other)
+        {
+            var xx1 = this[0],
+                xy1 = this[1],
+                yx1 = this[2],
+                yy1 = this[3],
+                dx1 = this[4],
+                dy1 = this[5],
+                xx2 = other[0],
+                xy2 = other[1],
+                yx2 = other[2],
+                yy2 = other[3],
+                dx2 = other[4],
+                dy2 = other[5];
+            return new Transform([
+                xx1*xx2 + xy1*yx2,
+                xx1*xy2 + xy1*yy2,
+                yx1*xx2 + yy1*yx2,
+                yx1*xy2 + yy1*yy2,
+                xx2*dx1 + yx2*dy1 + dx2,
+                xy2*dx1 + yy2*dy1 + dy2
+            ]);
+        };
+        /**
+         * Return the inverse transformation.
+         *
+         * Example:
+         *     >>> t = Identity.translate(2, 3).scale(4, 5)
+         *     >>> t.transformPoint((10, 20))
+         *     (42, 103)
+         *     >>> it = t.inverse()
+         *     >>> it.transformPoint((42, 103))
+         *     (10.0, 20.0)
+         *     >>>
+         */
+    _p.inverse = function()
+        {
+            if( this.cmp(Identity) )
+                return this;
+            var XX = this[0],
+                XY = this[1],
+                YX = this[2],
+                YY = this[3],
+                DX = this[4],
+                DY = this[5],
+                det = XX*YY - YX*XY,
+                xx = YY/det,
+                xy = -XY/det,
+                yx = -YX/det,
+                yy = XX/det,
+                dx = -xx*DX - yx*DY,
+                dy = -xy*DX - yy*DY;
+            return new Transform([xx, xy, yx, yy, dx, dy]);
+        };
+        /**
+         * Return a PostScript representation:
+         *  >>> t = Identity.scale(2, 3).translate(4, 5)
+         *  >>> t.toPS()
+         *  '[2 0 0 3 8 15]'
+         *  >>>
+         */
+    _p.toPS = function()
+        {
+            return ['[', this.__affine().join(' '),']'].join('');
+        };
+    /*compare*/
+    _p.cmp = function(other)
+        {
+            return (
+               other[0] === this[0]
+            && other[1] === this[1]
+            && other[2] === this[2]
+            && other[3] === this[3]
+            && other[4] === this[4]
+            && other[5] === this[5]
+            );
+        };
+    _p.valueOf = function()
+        {
+            return ['<Transform ', this.toPS(), '>'].join('');
+        };
+    _p.toString = function()
+        {
+            return this.__affine().join(' ');
+        };
+        /**
+         * Transform instances also behave like a list of length 6:
+         */
+    Object.defineProperty(_p, 'length', {
+        get: function(){
+            return 6;
+        }
+    });
+        /**
+         * Transform instances also behave like sequences and even support
+         * slicing...
+         */
+    _p.slice = function(start, len)
+        {
+            return this.__affine().slice(start, len);
+        };
+        /**
+         * Transform is usable kind of like an array
+         * var t = new Transform();
+         * echo t[0]; //1
+         */
+    Object.defineProperties(_p, {
+        0: {get: function() { return this.__get(0); }}
+      , 1: {get: function() { return this.__get(1); }}
+      , 2: {get: function() { return this.__get(2); }}
+      , 3: {get: function() { return this.__get(3); }}
+      , 4: {get: function() { return this.__get(4); }}
+      , 5: {get: function() { return this.__get(5); }}
+    });
+    /**
+    * Return the identity transformation offset by x, y.
+    *
+    * Example:
+    *      >>> offset(2, 3)
+    *      <Transform [2 0 0 3 0 0]>
+    *      >>>
+    */
+    function Offset (x, y) {
+        x = x || 0;
+        y = y || 0;
+        return new Transform([1, 0, 0, 1, x, y]);
+    }
+
+    /**
+     * Return the identity transformation scaled by x, y. The 'y' argument
+     * may be None, which implies to use the x value for y as well.
+     *
+     * Example:
+     *  >>> Scale(2, 3)
+     *  <Transform [2 0 0 3 0 0]>
+     *  >>>
+     */
+    function Scale (x, y) {
+        if(y === undefined || y === null)
+            y = x;
+        return new Transform([x, 0, 0, y, 0, 0]);
+    }
+
+    var Identity = new Transform();
+
+    return {
+        Transform: Transform,
+        Identity: Identity,
+        Offset: Offset,
+        Scale: Scale
+    };
+});
+
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
  *
@@ -208,6 +11853,92 @@
  * I even copied the docstrings and comments! (These may still refer to the Python code)
  */
 
+define(
+    'Atem-Pen-Case/pens/TransformPen',[
+        './AbstractPen',
+        'Atem-Math-Tools/transform'
+    ],
+    function(
+        Parent,
+        transform
+    )
+{
+    "use strict";
+    var Transform = transform.Transform;
+    /**
+     * Pen that transforms all coordinates using a Affine transformation,
+     * and passes them to another pen.
+     */
+
+    /*constructor*/
+    /**
+     * The 'outPen' argument is another pen object. It will receive the
+     * transformed coordinates. The 'transformation' argument can either
+     * be a six-element Array, or a tools.misc.transform.Transform object.
+     */
+    function TransformPen(outPen, transformation) {
+        if( transformation instanceof Array)
+            transformation = new Transform(transformation);
+        this._transformation = transformation;
+        this._transformPoint = function(pt) {
+            return transformation.transformPoint(pt);
+        };
+        this._outPen = outPen;
+        this._stack = [];
+    }
+
+    /*inheritance*/
+    var _p = TransformPen.prototype = Object.create(Parent.prototype);
+    _p.constructor = TransformPen;
+
+    /*definition*/
+        _p.moveTo = function(pt)
+        {
+            this._outPen.moveTo(this._transformPoint(pt));
+        };
+
+        _p.lineTo = function(pt)
+        {
+            this._outPen.lineTo(this._transformPoint(pt));
+        };
+
+        _p.curveTo = function(/* *points */)
+        {
+            var points = [].slice.call(arguments);//transform arguments to an array
+            this._outPen.curveTo.apply(this._outPen, this._transformPoints(points));
+        };
+
+        _p.qCurveTo = function (/* *points */)
+        {
+            var points = [].slice.call(arguments);//transform arguments to an array
+            if (points[points.length -1] === null) {
+                points = this._transformPoints(points.slice(0, -1));
+                points.push(null);
+            } else {
+                points = this._transformPoints(points);
+            }
+            this._outPen.qCurveTo.apply(this._outPen, points);
+        };
+
+        _p._transformPoints = function(points)
+        {
+            return points.map(this._transformPoint);
+        };
+
+        _p.closePath = function()
+        {
+            this._outPen.closePath();
+        };
+
+        _p.addComponent = function(glyphName, transformation)
+        {
+            transformation = this._transformation.transform(transformation);
+            this._outPen.addComponent(glyphName, transformation);
+        };
+
+    return TransformPen;
+});
+
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
  *
@@ -219,6 +11950,228 @@
  *
  * I even copied the docstrings and comments! (These may still refer to the Python code)
  */
+define('Atem-Pen-Case/pens/BasePen',[
+    'Atem-Errors/errors'
+  , 'Atem-Pen-Case/tools/decomposeSuperSegments'
+  , './AbstractPen'
+  , './TransformPen'
+], function(
+    errors
+  , decompose
+  , Parent
+  , TransformPen
+) {
+    "use strict";
+    var NotImplementedError = errors.NotImplemented,
+        AssertionError = errors.Assertion,
+        decomposeSuperBezierSegment = decompose.decomposeSuperBezierSegment,
+        decomposeQuadraticSegment = decompose.decomposeQuadraticSegment,
+        assert = errors.assert;
+    /**
+     * Base class for drawing pens. You must override _moveTo, _lineTo and
+     * _curveToOne. You may additionally override _closePath, _endPath,
+     * addComponent and/or _qCurveToOne. You should not override any other
+     * methods.
+     */
+    /*constructor*/
+    function BasePen (glyphSet) {
+        this.glyphSet = glyphSet;
+        this.__currentPoint = null;
+    }
+
+    /*inheritance*/
+    var _p = BasePen.prototype = Object.create(Parent.prototype);
+    _p.constructor = BasePen;
+
+    /*definition*/
+
+        // must override
+
+        _p._moveTo = function(pt, kwargs/* optional, object contour attributes*/)
+        {
+            throw new NotImplementedError('implement _moveTo');
+        };
+
+        _p._lineTo = function(pt)
+        {
+            throw new NotImplementedError('implement _lineTo');
+        };
+
+        _p._curveToOne = function(pt1, pt2, pt3)
+        {
+            throw new NotImplementedError('implement _curveToOne');
+        };
+
+        // may override
+
+        _p._closePath = function()
+        {
+            //pass
+        };
+
+        _p._endPath = function()
+        {
+            //pass
+        };
+
+        /**
+         * This method implements the basic quadratic curve type. The
+         * default implementation delegates the work to the cubic curve
+         * function. Optionally override with a native implementation.
+         */
+        _p._qCurveToOne = function(pt1, pt2)
+        {
+            var pt0x = this.__currentPoint[0],
+                pt0y = this.__currentPoint[1],
+                pt1x = pt1[0],
+                pt1y = pt1[1],
+                pt2x = pt2[0],
+                pt2y = pt2[1],
+                mid1x = pt0x + 0.66666666666666667 * (pt1x - pt0x),
+                mid1y = pt0y + 0.66666666666666667 * (pt1y - pt0y),
+                mid2x = pt2x + 0.66666666666666667 * (pt1x - pt2x),
+                mid2y = pt2y + 0.66666666666666667 * (pt1y - pt2y);
+            this._curveToOne([mid1x, mid1y], [mid2x, mid2y], pt2);
+        };
+
+        /**
+         * This default implementation simply transforms the points
+         * of the base glyph and draws it onto self.
+         */
+        _p.addComponent = function(glyphName, transformation, kwargs /*optional, object*/)
+        {
+            var glyph = (typeof this.glyphSet.get === 'function')
+                ? this.glyphSet.get(glyphName)
+                : this.glyphSet[glyphName];
+            if(glyph !== undefined) {
+                var tPen = new TransformPen(this, transformation);
+                // using the synchronous call!
+                // load components before drawing the glyph if this is
+                // not good for your case!
+                // addComponent can't get a asynchronous api because
+                // we would break the pen protocol then
+                glyph.draw(false, tPen);
+            }
+        };
+
+        // don't override
+
+        /**
+         * Return the current point. This is not part of the public
+         * interface, yet is useful for subclasses.
+         */
+        _p._getCurrentPoint = function()
+        {
+            return this.__currentPoint;
+        };
+
+        _p.closePath = function()
+        {
+            this._closePath();
+            this.__currentPoint = null;
+        };
+
+        _p.endPath = function()
+        {
+            this._endPath();
+            this.__currentPoint = null;
+        };
+
+        _p.moveTo = function(pt, kwargs/* optional, object contour attributes*/)
+        {
+            this._moveTo.apply(this, arguments);
+            this.__currentPoint = pt;
+        };
+
+        _p.lineTo = function(pt)
+        {
+            this._lineTo(pt);
+            this.__currentPoint = pt;
+        };
+
+        _p.curveTo = function(/* *points */)
+        {
+            var points = [].slice.call(arguments),//transform arguments to an array
+                n = points.length - 1;// 'n' is the number of control points
+            assert(n >= 0, 'curveTo needs at least one point');
+            if (n === 2) {
+                // The common case, we have exactly two BCP's, so this is a standard
+                // cubic bezier. Even though decomposeSuperBezierSegment() handles
+                // this case just fine, we special-case it anyway since it's so
+                // common.
+                this._curveToOne.apply(this, points);
+                this.__currentPoint = points[points.length - 1];
+            } else if (n > 2) {
+                // n is the number of control points; split curve into n-1 cubic
+                // bezier segments. The algorithm used here is inspired by NURB
+                // splines and the TrueType "implied point" principle, and ensures
+                // the smoothest possible connection between two curve segments,
+                // with no disruption in the curvature. It is practical since it
+                // allows one to construct multiple bezier segments with a much
+                // smaller amount of points.
+                var _curveToOne = this._curveToOne,
+                    segments = decomposeSuperBezierSegment(points),
+                    segment, i;
+                for (i in segments) {
+                    segment = segments[i];
+                    //var pt1 = segment[0];
+                    //var pt2 = segment[1];
+                    //var pt3 = segment[2];
+                    _curveToOne.apply(this ,segment);
+                    this.__currentPoint = segment[2];//pt3
+                }
+            } else if (n === 1) {
+                this.qCurveTo.apply(this, points);
+            } else if (n === 0) {
+                this.lineTo(points[0]);
+            } else {
+                throw new AssertionError("curveTo() can't get there from here");
+            }
+        };
+
+        _p.qCurveTo = function(/* *points */)
+        {
+            var points = [].slice.call(arguments),//transform arguments to an array
+                n = points.length - 1; //'n' is the number of control points
+            assert(n >= 0, 'qCurveTo needs at least one point');
+            if (points[points.length -1] === null) {
+                // Special case for TrueType quadratics: it is possible to
+                // define a contour with NO on-curve points. BasePen supports
+                // this by allowing the final argument (the expected on-curve
+                // point) to be null. We simulate the feature by making the implied
+                // on-curve point between the last and the first off-curve points
+                // explicit.
+                var x = points[points.length -2][0], // last off-curve point x
+                    y = points[points.length -2][1], // last off-curve point y
+                    nx = points[0][0], // first off-curve point x
+                    ny = points[0][1], // first off-curve point y
+                    impliedStartPoint = [ 0.5 * (x + nx), 0.5 * (y + ny) ];
+                this.__currentPoint = impliedStartPoint;
+                this._moveTo(impliedStartPoint);
+                points.splice(-1, 1, impliedStartPoint);//splice syntax is: index, howMany, *elements to insert
+            }
+            if (n > 0) {
+                // Split the string of points into discrete quadratic curve
+                // segments. Between any two consecutive off-curve points
+                // there's an implied on-curve point exactly in the middle.
+                // This is where the segment splits.
+                var _qCurveToOne = this._qCurveToOne,
+                    segments = decomposeQuadraticSegment(points),
+                    segment, i;
+                for (i in segments) {
+                    segment = segments[i];
+                    //var pt1 = segment[0];
+                    //var pt2 = segment[1];
+                    _qCurveToOne.apply(this, segment);
+                    this.__currentPoint = segment[1]; //pt2
+                }
+            } else {
+                this.lineTo(points[0]);
+            }
+        };
+
+    return BasePen;
+});
 
 /**
  * Copyright (c) 2011, Lasse Fister lasse@graphicore.de, http://graphicore.de
@@ -233,10 +12186,5344 @@
  *    http://www.w3.org/TR/SVG/paths.html#InterfaceSVGPathElement
  */
 
-var requirejs,require,define;!function(e){function t(e,t){return v.call(e,t)}function n(e,t){var n,r,a,s,i,o,l,u,c,h,f,p,d=t&&t.split("/"),m=g.map,y=m&&m["*"]||{};if(e){for(e=e.split("/"),i=e.length-1,g.nodeIdCompat&&S.test(e[i])&&(e[i]=e[i].replace(S,"")),"."===e[0].charAt(0)&&d&&(p=d.slice(0,d.length-1),e=p.concat(e)),c=0;c<e.length;c++)if(f=e[c],"."===f)e.splice(c,1),c-=1;else if(".."===f){if(0===c||1===c&&".."===e[2]||".."===e[c-1])continue;c>0&&(e.splice(c-1,2),c-=2)}e=e.join("/")}if((d||y)&&m){for(n=e.split("/"),c=n.length;c>0;c-=1){if(r=n.slice(0,c).join("/"),d)for(h=d.length;h>0;h-=1)if(a=m[d.slice(0,h).join("/")],a&&(a=a[r])){s=a,o=c;break}if(s)break;!l&&y&&y[r]&&(l=y[r],u=c)}!s&&l&&(s=l,o=u),s&&(n.splice(0,o,s),e=n.join("/"))}return e}function r(t,n){return function(){var r=b.call(arguments,0);return"string"!=typeof r[0]&&1===r.length&&r.push(null),h.apply(e,r.concat([t,n]))}}function a(e){return function(t){return n(t,e)}}function s(e){return function(t){d[e]=t}}function i(n){if(t(m,n)){var r=m[n];delete m[n],y[n]=!0,c.apply(e,r)}if(!t(d,n)&&!t(y,n))throw new Error("No "+n);return d[n]}function o(e){var t,n=e?e.indexOf("!"):-1;return n>-1&&(t=e.substring(0,n),e=e.substring(n+1,e.length)),[t,e]}function l(e){return e?o(e):[]}function u(e){return function(){return g&&g.config&&g.config[e]||{}}}var c,h,f,p,d={},m={},g={},y={},v=Object.prototype.hasOwnProperty,b=[].slice,S=/\.js$/;f=function(e,t){var r,s=o(e),l=s[0],u=t[1];return e=s[1],l&&(l=n(l,u),r=i(l)),l?e=r&&r.normalize?r.normalize(e,a(u)):n(e,u):(e=n(e,u),s=o(e),l=s[0],e=s[1],l&&(r=i(l))),{f:l?l+"!"+e:e,n:e,pr:l,p:r}},p={require:function(e){return r(e)},exports:function(e){var t=d[e];return"undefined"!=typeof t?t:d[e]={}},module:function(e){return{id:e,uri:"",exports:d[e],config:u(e)}}},c=function(n,a,o,u){var c,h,g,v,b,S,_,C=[],x=typeof o;if(u=u||n,S=l(u),"undefined"===x||"function"===x){for(a=!a.length&&o.length?["require","exports","module"]:a,b=0;b<a.length;b+=1)if(v=f(a[b],S),h=v.f,"require"===h)C[b]=p.require(n);else if("exports"===h)C[b]=p.exports(n),_=!0;else if("module"===h)c=C[b]=p.module(n);else if(t(d,h)||t(m,h)||t(y,h))C[b]=i(h);else{if(!v.p)throw new Error(n+" missing "+h);v.p.load(v.n,r(u,!0),s(h),{}),C[b]=d[h]}g=o?o.apply(d[n],C):void 0,n&&(c&&c.exports!==e&&c.exports!==d[n]?d[n]=c.exports:g===e&&_||(d[n]=g))}else n&&(d[n]=o)},requirejs=require=h=function(t,n,r,a,s){if("string"==typeof t)return p[t]?p[t](n):i(f(t,l(n)).f);if(!t.splice){if(g=t,g.deps&&h(g.deps,g.callback),!n)return;n.splice?(t=n,n=r,r=null):t=e}return n=n||function(){},"function"==typeof r&&(r=a,a=s),a?c(e,t,n,r):setTimeout(function(){c(e,t,n,r)},4),h},h.config=function(e){return h(e)},requirejs._defined=d,define=function(e,n,r){if("string"!=typeof e)throw new Error("See almond README: incorrect module build, no module name");n.splice||(r=n,n=[]),t(d,e)||t(m,e)||(m[e]=[e,n,r])},define.amd={jQuery:!0}}(),define("almond",function(){}),function(e){if("object"==typeof exports&&"undefined"!=typeof module)module.exports=e();else if("function"==typeof define&&define.amd)define("opentype",[],e);else{var t;t="undefined"!=typeof window?window:"undefined"!=typeof global?global:"undefined"!=typeof self?self:this,t.opentype=e()}}(function(){return function e(t,n,r){function a(i,o){if(!n[i]){if(!t[i]){var l="function"==typeof require&&require;if(!o&&l)return l(i,!0);if(s)return s(i,!0);var u=new Error("Cannot find module '"+i+"'");throw u.code="MODULE_NOT_FOUND",u}var c=n[i]={exports:{}};t[i][0].call(c.exports,function(e){var n=t[i][1][e];return a(n?n:e)},c,c.exports,e,t,n,r)}return n[i].exports}for(var s="function"==typeof require&&require,i=0;i<r.length;i++)a(r[i]);return a}({1:[function(e,t,n){function r(){this.table=new Uint16Array(16),this.trans=new Uint16Array(288)}function a(e,t){this.source=e,this.sourceIndex=0,this.tag=0,this.bitcount=0,this.dest=t,this.destLen=0,this.ltree=new r,this.dtree=new r}function s(e,t,n,r){var a,s;for(a=0;a<n;++a)e[a]=0;for(a=0;a<30-n;++a)e[a+n]=a/n|0;for(s=r,a=0;a<30;++a)t[a]=s,s+=1<<e[a]}function i(e,t){var n;for(n=0;n<7;++n)e.table[n]=0;for(e.table[7]=24,e.table[8]=152,e.table[9]=112,n=0;n<24;++n)e.trans[n]=256+n;for(n=0;n<144;++n)e.trans[24+n]=n;for(n=0;n<8;++n)e.trans[168+n]=280+n;for(n=0;n<112;++n)e.trans[176+n]=144+n;for(n=0;n<5;++n)t.table[n]=0;for(t.table[5]=32,n=0;n<32;++n)t.trans[n]=n}function o(e,t,n,r){var a,s;for(a=0;a<16;++a)e.table[a]=0;for(a=0;a<r;++a)e.table[t[n+a]]++;for(e.table[0]=0,s=0,a=0;a<16;++a)O[a]=s,s+=e.table[a];for(a=0;a<r;++a)t[n+a]&&(e.trans[O[t[n+a]]++]=a)}function l(e){e.bitcount--||(e.tag=e.source[e.sourceIndex++],e.bitcount=7);var t=1&e.tag;return e.tag>>>=1,t}function u(e,t,n){if(!t)return n;for(;e.bitcount<24;)e.tag|=e.source[e.sourceIndex++]<<e.bitcount,e.bitcount+=8;var r=e.tag&65535>>>16-t;return e.tag>>>=t,e.bitcount-=t,r+n}function c(e,t){for(;e.bitcount<24;)e.tag|=e.source[e.sourceIndex++]<<e.bitcount,e.bitcount+=8;var n=0,r=0,a=0,s=e.tag;do r=2*r+(1&s),s>>>=1,++a,n+=t.table[a],r-=t.table[a];while(r>=0);return e.tag=s,e.bitcount-=a,t.trans[n+r]}function h(e,t,n){var r,a,s,i,l,h;for(r=u(e,5,257),a=u(e,5,1),s=u(e,4,4),i=0;i<19;++i)w[i]=0;for(i=0;i<s;++i){var f=u(e,3,0);w[x[i]]=f}for(o(T,w,0,19),l=0;l<r+a;){var p=c(e,T);switch(p){case 16:var d=w[l-1];for(h=u(e,2,3);h;--h)w[l++]=d;break;case 17:for(h=u(e,3,3);h;--h)w[l++]=0;break;case 18:for(h=u(e,7,11);h;--h)w[l++]=0;break;default:w[l++]=p}}o(t,w,0,r),o(n,w,r,a)}function f(e,t,n){for(;;){var r=c(e,t);if(256===r)return m;if(r<256)e.dest[e.destLen++]=r;else{var a,s,i,o;for(r-=257,a=u(e,b[r],S[r]),s=c(e,n),i=e.destLen-u(e,_[s],C[s]),o=i;o<i+a;++o)e.dest[e.destLen++]=e.dest[o]}}}function p(e){for(var t,n,r;e.bitcount>8;)e.sourceIndex--,e.bitcount-=8;if(t=e.source[e.sourceIndex+1],t=256*t+e.source[e.sourceIndex],n=e.source[e.sourceIndex+3],n=256*n+e.source[e.sourceIndex+2],t!==(65535&~n))return g;for(e.sourceIndex+=4,r=t;r;--r)e.dest[e.destLen++]=e.source[e.sourceIndex++];return e.bitcount=0,m}function d(e,t){var n,r,s,i=new a(e,t);do{switch(n=l(i),r=u(i,2,0)){case 0:s=p(i);break;case 1:s=f(i,y,v);break;case 2:h(i,i.ltree,i.dtree),s=f(i,i.ltree,i.dtree);break;default:s=g}if(s!==m)throw new Error("Data error")}while(!n);return i.destLen<i.dest.length?"function"==typeof i.dest.slice?i.dest.slice(0,i.destLen):i.dest.subarray(0,i.destLen):i.dest}var m=0,g=-3,y=new r,v=new r,b=new Uint8Array(30),S=new Uint16Array(30),_=new Uint8Array(30),C=new Uint16Array(30),x=new Uint8Array([16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]),T=new r,w=new Uint8Array(320),O=new Uint16Array(16);i(y,v),s(b,S,4,3),s(_,C,2,1),b[28]=0,S[28]=258,t.exports=d},{}],2:[function(e,t,n){n.fail=function(e){throw new Error(e)},n.argument=function(e,t){e||n.fail(t)},n.assert=n.argument},{}],3:[function(e,t,n){function r(e,t,n,r,a){e.beginPath(),e.moveTo(t,n),e.lineTo(r,a),e.stroke()}n.line=r},{}],4:[function(e,t,n){function r(e){this.font=e}function a(e){this.cmap=e}function s(e,t){this.encoding=e,this.charset=t}function i(e){var t;switch(e.version){case 1:this.names=n.standardNames.slice();break;case 2:for(this.names=new Array(e.numberOfGlyphs),t=0;t<e.numberOfGlyphs;t++)e.glyphNameIndex[t]<n.standardNames.length?this.names[t]=n.standardNames[e.glyphNameIndex[t]]:this.names[t]=e.names[e.glyphNameIndex[t]-n.standardNames.length];break;case 2.5:for(this.names=new Array(e.numberOfGlyphs),t=0;t<e.numberOfGlyphs;t++)this.names[t]=n.standardNames[t+e.glyphNameIndex[t]];break;case 3:this.names=[]}}function o(e){for(var t,n=e.tables.cmap.glyphIndexMap,r=Object.keys(n),a=0;a<r.length;a+=1){var s=r[a],i=n[s];t=e.glyphs.get(i),t.addUnicode(parseInt(s))}for(a=0;a<e.glyphs.length;a+=1)t=e.glyphs.get(a),e.cffEncoding?t.name=e.cffEncoding.charset[a]:e.glyphNames.names&&(t.name=e.glyphNames.glyphIndexToName(a))}var l=[".notdef","space","exclam","quotedbl","numbersign","dollar","percent","ampersand","quoteright","parenleft","parenright","asterisk","plus","comma","hyphen","period","slash","zero","one","two","three","four","five","six","seven","eight","nine","colon","semicolon","less","equal","greater","question","at","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","bracketleft","backslash","bracketright","asciicircum","underscore","quoteleft","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","braceleft","bar","braceright","asciitilde","exclamdown","cent","sterling","fraction","yen","florin","section","currency","quotesingle","quotedblleft","guillemotleft","guilsinglleft","guilsinglright","fi","fl","endash","dagger","daggerdbl","periodcentered","paragraph","bullet","quotesinglbase","quotedblbase","quotedblright","guillemotright","ellipsis","perthousand","questiondown","grave","acute","circumflex","tilde","macron","breve","dotaccent","dieresis","ring","cedilla","hungarumlaut","ogonek","caron","emdash","AE","ordfeminine","Lslash","Oslash","OE","ordmasculine","ae","dotlessi","lslash","oslash","oe","germandbls","onesuperior","logicalnot","mu","trademark","Eth","onehalf","plusminus","Thorn","onequarter","divide","brokenbar","degree","thorn","threequarters","twosuperior","registered","minus","eth","multiply","threesuperior","copyright","Aacute","Acircumflex","Adieresis","Agrave","Aring","Atilde","Ccedilla","Eacute","Ecircumflex","Edieresis","Egrave","Iacute","Icircumflex","Idieresis","Igrave","Ntilde","Oacute","Ocircumflex","Odieresis","Ograve","Otilde","Scaron","Uacute","Ucircumflex","Udieresis","Ugrave","Yacute","Ydieresis","Zcaron","aacute","acircumflex","adieresis","agrave","aring","atilde","ccedilla","eacute","ecircumflex","edieresis","egrave","iacute","icircumflex","idieresis","igrave","ntilde","oacute","ocircumflex","odieresis","ograve","otilde","scaron","uacute","ucircumflex","udieresis","ugrave","yacute","ydieresis","zcaron","exclamsmall","Hungarumlautsmall","dollaroldstyle","dollarsuperior","ampersandsmall","Acutesmall","parenleftsuperior","parenrightsuperior","266 ff","onedotenleader","zerooldstyle","oneoldstyle","twooldstyle","threeoldstyle","fouroldstyle","fiveoldstyle","sixoldstyle","sevenoldstyle","eightoldstyle","nineoldstyle","commasuperior","threequartersemdash","periodsuperior","questionsmall","asuperior","bsuperior","centsuperior","dsuperior","esuperior","isuperior","lsuperior","msuperior","nsuperior","osuperior","rsuperior","ssuperior","tsuperior","ff","ffi","ffl","parenleftinferior","parenrightinferior","Circumflexsmall","hyphensuperior","Gravesmall","Asmall","Bsmall","Csmall","Dsmall","Esmall","Fsmall","Gsmall","Hsmall","Ismall","Jsmall","Ksmall","Lsmall","Msmall","Nsmall","Osmall","Psmall","Qsmall","Rsmall","Ssmall","Tsmall","Usmall","Vsmall","Wsmall","Xsmall","Ysmall","Zsmall","colonmonetary","onefitted","rupiah","Tildesmall","exclamdownsmall","centoldstyle","Lslashsmall","Scaronsmall","Zcaronsmall","Dieresissmall","Brevesmall","Caronsmall","Dotaccentsmall","Macronsmall","figuredash","hypheninferior","Ogoneksmall","Ringsmall","Cedillasmall","questiondownsmall","oneeighth","threeeighths","fiveeighths","seveneighths","onethird","twothirds","zerosuperior","foursuperior","fivesuperior","sixsuperior","sevensuperior","eightsuperior","ninesuperior","zeroinferior","oneinferior","twoinferior","threeinferior","fourinferior","fiveinferior","sixinferior","seveninferior","eightinferior","nineinferior","centinferior","dollarinferior","periodinferior","commainferior","Agravesmall","Aacutesmall","Acircumflexsmall","Atildesmall","Adieresissmall","Aringsmall","AEsmall","Ccedillasmall","Egravesmall","Eacutesmall","Ecircumflexsmall","Edieresissmall","Igravesmall","Iacutesmall","Icircumflexsmall","Idieresissmall","Ethsmall","Ntildesmall","Ogravesmall","Oacutesmall","Ocircumflexsmall","Otildesmall","Odieresissmall","OEsmall","Oslashsmall","Ugravesmall","Uacutesmall","Ucircumflexsmall","Udieresissmall","Yacutesmall","Thornsmall","Ydieresissmall","001.000","001.001","001.002","001.003","Black","Bold","Book","Light","Medium","Regular","Roman","Semibold"],u=["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","space","exclam","quotedbl","numbersign","dollar","percent","ampersand","quoteright","parenleft","parenright","asterisk","plus","comma","hyphen","period","slash","zero","one","two","three","four","five","six","seven","eight","nine","colon","semicolon","less","equal","greater","question","at","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","bracketleft","backslash","bracketright","asciicircum","underscore","quoteleft","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","braceleft","bar","braceright","asciitilde","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","exclamdown","cent","sterling","fraction","yen","florin","section","currency","quotesingle","quotedblleft","guillemotleft","guilsinglleft","guilsinglright","fi","fl","","endash","dagger","daggerdbl","periodcentered","","paragraph","bullet","quotesinglbase","quotedblbase","quotedblright","guillemotright","ellipsis","perthousand","","questiondown","","grave","acute","circumflex","tilde","macron","breve","dotaccent","dieresis","","ring","cedilla","","hungarumlaut","ogonek","caron","emdash","","","","","","","","","","","","","","","","","AE","","ordfeminine","","","","","Lslash","Oslash","OE","ordmasculine","","","","","","ae","","","","dotlessi","","","lslash","oslash","oe","germandbls"],c=["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","space","exclamsmall","Hungarumlautsmall","","dollaroldstyle","dollarsuperior","ampersandsmall","Acutesmall","parenleftsuperior","parenrightsuperior","twodotenleader","onedotenleader","comma","hyphen","period","fraction","zerooldstyle","oneoldstyle","twooldstyle","threeoldstyle","fouroldstyle","fiveoldstyle","sixoldstyle","sevenoldstyle","eightoldstyle","nineoldstyle","colon","semicolon","commasuperior","threequartersemdash","periodsuperior","questionsmall","","asuperior","bsuperior","centsuperior","dsuperior","esuperior","","","isuperior","","","lsuperior","msuperior","nsuperior","osuperior","","","rsuperior","ssuperior","tsuperior","","ff","fi","fl","ffi","ffl","parenleftinferior","","parenrightinferior","Circumflexsmall","hyphensuperior","Gravesmall","Asmall","Bsmall","Csmall","Dsmall","Esmall","Fsmall","Gsmall","Hsmall","Ismall","Jsmall","Ksmall","Lsmall","Msmall","Nsmall","Osmall","Psmall","Qsmall","Rsmall","Ssmall","Tsmall","Usmall","Vsmall","Wsmall","Xsmall","Ysmall","Zsmall","colonmonetary","onefitted","rupiah","Tildesmall","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","exclamdownsmall","centoldstyle","Lslashsmall","","","Scaronsmall","Zcaronsmall","Dieresissmall","Brevesmall","Caronsmall","","Dotaccentsmall","","","Macronsmall","","","figuredash","hypheninferior","","","Ogoneksmall","Ringsmall","Cedillasmall","","","","onequarter","onehalf","threequarters","questiondownsmall","oneeighth","threeeighths","fiveeighths","seveneighths","onethird","twothirds","","","zerosuperior","onesuperior","twosuperior","threesuperior","foursuperior","fivesuperior","sixsuperior","sevensuperior","eightsuperior","ninesuperior","zeroinferior","oneinferior","twoinferior","threeinferior","fourinferior","fiveinferior","sixinferior","seveninferior","eightinferior","nineinferior","centinferior","dollarinferior","periodinferior","commainferior","Agravesmall","Aacutesmall","Acircumflexsmall","Atildesmall","Adieresissmall","Aringsmall","AEsmall","Ccedillasmall","Egravesmall","Eacutesmall","Ecircumflexsmall","Edieresissmall","Igravesmall","Iacutesmall","Icircumflexsmall","Idieresissmall","Ethsmall","Ntildesmall","Ogravesmall","Oacutesmall","Ocircumflexsmall","Otildesmall","Odieresissmall","OEsmall","Oslashsmall","Ugravesmall","Uacutesmall","Ucircumflexsmall","Udieresissmall","Yacutesmall","Thornsmall","Ydieresissmall"],h=[".notdef",".null","nonmarkingreturn","space","exclam","quotedbl","numbersign","dollar","percent","ampersand","quotesingle","parenleft","parenright","asterisk","plus","comma","hyphen","period","slash","zero","one","two","three","four","five","six","seven","eight","nine","colon","semicolon","less","equal","greater","question","at","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","bracketleft","backslash","bracketright","asciicircum","underscore","grave","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","braceleft","bar","braceright","asciitilde","Adieresis","Aring","Ccedilla","Eacute","Ntilde","Odieresis","Udieresis","aacute","agrave","acircumflex","adieresis","atilde","aring","ccedilla","eacute","egrave","ecircumflex","edieresis","iacute","igrave","icircumflex","idieresis","ntilde","oacute","ograve","ocircumflex","odieresis","otilde","uacute","ugrave","ucircumflex","udieresis","dagger","degree","cent","sterling","section","bullet","paragraph","germandbls","registered","copyright","trademark","acute","dieresis","notequal","AE","Oslash","infinity","plusminus","lessequal","greaterequal","yen","mu","partialdiff","summation","product","pi","integral","ordfeminine","ordmasculine","Omega","ae","oslash","questiondown","exclamdown","logicalnot","radical","florin","approxequal","Delta","guillemotleft","guillemotright","ellipsis","nonbreakingspace","Agrave","Atilde","Otilde","OE","oe","endash","emdash","quotedblleft","quotedblright","quoteleft","quoteright","divide","lozenge","ydieresis","Ydieresis","fraction","currency","guilsinglleft","guilsinglright","fi","fl","daggerdbl","periodcentered","quotesinglbase","quotedblbase","perthousand","Acircumflex","Ecircumflex","Aacute","Edieresis","Egrave","Iacute","Icircumflex","Idieresis","Igrave","Oacute","Ocircumflex","apple","Ograve","Uacute","Ucircumflex","Ugrave","dotlessi","circumflex","tilde","macron","breve","dotaccent","ring","cedilla","hungarumlaut","ogonek","caron","Lslash","lslash","Scaron","scaron","Zcaron","zcaron","brokenbar","Eth","eth","Yacute","yacute","Thorn","thorn","minus","multiply","onesuperior","twosuperior","threesuperior","onehalf","onequarter","threequarters","franc","Gbreve","gbreve","Idotaccent","Scedilla","scedilla","Cacute","cacute","Ccaron","ccaron","dcroat"];r.prototype.charToGlyphIndex=function(e){var t=e.charCodeAt(0),n=this.font.glyphs;if(!n)return null;for(var r=0;r<n.length;r+=1)for(var a=n.get(r),s=0;s<a.unicodes.length;s+=1)if(a.unicodes[s]===t)return r},a.prototype.charToGlyphIndex=function(e){return this.cmap.glyphIndexMap[e.charCodeAt(0)]||0},s.prototype.charToGlyphIndex=function(e){var t=e.charCodeAt(0),n=this.encoding[t];return this.charset.indexOf(n)},i.prototype.nameToGlyphIndex=function(e){return this.names.indexOf(e)},i.prototype.glyphIndexToName=function(e){return this.names[e]},n.cffStandardStrings=l,n.cffStandardEncoding=u,n.cffExpertEncoding=c,n.standardNames=h,n.DefaultEncoding=r,n.CmapEncoding=a,n.CffEncoding=s,n.GlyphNames=i,n.addGlyphNames=o},{}],5:[function(e,t,n){function r(e){e=e||{},e.empty||(u.checkArgument(e.familyName,"When creating a new Font object, familyName is required."),u.checkArgument(e.styleName,"When creating a new Font object, styleName is required."),u.checkArgument(e.unitsPerEm,"When creating a new Font object, unitsPerEm is required."),u.checkArgument(e.ascender,"When creating a new Font object, ascender is required."),u.checkArgument(e.descender,"When creating a new Font object, descender is required."),u.checkArgument(e.descender<0,"Descender should be negative (e.g. -512)."),this.names={fontFamily:{en:e.familyName||" "},fontSubfamily:{en:e.styleName||" "},fullName:{en:e.fullName||e.familyName+" "+e.styleName},postScriptName:{en:e.postScriptName||e.familyName+e.styleName},designer:{en:e.designer||" "},designerURL:{en:e.designerURL||" "},manufacturer:{en:e.manufacturer||" "},manufacturerURL:{en:e.manufacturerURL||" "},license:{en:e.license||" "},licenseURL:{en:e.licenseURL||" "},version:{en:e.version||"Version 0.1"},description:{en:e.description||" "},copyright:{en:e.copyright||" "},trademark:{en:e.trademark||" "}},this.unitsPerEm=e.unitsPerEm||1e3,this.ascender=e.ascender,this.descender=e.descender,this.createdTimestamp=e.createdTimestamp,this.tables={os2:{usWeightClass:e.weightClass||this.usWeightClasses.MEDIUM,usWidthClass:e.widthClass||this.usWidthClasses.MEDIUM,fsSelection:e.fsSelection||this.fsSelectionValues.REGULAR}}),this.supported=!0,this.glyphs=new o.GlyphSet(this,e.glyphs||[]),this.encoding=new i.DefaultEncoding(this),this.substitution=new l(this),this.tables=this.tables||{}}var a=e("./path"),s=e("./tables/sfnt"),i=e("./encoding"),o=e("./glyphset"),l=e("./substitution"),u=e("./util");r.prototype.hasChar=function(e){return null!==this.encoding.charToGlyphIndex(e)},r.prototype.charToGlyphIndex=function(e){return this.encoding.charToGlyphIndex(e)},r.prototype.charToGlyph=function(e){var t=this.charToGlyphIndex(e),n=this.glyphs.get(t);return n||(n=this.glyphs.get(0)),n},r.prototype.stringToGlyphs=function(e){for(var t=[],n=0;n<e.length;n+=1){var r=e[n];t.push(this.charToGlyph(r))}return t},r.prototype.nameToGlyphIndex=function(e){return this.glyphNames.nameToGlyphIndex(e)},r.prototype.nameToGlyph=function(e){var t=this.nameToGlyphIndex(e),n=this.glyphs.get(t);return n||(n=this.glyphs.get(0)),n},r.prototype.glyphIndexToName=function(e){return this.glyphNames.glyphIndexToName?this.glyphNames.glyphIndexToName(e):""},r.prototype.getKerningValue=function(e,t){e=e.index||e,t=t.index||t;var n=this.getGposKerningValue;return n?n(e,t):this.kerningPairs[e+","+t]||0},r.prototype.forEachGlyph=function(e,t,n,r,a,s){t=void 0!==t?t:0,n=void 0!==n?n:0,r=void 0!==r?r:72,a=a||{};for(var i=void 0===a.kerning||a.kerning,o=1/this.unitsPerEm*r,l=this.stringToGlyphs(e),u=0;u<l.length;u+=1){var c=l[u];if(s(c,t,n,r,a),c.advanceWidth&&(t+=c.advanceWidth*o),i&&u<l.length-1){var h=this.getKerningValue(c,l[u+1]);t+=h*o}a.letterSpacing?t+=a.letterSpacing*r:a.tracking&&(t+=a.tracking/1e3*r)}},r.prototype.getPath=function(e,t,n,r,s){var i=new a.Path;return this.forEachGlyph(e,t,n,r,s,function(e,t,n,r){var a=e.getPath(t,n,r);i.extend(a)}),i},r.prototype.getPaths=function(e,t,n,r,a){var s=[];return this.forEachGlyph(e,t,n,r,a,function(e,t,n,r){var a=e.getPath(t,n,r);s.push(a)}),s},r.prototype.draw=function(e,t,n,r,a,s){this.getPath(t,n,r,a,s).draw(e)},r.prototype.drawPoints=function(e,t,n,r,a,s){this.forEachGlyph(t,n,r,a,s,function(t,n,r,a){t.drawPoints(e,n,r,a)})},r.prototype.drawMetrics=function(e,t,n,r,a,s){this.forEachGlyph(t,n,r,a,s,function(t,n,r,a){t.drawMetrics(e,n,r,a)})},r.prototype.getEnglishName=function(e){var t=this.names[e];if(t)return t.en},r.prototype.validate=function(){function e(e,t){e||n.push(t)}function t(t){var n=r.getEnglishName(t);e(n&&n.trim().length>0,"No English "+t+" specified.")}var n=[],r=this;t("fontFamily"),t("weightName"),t("manufacturer"),t("copyright"),t("version"),e(this.unitsPerEm>0,"No unitsPerEm specified.")},r.prototype.toTables=function(){return s.fontToTable(this)},r.prototype.toBuffer=function(){return console.warn("Font.toBuffer is deprecated. Use Font.toArrayBuffer instead."),this.toArrayBuffer()},r.prototype.toArrayBuffer=function(){for(var e=this.toTables(),t=e.encode(),n=new ArrayBuffer(t.length),r=new Uint8Array(n),a=0;a<t.length;a++)r[a]=t[a];return n},r.prototype.download=function(t){var n=this.getEnglishName("fontFamily"),r=this.getEnglishName("fontSubfamily");t=t||n.replace(/\s/g,"")+"-"+r+".otf";var a=this.toArrayBuffer();if(u.isBrowser())window.requestFileSystem=window.requestFileSystem||window.webkitRequestFileSystem,window.requestFileSystem(window.TEMPORARY,a.byteLength,function(e){e.root.getFile(t,{create:!0},function(e){e.createWriter(function(t){var n=new DataView(a),r=new Blob([n],{type:"font/opentype"});t.write(r),t.addEventListener("writeend",function(){location.href=e.toURL()},!1)})})},function(e){throw new Error(e.name+": "+e.message)});else{var s=e("fs"),i=u.arrayBufferToNodeBuffer(a);s.writeFileSync(t,i)}},r.prototype.fsSelectionValues={ITALIC:1,UNDERSCORE:2,NEGATIVE:4,OUTLINED:8,STRIKEOUT:16,BOLD:32,REGULAR:64,USER_TYPO_METRICS:128,WWS:256,OBLIQUE:512},r.prototype.usWidthClasses={ULTRA_CONDENSED:1,EXTRA_CONDENSED:2,CONDENSED:3,SEMI_CONDENSED:4,MEDIUM:5,SEMI_EXPANDED:6,EXPANDED:7,EXTRA_EXPANDED:8,ULTRA_EXPANDED:9},r.prototype.usWeightClasses={THIN:100,EXTRA_LIGHT:200,LIGHT:300,NORMAL:400,MEDIUM:500,SEMI_BOLD:600,BOLD:700,EXTRA_BOLD:800,BLACK:900},n.Font=r},{"./encoding":4,"./glyphset":7,"./path":11,"./substitution":12,"./tables/sfnt":31,"./util":33,fs:void 0}],6:[function(e,t,n){function r(e,t){var n=t||{commands:[]};return{configurable:!0,get:function(){return"function"==typeof n&&(n=n()),n},set:function(e){n=e}}}function a(e){this.bindConstructorValues(e)}var s=e("./check"),i=e("./draw"),o=e("./path");a.prototype.bindConstructorValues=function(e){this.index=e.index||0,this.name=e.name||null,this.unicode=e.unicode||void 0,this.unicodes=e.unicodes||void 0!==e.unicode?[e.unicode]:[],e.xMin&&(this.xMin=e.xMin),e.yMin&&(this.yMin=e.yMin),e.xMax&&(this.xMax=e.xMax),e.yMax&&(this.yMax=e.yMax),e.advanceWidth&&(this.advanceWidth=e.advanceWidth),Object.defineProperty(this,"path",r(this,e.path))},a.prototype.addUnicode=function(e){0===this.unicodes.length&&(this.unicode=e),this.unicodes.push(e)},a.prototype.getPath=function(e,t,n,r){e=void 0!==e?e:0,t=void 0!==t?t:0,r=void 0!==r?r:{xScale:1,yScale:1},n=void 0!==n?n:72;for(var a=1/this.path.unitsPerEm*n,s=r.xScale*a,i=r.yScale*a,l=new o.Path,u=this.path.commands,c=0;c<u.length;c+=1){var h=u[c];"M"===h.type?l.moveTo(e+h.x*s,t+-h.y*i):"L"===h.type?l.lineTo(e+h.x*s,t+-h.y*i):"Q"===h.type?l.quadraticCurveTo(e+h.x1*s,t+-h.y1*i,e+h.x*s,t+-h.y*i):"C"===h.type?l.curveTo(e+h.x1*s,t+-h.y1*i,e+h.x2*s,t+-h.y2*i,e+h.x*s,t+-h.y*i):"Z"===h.type&&l.closePath()}return l},a.prototype.getContours=function(){if(void 0===this.points)return[];for(var e=[],t=[],n=0;n<this.points.length;n+=1){var r=this.points[n];t.push(r),r.lastPointOfContour&&(e.push(t),t=[])}return s.argument(0===t.length,"There are still points left in the current contour."),e},a.prototype.getMetrics=function(){for(var e=this.path.commands,t=[],n=[],r=0;r<e.length;r+=1){var a=e[r];"Z"!==a.type&&(t.push(a.x),n.push(a.y)),"Q"!==a.type&&"C"!==a.type||(t.push(a.x1),n.push(a.y1)),"C"===a.type&&(t.push(a.x2),n.push(a.y2))}var s={xMin:Math.min.apply(null,t),yMin:Math.min.apply(null,n),xMax:Math.max.apply(null,t),yMax:Math.max.apply(null,n),leftSideBearing:this.leftSideBearing};return isFinite(s.xMin)||(s.xMin=0),isFinite(s.xMax)||(s.xMax=this.advanceWidth),isFinite(s.yMin)||(s.yMin=0),isFinite(s.yMax)||(s.yMax=0),s.rightSideBearing=this.advanceWidth-s.leftSideBearing-(s.xMax-s.xMin),s},a.prototype.draw=function(e,t,n,r,a){this.getPath(t,n,r,a).draw(e)},a.prototype.drawPoints=function(e,t,n,r){function a(t,n,r,a){var s=2*Math.PI;e.beginPath();for(var i=0;i<t.length;i+=1)e.moveTo(n+t[i].x*a,r+t[i].y*a),e.arc(n+t[i].x*a,r+t[i].y*a,2,0,s,!1);e.closePath(),e.fill()}t=void 0!==t?t:0,n=void 0!==n?n:0,r=void 0!==r?r:24;for(var s=1/this.path.unitsPerEm*r,i=[],o=[],l=this.path,u=0;u<l.commands.length;u+=1){var c=l.commands[u];void 0!==c.x&&i.push({x:c.x,y:-c.y}),void 0!==c.x1&&o.push({x:c.x1,y:-c.y1}),void 0!==c.x2&&o.push({x:c.x2,y:-c.y2})}e.fillStyle="blue",a(i,t,n,s),e.fillStyle="red",a(o,t,n,s)},a.prototype.drawMetrics=function(e,t,n,r){var a;t=void 0!==t?t:0,n=void 0!==n?n:0,r=void 0!==r?r:24,a=1/this.path.unitsPerEm*r,e.lineWidth=1,e.strokeStyle="black",i.line(e,t,-1e4,t,1e4),i.line(e,-1e4,n,1e4,n);var s=this.xMin||0,o=this.yMin||0,l=this.xMax||0,u=this.yMax||0,c=this.advanceWidth||0;e.strokeStyle="blue",i.line(e,t+s*a,-1e4,t+s*a,1e4),i.line(e,t+l*a,-1e4,t+l*a,1e4),i.line(e,-1e4,n+-o*a,1e4,n+-o*a),i.line(e,-1e4,n+-u*a,1e4,n+-u*a),e.strokeStyle="green",i.line(e,t+c*a,-1e4,t+c*a,1e4)},n.Glyph=a},{"./check":2,"./draw":3,"./path":11}],7:[function(e,t,n){function r(e,t,n){Object.defineProperty(e,t,{get:function(){return e.path,e[n]},set:function(t){e[n]=t},enumerable:!0,configurable:!0})}function a(e,t){if(this.font=e,this.glyphs={},Array.isArray(t))for(var n=0;n<t.length;n++)this.glyphs[n]=t[n];this.length=t&&t.length||0}function s(e,t){return new l.Glyph({index:t,font:e})}function i(e,t,n,a,s,i){return function(){var o=new l.Glyph({index:t,font:e});return o.path=function(){n(o,a,s);var t=i(e.glyphs,o);return t.unitsPerEm=e.unitsPerEm,t},r(o,"xMin","_xMin"),r(o,"xMax","_xMax"),r(o,"yMin","_yMin"),r(o,"yMax","_yMax"),o}}function o(e,t,n,r){return function(){var a=new l.Glyph({index:t,font:e});return a.path=function(){var t=n(e,a,r);return t.unitsPerEm=e.unitsPerEm,t},a}}var l=e("./glyph");a.prototype.get=function(e){return"function"==typeof this.glyphs[e]&&(this.glyphs[e]=this.glyphs[e]()),this.glyphs[e]},a.prototype.push=function(e,t){this.glyphs[e]=t,this.length++},n.GlyphSet=a,n.glyphLoader=s,n.ttfGlyphLoader=i,n.cffGlyphLoader=o},{"./glyph":6}],8:[function(e,t,n){function r(e,t){for(var n=0,r=e.length-1;n<=r;){var a=n+r>>>1,s=e[a].tag;if(s===t)return a;s<t?n=a+1:r=a-1}return-n-1}function a(e,t){for(var n=0,r=e.length-1;n<=r;){var a=n+r>>>1,s=e[a];if(s===t)return a;s<t?n=a+1:r=a-1}return-n-1}var s=e("./check"),i={searchTag:r,binSearch:a,getScriptNames:function(){var e=this.getGsubTable();return e?e.scripts.map(function(e){return e.tag}):[]},getScriptTable:function(e,t){var n=this.getGsubTable(t);if(n){var a=n.scripts,s=r(n.scripts,e);if(s>=0)return a[s].script;var i={tag:e,script:{defaultLangSys:{reserved:0,reqFeatureIndex:65535,featureIndexes:[]},langSysRecords:[]}};return a.splice(-1-s,0,i.script),i}},getLangSysTable:function(e,t,n){var a=this.getScriptTable(e,n);if(a){if("DFLT"===t)return a.defaultLangSys;var s=r(a.langSysRecords,t);if(s>=0)return a.langSysRecords[s].langSys;if(n){var i={tag:t,langSys:{reserved:0,reqFeatureIndex:65535,featureIndexes:[]}};return a.langSysRecords.splice(-1-s,0,i),i.langSys}}},getFeatureTable:function(e,t,n,r){var a=this.getLangSysTable(e,t,r);if(a){for(var i,o=a.featureIndexes,l=this.font.tables.gsub.features,u=0;u<o.length;u++)if(i=l[o[u]],i.tag===n)return i.feature;if(r){var c=l.length;return s.assert(0===c||n>=l[c-1].tag,"Features must be added in alphabetical order."),i={tag:n,feature:{params:0,lookupListIndexes:[]}},l.push(i),o.push(c),i.feature}}},getLookupTable:function(e,t,n,r,a){var s=this.getFeatureTable(e,t,n,a);if(s){for(var i,o=s.lookupListIndexes,l=this.font.tables.gsub.lookups,u=0;u<o.length;u++)if(i=l[o[u]],i.lookupType===r)return i;if(a){i={lookupType:r,lookupFlag:0,subtables:[],markFilteringSet:void 0};var c=l.length;return l.push(i),o.push(c),i}}},expandCoverage:function(e){if(1===e.format)return e.glyphs;for(var t=[],n=e.ranges,r=0;r<n;r++)for(var a=n[r],s=a.start,i=a.end,o=s;o<=i;o++)t.push(o);return t}};t.exports=i},{"./check":2}],9:[function(e,t,n){function r(t,n){var r=e("fs");r.readFile(t,function(e,t){return e?n(e.message):void n(null,y.nodeBufferToArrayBuffer(t))})}function a(e,t){var n=new XMLHttpRequest;n.open("get",e,!0),n.responseType="arraybuffer",n.onload=function(){return 200!==n.status?t("Font could not be loaded: "+n.statusText):t(null,n.response)},n.send()}function s(e,t){for(var n=[],r=12,a=0;a<t;a+=1){var s=m.getTag(e,r),i=m.getULong(e,r+4),o=m.getULong(e,r+8),l=m.getULong(e,r+12);n.push({tag:s,checksum:i,offset:o,length:l,compression:!1}),r+=16}return n}function i(e,t){for(var n=[],r=44,a=0;a<t;a+=1){var s,i=m.getTag(e,r),o=m.getULong(e,r+4),l=m.getULong(e,r+8),u=m.getULong(e,r+12);s=l<u&&"WOFF",n.push({tag:i,offset:o,compression:s,compressedLength:l,originalLength:u}),r+=20}return n}function o(e,t){if("WOFF"===t.compression){var n=new Uint8Array(e.buffer,t.offset+2,t.compressedLength-2),r=new Uint8Array(t.originalLength);if(h(n,r),r.byteLength!==t.originalLength)throw new Error("Decompression error: "+t.tag+" decompressed length doesn't match recorded length");var a=new DataView(r.buffer,0);
-return{data:a,offset:0}}return{data:e,offset:t.offset}}function l(e){var t,n,r,a=new p.Font({empty:!0}),l=new DataView(e,0),u=[],c=m.getTag(l,0);if(c===String.fromCharCode(0,1,0,0))a.outlinesFormat="truetype",r=m.getUShort(l,4),u=s(l,r);else if("OTTO"===c)a.outlinesFormat="cff",r=m.getUShort(l,4),u=s(l,r);else{if("wOFF"!==c)throw new Error("Unsupported OpenType signature "+c);var h=m.getTag(l,4);if(h===String.fromCharCode(0,1,0,0))a.outlinesFormat="truetype";else{if("OTTO"!==h)throw new Error("Unsupported OpenType flavor "+c);a.outlinesFormat="cff"}r=m.getUShort(l,12),u=i(l,r)}for(var d,g,y,B,I,R,P,M,G,H,j=0;j<r;j+=1){var W,q=u[j];switch(q.tag){case"cmap":W=o(l,q),a.tables.cmap=v.parse(W.data,W.offset),a.encoding=new f.CmapEncoding(a.tables.cmap);break;case"fvar":g=q;break;case"head":W=o(l,q),a.tables.head=T.parse(W.data,W.offset),a.unitsPerEm=a.tables.head.unitsPerEm,t=a.tables.head.indexToLocFormat;break;case"hhea":W=o(l,q),a.tables.hhea=w.parse(W.data,W.offset),a.ascender=a.tables.hhea.ascender,a.descender=a.tables.hhea.descender,a.numberOfHMetrics=a.tables.hhea.numberOfHMetrics;break;case"hmtx":R=q;break;case"ltag":W=o(l,q),n=D.parse(W.data,W.offset);break;case"maxp":W=o(l,q),a.tables.maxp=F.parse(W.data,W.offset),a.numGlyphs=a.tables.maxp.numGlyphs;break;case"name":G=q;break;case"OS/2":W=o(l,q),a.tables.os2=U.parse(W.data,W.offset);break;case"post":W=o(l,q),a.tables.post=k.parse(W.data,W.offset),a.glyphNames=new f.GlyphNames(a.tables.post);break;case"glyf":y=q;break;case"loca":M=q;break;case"CFF ":d=q;break;case"kern":P=q;break;case"GPOS":B=q;break;case"GSUB":I=q;break;case"meta":H=q}}var V=o(l,G);if(a.tables.name=E.parse(V.data,V.offset,n),a.names=a.tables.name,y&&M){var z=0===t,X=o(l,M),Y=L.parse(X.data,X.offset,a.numGlyphs,z),K=o(l,y);a.glyphs=_.parse(K.data,K.offset,Y,a)}else{if(!d)throw new Error("Font doesn't contain TrueType or CFF outlines.");var J=o(l,d);b.parse(J.data,J.offset,a)}var Z=o(l,R);if(O.parse(Z.data,Z.offset,a.numberOfHMetrics,a.numGlyphs,a.glyphs),f.addGlyphNames(a),P){var Q=o(l,P);a.kerningPairs=N.parse(Q.data,Q.offset)}else a.kerningPairs={};if(B){var $=o(l,B);C.parse($.data,$.offset,a)}if(I){var ee=o(l,I);a.tables.gsub=x.parse(ee.data,ee.offset)}if(g){var te=o(l,g);a.tables.fvar=S.parse(te.data,te.offset,a.names)}if(H){var ne=o(l,H);a.tables.meta=A.parse(ne.data,ne.offset),a.metas=a.tables.meta}return a}function u(e,t){var n="undefined"==typeof window,s=n?r:a;s(e,function(e,n){if(e)return t(e);var r;try{r=l(n)}catch(e){return t(e,null)}return t(null,r)})}function c(t){var n=e("fs"),r=n.readFileSync(t);return l(y.nodeBufferToArrayBuffer(r))}var h=e("tiny-inflate"),f=e("./encoding"),p=e("./font"),d=e("./glyph"),m=e("./parse"),g=e("./path"),y=e("./util"),v=e("./tables/cmap"),b=e("./tables/cff"),S=e("./tables/fvar"),_=e("./tables/glyf"),C=e("./tables/gpos"),x=e("./tables/gsub"),T=e("./tables/head"),w=e("./tables/hhea"),O=e("./tables/hmtx"),N=e("./tables/kern"),D=e("./tables/ltag"),L=e("./tables/loca"),F=e("./tables/maxp"),E=e("./tables/name"),U=e("./tables/os2"),k=e("./tables/post"),A=e("./tables/meta");n._parse=m,n.Font=p.Font,n.Glyph=d.Glyph,n.Path=g.Path,n.parse=l,n.load=u,n.loadSync=c},{"./encoding":4,"./font":5,"./glyph":6,"./parse":10,"./path":11,"./tables/cff":14,"./tables/cmap":15,"./tables/fvar":16,"./tables/glyf":17,"./tables/gpos":18,"./tables/gsub":19,"./tables/head":20,"./tables/hhea":21,"./tables/hmtx":22,"./tables/kern":23,"./tables/loca":24,"./tables/ltag":25,"./tables/maxp":26,"./tables/meta":27,"./tables/name":28,"./tables/os2":29,"./tables/post":30,"./util":33,fs:void 0,"tiny-inflate":1}],10:[function(e,t,n){function r(e,t){return e.getUint16(t,!1)}function a(e,t){this.data=e,this.offset=t,this.relativeOffset=0}var s=e("./check");n.getByte=function(e,t){return e.getUint8(t)},n.getCard8=n.getByte,n.getUShort=n.getCard16=r,n.getShort=function(e,t){return e.getInt16(t,!1)},n.getULong=function(e,t){return e.getUint32(t,!1)},n.getFixed=function(e,t){var n=e.getInt16(t,!1),r=e.getUint16(t+2,!1);return n+r/65535},n.getTag=function(e,t){for(var n="",r=t;r<t+4;r+=1)n+=String.fromCharCode(e.getInt8(r));return n},n.getOffset=function(e,t,n){for(var r=0,a=0;a<n;a+=1)r<<=8,r+=e.getUint8(t+a);return r},n.getBytes=function(e,t,n){for(var r=[],a=t;a<n;a+=1)r.push(e.getUint8(a));return r},n.bytesToString=function(e){for(var t="",n=0;n<e.length;n+=1)t+=String.fromCharCode(e[n]);return t};var i={byte:1,uShort:2,short:2,uLong:4,fixed:4,longDateTime:8,tag:4};a.prototype.parseByte=function(){var e=this.data.getUint8(this.offset+this.relativeOffset);return this.relativeOffset+=1,e},a.prototype.parseChar=function(){var e=this.data.getInt8(this.offset+this.relativeOffset);return this.relativeOffset+=1,e},a.prototype.parseCard8=a.prototype.parseByte,a.prototype.parseUShort=function(){var e=this.data.getUint16(this.offset+this.relativeOffset);return this.relativeOffset+=2,e},a.prototype.parseCard16=a.prototype.parseUShort,a.prototype.parseSID=a.prototype.parseUShort,a.prototype.parseOffset16=a.prototype.parseUShort,a.prototype.parseShort=function(){var e=this.data.getInt16(this.offset+this.relativeOffset);return this.relativeOffset+=2,e},a.prototype.parseF2Dot14=function(){var e=this.data.getInt16(this.offset+this.relativeOffset)/16384;return this.relativeOffset+=2,e},a.prototype.parseULong=function(){var e=n.getULong(this.data,this.offset+this.relativeOffset);return this.relativeOffset+=4,e},a.prototype.parseFixed=function(){var e=n.getFixed(this.data,this.offset+this.relativeOffset);return this.relativeOffset+=4,e},a.prototype.parseString=function(e){var t=this.data,n=this.offset+this.relativeOffset,r="";this.relativeOffset+=e;for(var a=0;a<e;a++)r+=String.fromCharCode(t.getUint8(n+a));return r},a.prototype.parseTag=function(){return this.parseString(4)},a.prototype.parseLongDateTime=function(){var e=n.getULong(this.data,this.offset+this.relativeOffset+4);return e-=2082844800,this.relativeOffset+=8,e},a.prototype.parseVersion=function(){var e=r(this.data,this.offset+this.relativeOffset),t=r(this.data,this.offset+this.relativeOffset+2);return this.relativeOffset+=4,e+t/4096/10},a.prototype.skip=function(e,t){void 0===t&&(t=1),this.relativeOffset+=i[e]*t},a.prototype.parseOffset16List=a.prototype.parseUShortList=function(e){void 0===e&&(e=this.parseUShort());for(var t=new Array(e),n=this.data,r=this.offset+this.relativeOffset,a=0;a<e;a++)t[a]=n.getUint16(r),r+=2;return this.relativeOffset+=2*e,t},a.prototype.parseList=function(e,t){t||(t=e,e=this.parseUShort());for(var n=new Array(e),r=0;r<e;r++)n[r]=t.call(this);return n},a.prototype.parseRecordList=function(e,t){t||(t=e,e=this.parseUShort());for(var n=new Array(e),r=Object.keys(t),a=0;a<e;a++){for(var s={},i=0;i<r.length;i++){var o=r[i],l=t[o];s[o]=l.call(this)}n[a]=s}return n},a.prototype.parseStruct=function(e){if("function"==typeof e)return e.call(this);for(var t=Object.keys(e),n={},r=0;r<t.length;r++){var a=t[r],s=e[a];n[a]=s.call(this)}return n},a.prototype.parsePointer=function(e){var t=this.parseOffset16();if(t>0)return new a(this.data,this.offset+t).parseStruct(e)},a.prototype.parseListOfLists=function(e){for(var t=this.parseOffset16List(),n=t.length,r=this.relativeOffset,a=new Array(n),s=0;s<n;s++){var i=t[s];if(0!==i)if(this.relativeOffset=i,e){for(var o=this.parseOffset16List(),l=new Array(o.length),u=0;u<o.length;u++)this.relativeOffset=i+o[u],l[u]=e.call(this);a[s]=l}else a[s]=this.parseUShortList();else a[s]=void 0}return this.relativeOffset=r,a},a.prototype.parseCoverage=function(){var e=this.offset+this.relativeOffset,t=this.parseUShort(),n=this.parseUShort();if(1===t)return{format:1,glyphs:this.parseUShortList(n)};if(2===t){for(var r=new Array(n),a=0;a<n;a++)r[a]={start:this.parseUShort(),end:this.parseUShort(),index:this.parseUShort()};return{format:2,ranges:r}}s.assert(!1,"0x"+e.toString(16)+": Coverage format must be 1 or 2.")},a.prototype.parseClassDef=function(){var e=this.offset+this.relativeOffset,t=this.parseUShort();return 1===t?{format:1,startGlyph:this.parseUShort(),classes:this.parseUShortList()}:2===t?{format:2,ranges:this.parseRecordList({start:a.uShort,end:a.uShort,classId:a.uShort})}:void s.assert(!1,"0x"+e.toString(16)+": ClassDef format must be 1 or 2.")},a.list=function(e,t){return function(){return this.parseList(e,t)}},a.recordList=function(e,t){return function(){return this.parseRecordList(e,t)}},a.pointer=function(e){return function(){return this.parsePointer(e)}},a.tag=a.prototype.parseTag,a.byte=a.prototype.parseByte,a.uShort=a.offset16=a.prototype.parseUShort,a.uShortList=a.prototype.parseUShortList,a.struct=a.prototype.parseStruct,a.coverage=a.prototype.parseCoverage,a.classDef=a.prototype.parseClassDef;var o={reserved:a.uShort,reqFeatureIndex:a.uShort,featureIndexes:a.uShortList};a.prototype.parseScriptList=function(){return this.parsePointer(a.recordList({tag:a.tag,script:a.pointer({defaultLangSys:a.pointer(o),langSysRecords:a.recordList({tag:a.tag,langSys:a.pointer(o)})})}))},a.prototype.parseFeatureList=function(){return this.parsePointer(a.recordList({tag:a.tag,feature:a.pointer({featureParams:a.offset16,lookupListIndexes:a.uShortList})}))},a.prototype.parseLookupList=function(e){return this.parsePointer(a.list(a.pointer(function(){var t=this.parseUShort();s.argument(1<=t&&t<=8,"GSUB lookup type "+t+" unknown.");var n=this.parseUShort(),r=16&n;return{lookupType:t,lookupFlag:n,subtables:this.parseList(a.pointer(e[t])),markFilteringSet:r?this.parseUShort():void 0}})))},n.Parser=a},{"./check":2}],11:[function(e,t,n){function r(){this.commands=[],this.fill="black",this.stroke=null,this.strokeWidth=1}r.prototype.moveTo=function(e,t){this.commands.push({type:"M",x:e,y:t})},r.prototype.lineTo=function(e,t){this.commands.push({type:"L",x:e,y:t})},r.prototype.curveTo=r.prototype.bezierCurveTo=function(e,t,n,r,a,s){this.commands.push({type:"C",x1:e,y1:t,x2:n,y2:r,x:a,y:s})},r.prototype.quadTo=r.prototype.quadraticCurveTo=function(e,t,n,r){this.commands.push({type:"Q",x1:e,y1:t,x:n,y:r})},r.prototype.close=r.prototype.closePath=function(){this.commands.push({type:"Z"})},r.prototype.extend=function(e){e.commands&&(e=e.commands),Array.prototype.push.apply(this.commands,e)},r.prototype.draw=function(e){e.beginPath();for(var t=0;t<this.commands.length;t+=1){var n=this.commands[t];"M"===n.type?e.moveTo(n.x,n.y):"L"===n.type?e.lineTo(n.x,n.y):"C"===n.type?e.bezierCurveTo(n.x1,n.y1,n.x2,n.y2,n.x,n.y):"Q"===n.type?e.quadraticCurveTo(n.x1,n.y1,n.x,n.y):"Z"===n.type&&e.closePath()}this.fill&&(e.fillStyle=this.fill,e.fill()),this.stroke&&(e.strokeStyle=this.stroke,e.lineWidth=this.strokeWidth,e.stroke())},r.prototype.toPathData=function(e){function t(t){return Math.round(t)===t?""+Math.round(t):t.toFixed(e)}function n(){for(var e="",n=0;n<arguments.length;n+=1){var r=arguments[n];r>=0&&n>0&&(e+=" "),e+=t(r)}return e}e=void 0!==e?e:2;for(var r="",a=0;a<this.commands.length;a+=1){var s=this.commands[a];"M"===s.type?r+="M"+n(s.x,s.y):"L"===s.type?r+="L"+n(s.x,s.y):"C"===s.type?r+="C"+n(s.x1,s.y1,s.x2,s.y2,s.x,s.y):"Q"===s.type?r+="Q"+n(s.x1,s.y1,s.x,s.y):"Z"===s.type&&(r+="Z")}return r},r.prototype.toSVG=function(e){var t='<path d="';return t+=this.toPathData(e),t+='"',this.fill&&"black"!==this.fill&&(t+=null===this.fill?' fill="none"':' fill="'+this.fill+'"'),this.stroke&&(t+=' stroke="'+this.stroke+'" stroke-width="'+this.strokeWidth+'"'),t+="/>"},n.Path=r},{}],12:[function(e,t,n){function r(e,t){var n=e.length;if(n!==t.length)return!1;for(var r=0;r<n;r++)if(e[r]!==t[r])return!1;return!0}function a(e,t,n){for(var r=e.subtables,a=0;a<r.length;a++){var s=r[a];if(s.substFormat===t)return s}if(n)return r.push(n),n}var s=e("./check"),i=e("./layout"),o=function(e){this.font=e};o.prototype=i,o.prototype.getGsubTable=function(e){var t=this.font.tables.gsub;return!t&&e&&(this.font.tables.gsub=t={version:1,scripts:[{tag:"DFLT",script:{defaultLangSys:{reserved:0,reqFeatureIndex:65535,featureIndexes:[]},langSysRecords:[]}}],features:[],lookups:[]}),t},o.prototype.getSingle=function(e,t,n){var r=[],a=this.getLookupTable(t,n,e,1);if(!a)return r;for(var s=a.subtables,i=0;i<s.length;i++){var o,l=s[i],u=this.expandCoverage(l.coverage);if(1===l.substFormat){var c=l.deltaGlyphId;for(o=0;o<u.length;o++){var h=u[o];r.push({sub:h,by:h+c})}}else{var f=l.substitute;for(o=0;o<u.length;o++)r.push({sub:u[o],by:f[o]})}}return r},o.prototype.getAlternates=function(e,t,n){var r=[],a=this.getLookupTable(t,n,e,3);if(!a)return r;for(var s=a.subtables,i=0;i<s.length;i++)for(var o=s[i],l=this.expandCoverage(o.coverage),u=o.alternateSets,c=0;c<l.length;c++)r.push({sub:l[c],by:u[c]});return r},o.prototype.getLigatures=function(e,t,n){var r=[],a=this.getLookupTable(t,n,e,4);if(!a)return[];for(var s=a.subtables,i=0;i<s.length;i++)for(var o=s[i],l=this.expandCoverage(o.coverage),u=o.ligatureSets,c=0;c<l.length;c++)for(var h=l[c],f=u[c],p=0;p<f.length;p++){var d=f[p];r.push({sub:[h].concat(d.components),by:d.ligGlyph})}return r},o.prototype.addSingle=function(e,t,n,r){var i=this.getLookupTable(n,r,e,1,!0),o=a(i,2,{substFormat:2,coverage:{format:1,glyphs:[]},substitute:[]});s.assert(1===o.coverage.format,"Ligature: unable to modify coverage table format "+o.coverage.format);var l=t.sub,u=this.binSearch(o.coverage.glyphs,l);u<0&&(u=-1-u,o.coverage.glyphs.splice(u,0,l),o.substitute.splice(u,0,0)),o.substitute[u]=t.by},o.prototype.addAlternate=function(e,t,n,r){var i=this.getLookupTable(n,r,e,3,!0),o=a(i,1,{substFormat:1,coverage:{format:1,glyphs:[]},alternateSets:[]});s.assert(1===o.coverage.format,"Ligature: unable to modify coverage table format "+o.coverage.format);var l=t.sub,u=this.binSearch(o.coverage.glyphs,l);u<0&&(u=-1-u,o.coverage.glyphs.splice(u,0,l),o.alternateSets.splice(u,0,0)),o.alternateSets[u]=t.by},o.prototype.addLigature=function(e,t,n,a){n=n||"DFLT",a=a||"DFLT";var i=this.getLookupTable(n,a,e,4,!0),o=i.subtables[0];o||(o={substFormat:1,coverage:{format:1,glyphs:[]},ligatureSets:[]},i.subtables[0]=o),s.assert(1===o.coverage.format,"Ligature: unable to modify coverage table format "+o.coverage.format);var l=t.sub[0],u=t.sub.slice(1),c={ligGlyph:t.by,components:u},h=this.binSearch(o.coverage.glyphs,l);if(h>=0){for(var f=o.ligatureSets[h],p=0;p<f.length;p++)if(r(f[p].components,u))return;f.push(c)}else h=-1-h,o.coverage.glyphs.splice(h,0,l),o.ligatureSets.splice(h,0,[c])},o.prototype.getFeature=function(e,t,n){if(t=t||"DFLT",n=n||"DFLT",/ss\d\d/.test(e))return this.getSingle(e,t,n);switch(e){case"aalt":case"salt":return this.getSingle(e,t,n).concat(this.getAlternates(e,t,n));case"dlig":case"liga":case"rlig":return this.getLigatures(e,t,n)}},o.prototype.add=function(e,t,n,r){if(n=n||"DFLT",r=r||"DFLT",/ss\d\d/.test(e))return this.addSingle(e,t,n,r);switch(e){case"aalt":case"salt":return"number"==typeof t.by?this.addSingle(e,t,n,r):this.addAlternate(e,t,n,r);case"dlig":case"liga":case"rlig":return this.addLigature(e,t,n,r)}},t.exports=o},{"./check":2,"./layout":8}],13:[function(e,t,n){function r(e,t,n){var r;for(r=0;r<t.length;r+=1){var a=t[r];this[a.name]=a.value}if(this.tableName=e,this.fields=t,n){var s=Object.keys(n);for(r=0;r<s.length;r+=1){var i=s[r],o=n[i];void 0!==this[i]&&(this[i]=o)}}}function a(e,t,n){void 0===n&&(n=t.length);var r=new Array(t.length+1);r[0]={name:e+"Count",type:"USHORT",value:n};for(var a=0;a<t.length;a++)r[a+1]={name:e+a,type:"USHORT",value:t[a]};return r}function s(e,t,n){var r=t.length,a=new Array(r+1);a[0]={name:e+"Count",type:"USHORT",value:r};for(var s=0;s<r;s++)a[s+1]={name:e+s,type:"TABLE",value:n(t[s],s)};return a}function i(e,t,n){var r=t.length,a=[];a[0]={name:e+"Count",type:"USHORT",value:r};for(var s=0;s<r;s++)a=a.concat(n(t[s],s));return a}function o(e){1===e.format?r.call(this,"coverageTable",[{name:"coverageFormat",type:"USHORT",value:1}].concat(a("glyph",e.glyphs))):h.assert(!1,"Can't create coverage table format 2 yet.")}function l(e){r.call(this,"scriptListTable",i("scriptRecord",e,function(e,t){var n=e.script,s=n.defaultLangSys;return h.assert(!!s,"Unable to write GSUB: script "+e.tag+" has no default language system."),[{name:"scriptTag"+t,type:"TAG",value:e.tag},{name:"script"+t,type:"TABLE",value:new r("scriptTable",[{name:"defaultLangSys",type:"TABLE",value:new r("defaultLangSys",[{name:"lookupOrder",type:"USHORT",value:0},{name:"reqFeatureIndex",type:"USHORT",value:s.reqFeatureIndex}].concat(a("featureIndex",s.featureIndexes)))}].concat(i("langSys",n.langSysRecords,function(e,t){var n=e.langSys;return[{name:"langSysTag"+t,type:"TAG",value:e.tag},{name:"langSys"+t,type:"TABLE",value:new r("langSys",[{name:"lookupOrder",type:"USHORT",value:0},{name:"reqFeatureIndex",type:"USHORT",value:n.reqFeatureIndex}].concat(a("featureIndex",n.featureIndexes)))}]})))}]}))}function u(e){r.call(this,"featureListTable",i("featureRecord",e,function(e,t){var n=e.feature;return[{name:"featureTag"+t,type:"TAG",value:e.tag},{name:"feature"+t,type:"TABLE",value:new r("featureTable",[{name:"featureParams",type:"USHORT",value:n.featureParams}].concat(a("lookupListIndex",n.lookupListIndexes)))}]}))}function c(e,t){r.call(this,"lookupListTable",s("lookup",e,function(e){var n=t[e.lookupType];return h.assert(!!n,"Unable to write GSUB lookup type "+e.lookupType+" tables."),new r("lookupTable",[{name:"lookupType",type:"USHORT",value:e.lookupType},{name:"lookupFlag",type:"USHORT",value:e.lookupFlag}].concat(s("subtable",e.subtables,n)))}))}var h=e("./check"),f=e("./types").encode,p=e("./types").sizeOf;r.prototype.encode=function(){return f.TABLE(this)},r.prototype.sizeOf=function(){return p.TABLE(this)},o.prototype=Object.create(r.prototype),o.prototype.constructor=o,l.prototype=Object.create(r.prototype),l.prototype.constructor=l,u.prototype=Object.create(r.prototype),u.prototype.constructor=u,c.prototype=Object.create(r.prototype),c.prototype.constructor=c,n.Record=n.Table=r,n.Coverage=o,n.ScriptList=l,n.FeatureList=u,n.LookupList=c,n.ushortList=a,n.tableList=s,n.recordList=i},{"./check":2,"./types":32}],14:[function(e,t,n){function r(e,t){if(e===t)return!0;if(Array.isArray(e)&&Array.isArray(t)){if(e.length!==t.length)return!1;for(var n=0;n<e.length;n+=1)if(!r(e[n],t[n]))return!1;return!0}return!1}function a(e,t,n){var r,a,s,i=[],o=[],l=A.getCard16(e,t);if(0!==l){var u=A.getByte(e,t+2);a=t+(l+1)*u+2;var c=t+3;for(r=0;r<l+1;r+=1)i.push(A.getOffset(e,c,u)),c+=u;s=a+i[l]}else s=t+2;for(r=0;r<i.length-1;r+=1){var h=A.getBytes(e,a+i[r],a+i[r+1]);n&&(h=n(h)),o.push(h)}return{objects:o,startOffset:t,endOffset:s}}function s(e){for(var t="",n=15,r=["0","1","2","3","4","5","6","7","8","9",".","E","E-",null,"-"];;){var a=e.parseByte(),s=a>>4,i=15&a;if(s===n)break;if(t+=r[s],i===n)break;t+=r[i]}return parseFloat(t)}function i(e,t){var n,r,a,i;if(28===t)return n=e.parseByte(),r=e.parseByte(),n<<8|r;if(29===t)return n=e.parseByte(),r=e.parseByte(),a=e.parseByte(),i=e.parseByte(),n<<24|r<<16|a<<8|i;if(30===t)return s(e);if(t>=32&&t<=246)return t-139;if(t>=247&&t<=250)return n=e.parseByte(),256*(t-247)+n+108;if(t>=251&&t<=254)return n=e.parseByte(),256*-(t-251)-n-108;throw new Error("Invalid b0 "+t)}function o(e){for(var t={},n=0;n<e.length;n+=1){var r,a=e[n][0],s=e[n][1];if(r=1===s.length?s[0]:s,t.hasOwnProperty(a))throw new Error("Object "+t+" already has key "+a);t[a]=r}return t}function l(e,t,n){t=void 0!==t?t:0;var r=new A.Parser(e,t),a=[],s=[];for(n=void 0!==n?n:e.length;r.relativeOffset<n;){var l=r.parseByte();l<=21?(12===l&&(l=1200+r.parseByte()),a.push([l,s]),s=[]):s.push(i(r,l))}return o(a)}function u(e,t){return t=t<=390?U.cffStandardStrings[t]:e[t-391]}function c(e,t,n){for(var r={},a=0;a<t.length;a+=1){var s=t[a],i=e[s.op];void 0===i&&(i=void 0!==s.value?s.value:null),"SID"===s.type&&(i=u(n,i)),r[s.name]=i}return r}function h(e,t){var n={};return n.formatMajor=A.getCard8(e,t),n.formatMinor=A.getCard8(e,t+1),n.size=A.getCard8(e,t+2),n.offsetSize=A.getCard8(e,t+3),n.startOffset=t,n.endOffset=t+4,n}function f(e,t){var n=l(e,0,e.byteLength);return c(n,R,t)}function p(e,t,n,r){var a=l(e,t,n);return c(a,P,r)}function d(e,t,n,r){var a,s,i,o=new A.Parser(e,t);n-=1;var l=[".notdef"],c=o.parseCard8();if(0===c)for(a=0;a<n;a+=1)s=o.parseSID(),l.push(u(r,s));else if(1===c)for(;l.length<=n;)for(s=o.parseSID(),i=o.parseCard8(),a=0;a<=i;a+=1)l.push(u(r,s)),s+=1;else{if(2!==c)throw new Error("Unknown charset format "+c);for(;l.length<=n;)for(s=o.parseSID(),i=o.parseCard16(),a=0;a<=i;a+=1)l.push(u(r,s)),s+=1}return l}function m(e,t,n){var r,a,s={},i=new A.Parser(e,t),o=i.parseCard8();if(0===o){var l=i.parseCard8();for(r=0;r<l;r+=1)a=i.parseCard8(),s[a]=r}else{if(1!==o)throw new Error("Unknown encoding format "+o);var u=i.parseCard8();for(a=1,r=0;r<u;r+=1)for(var c=i.parseCard8(),h=i.parseCard8(),f=c;f<=c+h;f+=1)s[f]=a,a+=1}return new U.CffEncoding(s,n)}function g(e,t,n){function r(e,t){m&&c.closePath(),c.moveTo(e,t),m=!0}function a(){var t;t=h.length%2!==0,t&&!p&&(d=h.shift()+e.nominalWidthX),f+=h.length>>1,h.length=0,p=!0}function s(n){for(var v,b,S,_,C,x,T,w,O,N,D,L,F=0;F<n.length;){var E=n[F];switch(F+=1,E){case 1:a();break;case 3:a();break;case 4:h.length>1&&!p&&(d=h.shift()+e.nominalWidthX,p=!0),y+=h.pop(),r(g,y);break;case 5:for(;h.length>0;)g+=h.shift(),y+=h.shift(),c.lineTo(g,y);break;case 6:for(;h.length>0&&(g+=h.shift(),c.lineTo(g,y),0!==h.length);)y+=h.shift(),c.lineTo(g,y);break;case 7:for(;h.length>0&&(y+=h.shift(),c.lineTo(g,y),0!==h.length);)g+=h.shift(),c.lineTo(g,y);break;case 8:for(;h.length>0;)i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u+h.shift(),c.curveTo(i,o,l,u,g,y);break;case 10:C=h.pop()+e.subrsBias,x=e.subrs[C],x&&s(x);break;case 11:return;case 12:switch(E=n[F],F+=1,E){case 35:i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),T=l+h.shift(),w=u+h.shift(),O=T+h.shift(),N=w+h.shift(),D=O+h.shift(),L=N+h.shift(),g=D+h.shift(),y=L+h.shift(),h.shift(),c.curveTo(i,o,l,u,T,w),c.curveTo(O,N,D,L,g,y);break;case 34:i=g+h.shift(),o=y,l=i+h.shift(),u=o+h.shift(),T=l+h.shift(),w=u,O=T+h.shift(),N=u,D=O+h.shift(),L=y,g=D+h.shift(),c.curveTo(i,o,l,u,T,w),c.curveTo(O,N,D,L,g,y);break;case 36:i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),T=l+h.shift(),w=u,O=T+h.shift(),N=u,D=O+h.shift(),L=N+h.shift(),g=D+h.shift(),c.curveTo(i,o,l,u,T,w),c.curveTo(O,N,D,L,g,y);break;case 37:i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),T=l+h.shift(),w=u+h.shift(),O=T+h.shift(),N=w+h.shift(),D=O+h.shift(),L=N+h.shift(),Math.abs(D-g)>Math.abs(L-y)?g=D+h.shift():y=L+h.shift(),c.curveTo(i,o,l,u,T,w),c.curveTo(O,N,D,L,g,y);break;default:console.log("Glyph "+t.index+": unknown operator 1200"+E),h.length=0}break;case 14:h.length>0&&!p&&(d=h.shift()+e.nominalWidthX,p=!0),m&&(c.closePath(),m=!1);break;case 18:a();break;case 19:case 20:a(),F+=f+7>>3;break;case 21:h.length>2&&!p&&(d=h.shift()+e.nominalWidthX,p=!0),y+=h.pop(),g+=h.pop(),r(g,y);break;case 22:h.length>1&&!p&&(d=h.shift()+e.nominalWidthX,p=!0),g+=h.pop(),r(g,y);break;case 23:a();break;case 24:for(;h.length>2;)i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u+h.shift(),c.curveTo(i,o,l,u,g,y);g+=h.shift(),y+=h.shift(),c.lineTo(g,y);break;case 25:for(;h.length>6;)g+=h.shift(),y+=h.shift(),c.lineTo(g,y);i=g+h.shift(),o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u+h.shift(),c.curveTo(i,o,l,u,g,y);break;case 26:for(h.length%2&&(g+=h.shift());h.length>0;)i=g,o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l,y=u+h.shift(),c.curveTo(i,o,l,u,g,y);break;case 27:for(h.length%2&&(y+=h.shift());h.length>0;)i=g+h.shift(),o=y,l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u,c.curveTo(i,o,l,u,g,y);break;case 28:v=n[F],b=n[F+1],h.push((v<<24|b<<16)>>16),F+=2;break;case 29:C=h.pop()+e.gsubrsBias,x=e.gsubrs[C],x&&s(x);break;case 30:for(;h.length>0&&(i=g,o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u+(1===h.length?h.shift():0),c.curveTo(i,o,l,u,g,y),0!==h.length);)i=g+h.shift(),o=y,l=i+h.shift(),u=o+h.shift(),y=u+h.shift(),g=l+(1===h.length?h.shift():0),c.curveTo(i,o,l,u,g,y);break;case 31:for(;h.length>0&&(i=g+h.shift(),o=y,l=i+h.shift(),u=o+h.shift(),y=u+h.shift(),g=l+(1===h.length?h.shift():0),c.curveTo(i,o,l,u,g,y),0!==h.length);)i=g,o=y+h.shift(),l=i+h.shift(),u=o+h.shift(),g=l+h.shift(),y=u+(1===h.length?h.shift():0),c.curveTo(i,o,l,u,g,y);break;default:E<32?console.log("Glyph "+t.index+": unknown operator "+E):E<247?h.push(E-139):E<251?(v=n[F],F+=1,h.push(256*(E-247)+v+108)):E<255?(v=n[F],F+=1,h.push(256*-(E-251)-v-108)):(v=n[F],b=n[F+1],S=n[F+2],_=n[F+3],F+=4,h.push((v<<24|b<<16|S<<8|_)/65536))}}}var i,o,l,u,c=new B.Path,h=[],f=0,p=!1,d=e.defaultWidthX,m=!1,g=0,y=0;return s(n),t.advanceWidth=d,c}function y(e){var t;return t=e.length<1240?107:e.length<33900?1131:32768}function v(e,t,n){n.tables.cff={};var r=h(e,t),s=a(e,r.endOffset,A.bytesToString),i=a(e,s.endOffset),o=a(e,i.endOffset,A.bytesToString),l=a(e,o.endOffset);n.gsubrs=l.objects,n.gsubrsBias=y(n.gsubrs);var u=new DataView(new Uint8Array(i.objects[0]).buffer),c=f(u,o.objects);n.tables.cff.topDict=c;var v=t+c.private[1],b=p(e,v,c.private[0],o.objects);if(n.defaultWidthX=b.defaultWidthX,n.nominalWidthX=b.nominalWidthX,0!==b.subrs){var S=v+b.subrs,_=a(e,S);n.subrs=_.objects,n.subrsBias=y(n.subrs)}else n.subrs=[],n.subrsBias=0;var C=a(e,t+c.charStrings);n.nGlyphs=C.objects.length;var x=d(e,t+c.charset,n.nGlyphs,o.objects);0===c.encoding?n.cffEncoding=new U.CffEncoding(U.cffStandardEncoding,x):1===c.encoding?n.cffEncoding=new U.CffEncoding(U.cffExpertEncoding,x):n.cffEncoding=m(e,t+c.encoding,x),n.encoding=n.encoding||n.cffEncoding,n.glyphs=new k.GlyphSet(n);for(var T=0;T<n.nGlyphs;T+=1){var w=C.objects[T];n.glyphs.push(T,k.cffGlyphLoader(n,T,g,w))}}function b(e,t){var n,r=U.cffStandardStrings.indexOf(e);return r>=0&&(n=r),r=t.indexOf(e),r>=0?n=r+U.cffStandardStrings.length:(n=U.cffStandardStrings.length+t.length,t.push(e)),n}function S(){return new I.Record("Header",[{name:"major",type:"Card8",value:1},{name:"minor",type:"Card8",value:0},{name:"hdrSize",type:"Card8",value:4},{name:"major",type:"Card8",value:1}])}function _(e){var t=new I.Record("Name INDEX",[{name:"names",type:"INDEX",value:[]}]);t.names=[];for(var n=0;n<e.length;n+=1)t.names.push({name:"name_"+n,type:"NAME",value:e[n]});return t}function C(e,t,n){for(var a={},s=0;s<e.length;s+=1){var i=e[s],o=t[i.name];void 0===o||r(o,i.value)||("SID"===i.type&&(o=b(o,n)),a[i.op]={name:i.name,type:i.type,value:o})}return a}function x(e,t){var n=new I.Record("Top DICT",[{name:"dict",type:"DICT",value:{}}]);return n.dict=C(R,e,t),n}function T(e){var t=new I.Record("Top DICT INDEX",[{name:"topDicts",type:"INDEX",value:[]}]);return t.topDicts=[{name:"topDict_0",type:"TABLE",value:e}],t}function w(e){var t=new I.Record("String INDEX",[{name:"strings",type:"INDEX",value:[]}]);t.strings=[];for(var n=0;n<e.length;n+=1)t.strings.push({name:"string_"+n,type:"STRING",value:e[n]});return t}function O(){return new I.Record("Global Subr INDEX",[{name:"subrs",type:"INDEX",value:[]}])}function N(e,t){for(var n=new I.Record("Charsets",[{name:"format",type:"Card8",value:0}]),r=0;r<e.length;r+=1){var a=e[r],s=b(a,t);n.fields.push({name:"glyph_"+r,type:"SID",value:s})}return n}function D(e){var t=[],n=e.path;t.push({name:"width",type:"NUMBER",value:e.advanceWidth});for(var r=0,a=0,s=0;s<n.commands.length;s+=1){var i,o,l=n.commands[s];if("Q"===l.type){var u=1/3,c=2/3;l={type:"C",x:l.x,y:l.y,x1:u*r+c*l.x1,y1:u*a+c*l.y1,x2:u*l.x+c*l.x1,y2:u*l.y+c*l.y1}}if("M"===l.type)i=Math.round(l.x-r),o=Math.round(l.y-a),t.push({name:"dx",type:"NUMBER",value:i}),t.push({name:"dy",type:"NUMBER",value:o}),t.push({name:"rmoveto",type:"OP",value:21}),r=Math.round(l.x),a=Math.round(l.y);else if("L"===l.type)i=Math.round(l.x-r),o=Math.round(l.y-a),t.push({name:"dx",type:"NUMBER",value:i}),t.push({name:"dy",type:"NUMBER",value:o}),t.push({name:"rlineto",type:"OP",value:5}),r=Math.round(l.x),a=Math.round(l.y);else if("C"===l.type){var h=Math.round(l.x1-r),f=Math.round(l.y1-a),p=Math.round(l.x2-l.x1),d=Math.round(l.y2-l.y1);i=Math.round(l.x-l.x2),o=Math.round(l.y-l.y2),t.push({name:"dx1",type:"NUMBER",value:h}),t.push({name:"dy1",type:"NUMBER",value:f}),t.push({name:"dx2",type:"NUMBER",value:p}),t.push({name:"dy2",type:"NUMBER",value:d}),t.push({name:"dx",type:"NUMBER",value:i}),t.push({name:"dy",type:"NUMBER",value:o}),t.push({name:"rrcurveto",type:"OP",value:8}),r=Math.round(l.x),a=Math.round(l.y)}}return t.push({name:"endchar",type:"OP",value:14}),t}function L(e){for(var t=new I.Record("CharStrings INDEX",[{name:"charStrings",type:"INDEX",value:[]}]),n=0;n<e.length;n+=1){var r=e.get(n),a=D(r);t.charStrings.push({name:r.name,type:"CHARSTRING",value:a})}return t}function F(e,t){var n=new I.Record("Private DICT",[{name:"dict",type:"DICT",value:{}}]);return n.dict=C(P,e,t),n}function E(e,t){for(var n,r=new I.Table("CFF ",[{name:"header",type:"RECORD"},{name:"nameIndex",type:"RECORD"},{name:"topDictIndex",type:"RECORD"},{name:"stringIndex",type:"RECORD"},{name:"globalSubrIndex",type:"RECORD"},{name:"charsets",type:"RECORD"},{name:"charStringsIndex",type:"RECORD"},{name:"privateDict",type:"RECORD"}]),a=1/t.unitsPerEm,s={version:t.version,fullName:t.fullName,familyName:t.familyName,weight:t.weightName,fontBBox:t.fontBBox||[0,0,0,0],fontMatrix:[a,0,0,a,0,0],charset:999,encoding:0,charStrings:999,private:[0,999]},i={},o=[],l=1;l<e.length;l+=1)n=e.get(l),o.push(n.name);var u=[];r.header=S(),r.nameIndex=_([t.postScriptName]);var c=x(s,u);r.topDictIndex=T(c),r.globalSubrIndex=O(),r.charsets=N(o,u),r.charStringsIndex=L(e),r.privateDict=F(i,u),r.stringIndex=w(u);var h=r.header.sizeOf()+r.nameIndex.sizeOf()+r.topDictIndex.sizeOf()+r.stringIndex.sizeOf()+r.globalSubrIndex.sizeOf();return s.charset=h,s.encoding=0,s.charStrings=s.charset+r.charsets.sizeOf(),s.private[1]=s.charStrings+r.charStringsIndex.sizeOf(),c=x(s,u),r.topDictIndex=T(c),r}var U=e("../encoding"),k=e("../glyphset"),A=e("../parse"),B=e("../path"),I=e("../table"),R=[{name:"version",op:0,type:"SID"},{name:"notice",op:1,type:"SID"},{name:"copyright",op:1200,type:"SID"},{name:"fullName",op:2,type:"SID"},{name:"familyName",op:3,type:"SID"},{name:"weight",op:4,type:"SID"},{name:"isFixedPitch",op:1201,type:"number",value:0},{name:"italicAngle",op:1202,type:"number",value:0},{name:"underlinePosition",op:1203,type:"number",value:-100},{name:"underlineThickness",op:1204,type:"number",value:50},{name:"paintType",op:1205,type:"number",value:0},{name:"charstringType",op:1206,type:"number",value:2},{name:"fontMatrix",op:1207,type:["real","real","real","real","real","real"],value:[.001,0,0,.001,0,0]},{name:"uniqueId",op:13,type:"number"},{name:"fontBBox",op:5,type:["number","number","number","number"],value:[0,0,0,0]},{name:"strokeWidth",op:1208,type:"number",value:0},{name:"xuid",op:14,type:[],value:null},{name:"charset",op:15,type:"offset",value:0},{name:"encoding",op:16,type:"offset",value:0},{name:"charStrings",op:17,type:"offset",value:0},{name:"private",op:18,type:["number","offset"],value:[0,0]}],P=[{name:"subrs",op:19,type:"offset",value:0},{name:"defaultWidthX",op:20,type:"number",value:0},{name:"nominalWidthX",op:21,type:"number",value:0}];n.parse=v,n.make=E},{"../encoding":4,"../glyphset":7,"../parse":10,"../path":11,"../table":13}],15:[function(e,t,n){function r(e,t){var n;t.parseUShort(),e.length=t.parseULong(),e.language=t.parseULong();var r;for(e.groupCount=r=t.parseULong(),e.glyphIndexMap={},n=0;n<r;n+=1)for(var a=t.parseULong(),s=t.parseULong(),i=t.parseULong(),o=a;o<=s;o+=1)e.glyphIndexMap[o]=i,i++}function a(e,t,n,r,a){var s;e.length=t.parseUShort(),e.language=t.parseUShort();var i;e.segCount=i=t.parseUShort()>>1,t.skip("uShort",3),e.glyphIndexMap={};var o=new c.Parser(n,r+a+14),l=new c.Parser(n,r+a+16+2*i),u=new c.Parser(n,r+a+16+4*i),h=new c.Parser(n,r+a+16+6*i),f=r+a+16+8*i;for(s=0;s<i-1;s+=1)for(var p,d=o.parseUShort(),m=l.parseUShort(),g=u.parseShort(),y=h.parseUShort(),v=m;v<=d;v+=1)0!==y?(f=h.offset+h.relativeOffset-2,f+=y,f+=2*(v-m),p=c.getUShort(n,f),0!==p&&(p=p+g&65535)):p=v+g&65535,e.glyphIndexMap[v]=p}function s(e,t){var n,s={};s.version=c.getUShort(e,t),u.argument(0===s.version,"cmap table version should be 0."),
-s.numTables=c.getUShort(e,t+2);var i=-1;for(n=s.numTables-1;n>=0;n-=1){var o=c.getUShort(e,t+4+8*n),l=c.getUShort(e,t+4+8*n+2);if(3===o&&(0===l||1===l||10===l)){i=c.getULong(e,t+4+8*n+4);break}}if(i===-1)return null;var h=new c.Parser(e,t+i);if(s.format=h.parseUShort(),12===s.format)r(s,h);else{if(4!==s.format)throw new Error("Only format 4 and 12 cmap tables are supported.");a(s,h,e,t,i)}return s}function i(e,t,n){e.segments.push({end:t,start:t,delta:-(t-n),offset:0})}function o(e){e.segments.push({end:65535,start:65535,delta:1,offset:0})}function l(e){var t,n=new h.Table("cmap",[{name:"version",type:"USHORT",value:0},{name:"numTables",type:"USHORT",value:1},{name:"platformID",type:"USHORT",value:3},{name:"encodingID",type:"USHORT",value:1},{name:"offset",type:"ULONG",value:12},{name:"format",type:"USHORT",value:4},{name:"length",type:"USHORT",value:0},{name:"language",type:"USHORT",value:0},{name:"segCountX2",type:"USHORT",value:0},{name:"searchRange",type:"USHORT",value:0},{name:"entrySelector",type:"USHORT",value:0},{name:"rangeShift",type:"USHORT",value:0}]);for(n.segments=[],t=0;t<e.length;t+=1){for(var r=e.get(t),a=0;a<r.unicodes.length;a+=1)i(n,r.unicodes[a],t);n.segments=n.segments.sort(function(e,t){return e.start-t.start})}o(n);var s;s=n.segments.length,n.segCountX2=2*s,n.searchRange=2*Math.pow(2,Math.floor(Math.log(s)/Math.log(2))),n.entrySelector=Math.log(n.searchRange/2)/Math.log(2),n.rangeShift=n.segCountX2-n.searchRange;var l=[],u=[],c=[],f=[],p=[];for(t=0;t<s;t+=1){var d=n.segments[t];l=l.concat({name:"end_"+t,type:"USHORT",value:d.end}),u=u.concat({name:"start_"+t,type:"USHORT",value:d.start}),c=c.concat({name:"idDelta_"+t,type:"SHORT",value:d.delta}),f=f.concat({name:"idRangeOffset_"+t,type:"USHORT",value:d.offset}),void 0!==d.glyphId&&(p=p.concat({name:"glyph_"+t,type:"USHORT",value:d.glyphId}))}return n.fields=n.fields.concat(l),n.fields.push({name:"reservedPad",type:"USHORT",value:0}),n.fields=n.fields.concat(u),n.fields=n.fields.concat(c),n.fields=n.fields.concat(f),n.fields=n.fields.concat(p),n.length=14+2*l.length+2+2*u.length+2*c.length+2*f.length+2*p.length,n}var u=e("../check"),c=e("../parse"),h=e("../table");n.parse=s,n.make=l},{"../check":2,"../parse":10,"../table":13}],16:[function(e,t,n){function r(e,t){var n=JSON.stringify(e),r=256;for(var a in t){var s=parseInt(a);if(s&&!(s<256)){if(JSON.stringify(t[a])===n)return s;r<=s&&(r=s+1)}}return t[r]=e,r}function a(e,t,n){var a=r(t.name,n);return[{name:"tag_"+e,type:"TAG",value:t.tag},{name:"minValue_"+e,type:"FIXED",value:t.minValue<<16},{name:"defaultValue_"+e,type:"FIXED",value:t.defaultValue<<16},{name:"maxValue_"+e,type:"FIXED",value:t.maxValue<<16},{name:"flags_"+e,type:"USHORT",value:0},{name:"nameID_"+e,type:"USHORT",value:a}]}function s(e,t,n){var r={},a=new h.Parser(e,t);return r.tag=a.parseTag(),r.minValue=a.parseFixed(),r.defaultValue=a.parseFixed(),r.maxValue=a.parseFixed(),a.skip("uShort",1),r.name=n[a.parseUShort()]||{},r}function i(e,t,n,a){for(var s=r(t.name,a),i=[{name:"nameID_"+e,type:"USHORT",value:s},{name:"flags_"+e,type:"USHORT",value:0}],o=0;o<n.length;++o){var l=n[o].tag;i.push({name:"axis_"+e+" "+l,type:"FIXED",value:t.coordinates[l]<<16})}return i}function o(e,t,n,r){var a={},s=new h.Parser(e,t);a.name=r[s.parseUShort()]||{},s.skip("uShort",1),a.coordinates={};for(var i=0;i<n.length;++i)a.coordinates[n[i].tag]=s.parseFixed();return a}function l(e,t){var n=new f.Table("fvar",[{name:"version",type:"ULONG",value:65536},{name:"offsetToData",type:"USHORT",value:0},{name:"countSizePairs",type:"USHORT",value:2},{name:"axisCount",type:"USHORT",value:e.axes.length},{name:"axisSize",type:"USHORT",value:20},{name:"instanceCount",type:"USHORT",value:e.instances.length},{name:"instanceSize",type:"USHORT",value:4+4*e.axes.length}]);n.offsetToData=n.sizeOf();for(var r=0;r<e.axes.length;r++)n.fields=n.fields.concat(a(r,e.axes[r],t));for(var s=0;s<e.instances.length;s++)n.fields=n.fields.concat(i(s,e.instances[s],e.axes,t));return n}function u(e,t,n){var r=new h.Parser(e,t),a=r.parseULong();c.argument(65536===a,"Unsupported fvar table version.");var i=r.parseOffset16();r.skip("uShort",1);for(var l=r.parseUShort(),u=r.parseUShort(),f=r.parseUShort(),p=r.parseUShort(),d=[],m=0;m<l;m++)d.push(s(e,t+i+m*u,n));for(var g=[],y=t+i+l*u,v=0;v<f;v++)g.push(o(e,y+v*p,d,n));return{axes:d,instances:g}}var c=e("../check"),h=e("../parse"),f=e("../table");n.make=l,n.parse=u},{"../check":2,"../parse":10,"../table":13}],17:[function(e,t,n){function r(e,t,n,r,a){var s;return(t&r)>0?(s=e.parseByte(),0===(t&a)&&(s=-s),s=n+s):s=(t&a)>0?n:n+e.parseShort(),s}function a(e,t,n){var a=new f.Parser(t,n);e.numberOfContours=a.parseShort(),e._xMin=a.parseShort(),e._yMin=a.parseShort(),e._xMax=a.parseShort(),e._yMax=a.parseShort();var s,i;if(e.numberOfContours>0){var o,l=e.endPointIndices=[];for(o=0;o<e.numberOfContours;o+=1)l.push(a.parseUShort());for(e.instructionLength=a.parseUShort(),e.instructions=[],o=0;o<e.instructionLength;o+=1)e.instructions.push(a.parseByte());var u=l[l.length-1]+1;for(s=[],o=0;o<u;o+=1)if(i=a.parseByte(),s.push(i),(8&i)>0)for(var h=a.parseByte(),p=0;p<h;p+=1)s.push(i),o+=1;if(c.argument(s.length===u,"Bad flags."),l.length>0){var d,m=[];if(u>0){for(o=0;o<u;o+=1)i=s[o],d={},d.onCurve=!!(1&i),d.lastPointOfContour=l.indexOf(o)>=0,m.push(d);var g=0;for(o=0;o<u;o+=1)i=s[o],d=m[o],d.x=r(a,i,g,2,16),g=d.x;var y=0;for(o=0;o<u;o+=1)i=s[o],d=m[o],d.y=r(a,i,y,4,32),y=d.y}e.points=m}else e.points=[]}else if(0===e.numberOfContours)e.points=[];else{e.isComposite=!0,e.points=[],e.components=[];for(var v=!0;v;){s=a.parseUShort();var b={glyphIndex:a.parseUShort(),xScale:1,scale01:0,scale10:0,yScale:1,dx:0,dy:0};(1&s)>0?(2&s)>0?(b.dx=a.parseShort(),b.dy=a.parseShort()):b.matchedPoints=[a.parseUShort(),a.parseUShort()]:(2&s)>0?(b.dx=a.parseChar(),b.dy=a.parseChar()):b.matchedPoints=[a.parseByte(),a.parseByte()],(8&s)>0?b.xScale=b.yScale=a.parseF2Dot14():(64&s)>0?(b.xScale=a.parseF2Dot14(),b.yScale=a.parseF2Dot14()):(128&s)>0&&(b.xScale=a.parseF2Dot14(),b.scale01=a.parseF2Dot14(),b.scale10=a.parseF2Dot14(),b.yScale=a.parseF2Dot14()),e.components.push(b),v=!!(32&s)}}}function s(e,t){for(var n=[],r=0;r<e.length;r+=1){var a=e[r],s={x:t.xScale*a.x+t.scale01*a.y+t.dx,y:t.scale10*a.x+t.yScale*a.y+t.dy,onCurve:a.onCurve,lastPointOfContour:a.lastPointOfContour};n.push(s)}return n}function i(e){for(var t=[],n=[],r=0;r<e.length;r+=1){var a=e[r];n.push(a),a.lastPointOfContour&&(t.push(n),n=[])}return c.argument(0===n.length,"There are still points left in the current contour."),t}function o(e){var t=new p.Path;if(!e)return t;for(var n=i(e),r=0;r<n.length;r+=1){var a,s,o=n[r],l=o[0],u=o[o.length-1];l.onCurve?(a=null,s=!0):(l=u.onCurve?u:{x:(l.x+u.x)/2,y:(l.y+u.y)/2},a=l,s=!1),t.moveTo(l.x,l.y);for(var c=s?1:0;c<o.length;c+=1){var h=o[c],f=0===c?l:o[c-1];if(f.onCurve&&h.onCurve)t.lineTo(h.x,h.y);else if(f.onCurve&&!h.onCurve)a=h;else if(f.onCurve||h.onCurve){if(f.onCurve||!h.onCurve)throw new Error("Invalid state.");t.quadraticCurveTo(a.x,a.y,h.x,h.y),a=null}else{var d={x:(f.x+h.x)/2,y:(f.y+h.y)/2};t.quadraticCurveTo(f.x,f.y,d.x,d.y),a=h}}l!==u&&(a?t.quadraticCurveTo(a.x,a.y,l.x,l.y):t.lineTo(l.x,l.y))}return t.closePath(),t}function l(e,t){if(t.isComposite)for(var n=0;n<t.components.length;n+=1){var r=t.components[n],a=e.get(r.glyphIndex);if(a.getPath(),a.points){var i;if(void 0===r.matchedPoints)i=s(a.points,r);else{if(r.matchedPoints[0]>t.points.length-1||r.matchedPoints[1]>a.points.length-1)throw Error("Matched points out of range in "+t.name);var l=t.points[r.matchedPoints[0]],u=a.points[r.matchedPoints[1]],c={xScale:r.xScale,scale01:r.scale01,scale10:r.scale10,yScale:r.yScale,dx:0,dy:0};u=s([u],c)[0],c.dx=l.x-u.x,c.dy=l.y-u.y,i=s(a.points,c)}t.points=t.points.concat(i)}}return o(t.points)}function u(e,t,n,r){var s,i=new h.GlyphSet(r);for(s=0;s<n.length-1;s+=1){var o=n[s],u=n[s+1];o!==u?i.push(s,h.ttfGlyphLoader(r,s,a,e,t+o,l)):i.push(s,h.glyphLoader(r,s))}return i}var c=e("../check"),h=e("../glyphset"),f=e("../parse"),p=e("../path");n.parse=u},{"../check":2,"../glyphset":7,"../parse":10,"../path":11}],18:[function(e,t,n){function r(e,t){for(var n=new c.Parser(e,t),r=n.parseUShort(),a=[],s=0;s<r;s++)a[n.parseTag()]={offset:n.parseUShort()};return a}function a(e,t){var n=new c.Parser(e,t),r=n.parseUShort(),a=n.parseUShort();if(1===r)return n.parseUShortList(a);if(2===r){for(var s=[];a--;)for(var i=n.parseUShort(),o=n.parseUShort(),l=n.parseUShort(),u=i;u<=o;u++)s[l++]=u;return s}}function s(e,t){var n=new c.Parser(e,t),r=n.parseUShort();if(1===r){var a=n.parseUShort(),s=n.parseUShort(),i=n.parseUShortList(s);return function(e){return i[e-a]||0}}if(2===r){for(var o=n.parseUShort(),l=[],u=[],h=[],f=0;f<o;f++)l[f]=n.parseUShort(),u[f]=n.parseUShort(),h[f]=n.parseUShort();return function(e){for(var t=0,n=l.length-1;t<n;){var r=t+n+1>>1;e<l[r]?n=r-1:t=r}return l[t]<=e&&e<=u[t]?h[t]||0:0}}}function i(e,t){var n,r,i=new c.Parser(e,t),o=i.parseUShort(),l=i.parseUShort(),u=a(e,t+l),h=i.parseUShort(),f=i.parseUShort();if(4===h&&0===f){var p={};if(1===o){for(var d=i.parseUShort(),m=[],g=i.parseOffset16List(d),y=0;y<d;y++){var v=g[y],b=p[v];if(!b){b={},i.relativeOffset=v;for(var S=i.parseUShort();S--;){var _=i.parseUShort();h&&(n=i.parseShort()),f&&(r=i.parseShort()),b[_]=n}}m[u[y]]=b}return function(e,t){var n=m[e];if(n)return n[t]}}if(2===o){for(var C=i.parseUShort(),x=i.parseUShort(),T=i.parseUShort(),w=i.parseUShort(),O=s(e,t+C),N=s(e,t+x),D=[],L=0;L<T;L++)for(var F=D[L]=[],E=0;E<w;E++)h&&(n=i.parseShort()),f&&(r=i.parseShort()),F[E]=n;var U={};for(L=0;L<u.length;L++)U[u[L]]=1;return function(e,t){if(U[e]){var n=O(e),r=N(t),a=D[n];return a?a[r]:void 0}}}}}function o(e,t){var n=new c.Parser(e,t),r=n.parseUShort(),a=n.parseUShort(),s=16&a,o=n.parseUShort(),l=n.parseOffset16List(o),u={lookupType:r,lookupFlag:a,markFilteringSet:s?n.parseUShort():-1};if(2===r){for(var h=[],f=0;f<o;f++)h.push(i(e,t+l[f]));u.getKerningValue=function(e,t){for(var n=h.length;n--;){var r=h[n](e,t);if(void 0!==r)return r}return 0}}return u}function l(e,t,n){var a=new c.Parser(e,t),s=a.parseFixed();u.argument(1===s,"Unsupported GPOS table version."),r(e,t+a.parseUShort()),r(e,t+a.parseUShort());var i=a.parseUShort();a.relativeOffset=i;for(var l=a.parseUShort(),h=a.parseOffset16List(l),f=t+i,p=0;p<l;p++){var d=o(e,f+h[p]);2!==d.lookupType||n.getGposKerningValue||(n.getGposKerningValue=d.getKerningValue)}}var u=e("../check"),c=e("../parse");n.parse=l},{"../check":2,"../parse":10}],19:[function(e,t,n){function r(e,t){t=t||0;var n=new i(e,t),r=n.parseVersion();return s.argument(1===r,"Unsupported GSUB table version."),{version:r,scripts:n.parseScriptList(),features:n.parseFeatureList(),lookups:n.parseLookupList(o)}}function a(e){return new l.Table("GSUB",[{name:"version",type:"ULONG",value:65536},{name:"scripts",type:"TABLE",value:new l.ScriptList(e.scripts)},{name:"features",type:"TABLE",value:new l.FeatureList(e.features)},{name:"lookups",type:"TABLE",value:new l.LookupList(e.lookups,c)}])}var s=e("../check"),i=e("../parse").Parser,o=new Array(9),l=e("../table");o[1]=function(){var e=this.offset+this.relativeOffset,t=this.parseUShort();return 1===t?{substFormat:1,coverage:this.parsePointer(i.coverage),deltaGlyphId:this.parseUShort()}:2===t?{substFormat:2,coverage:this.parsePointer(i.coverage),substitute:this.parseOffset16List()}:void s.assert(!1,"0x"+e.toString(16)+": lookup type 1 format must be 1 or 2.")},o[2]=function(){var e=this.parseUShort();return s.argument(1===e,"GSUB Multiple Substitution Subtable identifier-format must be 1"),{substFormat:e,coverage:this.parsePointer(i.coverage),sequences:this.parseListOfLists()}},o[3]=function(){var e=this.parseUShort();return s.argument(1===e,"GSUB Alternate Substitution Subtable identifier-format must be 1"),{substFormat:e,coverage:this.parsePointer(i.coverage),alternateSets:this.parseListOfLists()}},o[4]=function(){var e=this.parseUShort();return s.argument(1===e,"GSUB ligature table identifier-format must be 1"),{substFormat:e,coverage:this.parsePointer(i.coverage),ligatureSets:this.parseListOfLists(function(){return{ligGlyph:this.parseUShort(),components:this.parseUShortList(this.parseUShort()-1)}})}};var u={sequenceIndex:i.uShort,lookupListIndex:i.uShort};o[5]=function(){var e=this.offset+this.relativeOffset,t=this.parseUShort();if(1===t)return{substFormat:t,coverage:this.parsePointer(i.coverage),ruleSets:this.parseListOfLists(function(){var e=this.parseUShort(),t=this.parseUShort();return{input:this.parseUShortList(e-1),lookupRecords:this.parseRecordList(t,u)}})};if(2===t)return{substFormat:t,coverage:this.parsePointer(i.coverage),classDef:this.parsePointer(i.classDef),classSets:this.parseListOfLists(function(){var e=this.parseUShort(),t=this.parseUShort();return{classes:this.parseUShortList(e-1),lookupRecords:this.parseRecordList(t,u)}})};if(3===t){var n=this.parseUShort(),r=this.parseUShort();return{substFormat:t,coverages:this.parseList(n,i.pointer(i.coverage)),lookupRecords:this.parseRecordList(r,u)}}s.assert(!1,"0x"+e.toString(16)+": lookup type 5 format must be 1, 2 or 3.")},o[6]=function(){var e=this.offset+this.relativeOffset,t=this.parseUShort();return 1===t?{substFormat:1,coverage:this.parsePointer(i.coverage),chainRuleSets:this.parseListOfLists(function(){return{backtrack:this.parseUShortList(),input:this.parseUShortList(this.parseShort()-1),lookahead:this.parseUShortList(),lookupRecords:this.parseRecordList(u)}})}:2===t?{substFormat:2,coverage:this.parsePointer(i.coverage),backtrackClassDef:this.parsePointer(i.classDef),inputClassDef:this.parsePointer(i.classDef),lookaheadClassDef:this.parsePointer(i.classDef),chainClassSet:this.parseListOfLists(function(){return{backtrack:this.parseUShortList(),input:this.parseUShortList(this.parseShort()-1),lookahead:this.parseUShortList(),lookupRecords:this.parseRecordList(u)}})}:3===t?{substFormat:3,backtrackCoverage:this.parseList(i.pointer(i.coverage)),inputCoverage:this.parseList(i.pointer(i.coverage)),lookaheadCoverage:this.parseList(i.pointer(i.coverage)),lookupRecords:this.parseRecordList(u)}:void s.assert(!1,"0x"+e.toString(16)+": lookup type 6 format must be 1, 2 or 3.")},o[7]=function(){var e=this.parseUShort();s.argument(1===e,"GSUB Extension Substitution subtable identifier-format must be 1");var t=this.parseUShort(),n=new i(this.data,this.offset+this.parseULong());return{substFormat:1,lookupType:t,extension:o[t].call(n)}},o[8]=function(){var e=this.parseUShort();return s.argument(1===e,"GSUB Reverse Chaining Contextual Single Substitution Subtable identifier-format must be 1"),{substFormat:e,coverage:this.parsePointer(i.coverage),backtrackCoverage:this.parseList(i.pointer(i.coverage)),lookaheadCoverage:this.parseList(i.pointer(i.coverage)),substitutes:this.parseUShortList()}};var c=new Array(9);c[1]=function(e){return 1===e.substFormat?new l.Table("substitutionTable",[{name:"substFormat",type:"USHORT",value:1},{name:"coverage",type:"TABLE",value:new l.Coverage(e.coverage)},{name:"deltaGlyphID",type:"USHORT",value:e.deltaGlyphId}]):new l.Table("substitutionTable",[{name:"substFormat",type:"USHORT",value:2},{name:"coverage",type:"TABLE",value:new l.Coverage(e.coverage)}].concat(l.ushortList("substitute",e.substitute)))},c[3]=function(e){return s.assert(1===e.substFormat,"Lookup type 3 substFormat must be 1."),new l.Table("substitutionTable",[{name:"substFormat",type:"USHORT",value:1},{name:"coverage",type:"TABLE",value:new l.Coverage(e.coverage)}].concat(l.tableList("altSet",e.alternateSets,function(e){return new l.Table("alternateSetTable",l.ushortList("alternate",e))})))},c[4]=function(e){return s.assert(1===e.substFormat,"Lookup type 4 substFormat must be 1."),new l.Table("substitutionTable",[{name:"substFormat",type:"USHORT",value:1},{name:"coverage",type:"TABLE",value:new l.Coverage(e.coverage)}].concat(l.tableList("ligSet",e.ligatureSets,function(e){return new l.Table("ligatureSetTable",l.tableList("ligature",e,function(e){return new l.Table("ligatureTable",[{name:"ligGlyph",type:"USHORT",value:e.ligGlyph}].concat(l.ushortList("component",e.components,e.components.length+1)))}))})))},n.parse=r,n.make=a},{"../check":2,"../parse":10,"../table":13}],20:[function(e,t,n){function r(e,t){var n={},r=new i.Parser(e,t);return n.version=r.parseVersion(),n.fontRevision=Math.round(1e3*r.parseFixed())/1e3,n.checkSumAdjustment=r.parseULong(),n.magicNumber=r.parseULong(),s.argument(1594834165===n.magicNumber,"Font header has wrong magic number."),n.flags=r.parseUShort(),n.unitsPerEm=r.parseUShort(),n.created=r.parseLongDateTime(),n.modified=r.parseLongDateTime(),n.xMin=r.parseShort(),n.yMin=r.parseShort(),n.xMax=r.parseShort(),n.yMax=r.parseShort(),n.macStyle=r.parseUShort(),n.lowestRecPPEM=r.parseUShort(),n.fontDirectionHint=r.parseShort(),n.indexToLocFormat=r.parseShort(),n.glyphDataFormat=r.parseShort(),n}function a(e){var t=Math.round((new Date).getTime()/1e3)+2082844800,n=t;return e.createdTimestamp&&(n=e.createdTimestamp+2082844800),new o.Table("head",[{name:"version",type:"FIXED",value:65536},{name:"fontRevision",type:"FIXED",value:65536},{name:"checkSumAdjustment",type:"ULONG",value:0},{name:"magicNumber",type:"ULONG",value:1594834165},{name:"flags",type:"USHORT",value:0},{name:"unitsPerEm",type:"USHORT",value:1e3},{name:"created",type:"LONGDATETIME",value:n},{name:"modified",type:"LONGDATETIME",value:t},{name:"xMin",type:"SHORT",value:0},{name:"yMin",type:"SHORT",value:0},{name:"xMax",type:"SHORT",value:0},{name:"yMax",type:"SHORT",value:0},{name:"macStyle",type:"USHORT",value:0},{name:"lowestRecPPEM",type:"USHORT",value:0},{name:"fontDirectionHint",type:"SHORT",value:2},{name:"indexToLocFormat",type:"SHORT",value:0},{name:"glyphDataFormat",type:"SHORT",value:0}],e)}var s=e("../check"),i=e("../parse"),o=e("../table");n.parse=r,n.make=a},{"../check":2,"../parse":10,"../table":13}],21:[function(e,t,n){function r(e,t){var n={},r=new s.Parser(e,t);return n.version=r.parseVersion(),n.ascender=r.parseShort(),n.descender=r.parseShort(),n.lineGap=r.parseShort(),n.advanceWidthMax=r.parseUShort(),n.minLeftSideBearing=r.parseShort(),n.minRightSideBearing=r.parseShort(),n.xMaxExtent=r.parseShort(),n.caretSlopeRise=r.parseShort(),n.caretSlopeRun=r.parseShort(),n.caretOffset=r.parseShort(),r.relativeOffset+=8,n.metricDataFormat=r.parseShort(),n.numberOfHMetrics=r.parseUShort(),n}function a(e){return new i.Table("hhea",[{name:"version",type:"FIXED",value:65536},{name:"ascender",type:"FWORD",value:0},{name:"descender",type:"FWORD",value:0},{name:"lineGap",type:"FWORD",value:0},{name:"advanceWidthMax",type:"UFWORD",value:0},{name:"minLeftSideBearing",type:"FWORD",value:0},{name:"minRightSideBearing",type:"FWORD",value:0},{name:"xMaxExtent",type:"FWORD",value:0},{name:"caretSlopeRise",type:"SHORT",value:1},{name:"caretSlopeRun",type:"SHORT",value:0},{name:"caretOffset",type:"SHORT",value:0},{name:"reserved1",type:"SHORT",value:0},{name:"reserved2",type:"SHORT",value:0},{name:"reserved3",type:"SHORT",value:0},{name:"reserved4",type:"SHORT",value:0},{name:"metricDataFormat",type:"SHORT",value:0},{name:"numberOfHMetrics",type:"USHORT",value:0}],e)}var s=e("../parse"),i=e("../table");n.parse=r,n.make=a},{"../parse":10,"../table":13}],22:[function(e,t,n){function r(e,t,n,r,a){for(var i,o,l=new s.Parser(e,t),u=0;u<r;u+=1){u<n&&(i=l.parseUShort(),o=l.parseShort());var c=a.get(u);c.advanceWidth=i,c.leftSideBearing=o}}function a(e){for(var t=new i.Table("hmtx",[]),n=0;n<e.length;n+=1){var r=e.get(n),a=r.advanceWidth||0,s=r.leftSideBearing||0;t.fields.push({name:"advanceWidth_"+n,type:"USHORT",value:a}),t.fields.push({name:"leftSideBearing_"+n,type:"SHORT",value:s})}return t}var s=e("../parse"),i=e("../table");n.parse=r,n.make=a},{"../parse":10,"../table":13}],23:[function(e,t,n){function r(e,t){var n={},r=new s.Parser(e,t),i=r.parseUShort();a.argument(0===i,"Unsupported kern table version."),r.skip("uShort",1);var o=r.parseUShort();a.argument(0===o,"Unsupported kern sub-table version."),r.skip("uShort",2);var l=r.parseUShort();r.skip("uShort",3);for(var u=0;u<l;u+=1){var c=r.parseUShort(),h=r.parseUShort(),f=r.parseShort();n[c+","+h]=f}return n}var a=e("../check"),s=e("../parse");n.parse=r},{"../check":2,"../parse":10}],24:[function(e,t,n){function r(e,t,n,r){for(var s=new a.Parser(e,t),i=r?s.parseUShort:s.parseULong,o=[],l=0;l<n+1;l+=1){var u=i.call(s);r&&(u*=2),o.push(u)}return o}var a=e("../parse");n.parse=r},{"../parse":10}],25:[function(e,t,n){function r(e){for(var t=new o.Table("ltag",[{name:"version",type:"ULONG",value:1},{name:"flags",type:"ULONG",value:0},{name:"numTags",type:"ULONG",value:e.length}]),n="",r=12+4*e.length,a=0;a<e.length;++a){var s=n.indexOf(e[a]);s<0&&(s=n.length,n+=e[a]),t.fields.push({name:"offset "+a,type:"USHORT",value:r+s}),t.fields.push({name:"length "+a,type:"USHORT",value:e[a].length})}return t.fields.push({name:"stringPool",type:"CHARARRAY",value:n}),t}function a(e,t){var n=new i.Parser(e,t),r=n.parseULong();s.argument(1===r,"Unsupported ltag table version."),n.skip("uLong",1);for(var a=n.parseULong(),o=[],l=0;l<a;l++){for(var u="",c=t+n.parseUShort(),h=n.parseUShort(),f=c;f<c+h;++f)u+=String.fromCharCode(e.getInt8(f));o.push(u)}return o}var s=e("../check"),i=e("../parse"),o=e("../table");n.make=r,n.parse=a},{"../check":2,"../parse":10,"../table":13}],26:[function(e,t,n){function r(e,t){var n={},r=new s.Parser(e,t);return n.version=r.parseVersion(),n.numGlyphs=r.parseUShort(),1===n.version&&(n.maxPoints=r.parseUShort(),n.maxContours=r.parseUShort(),n.maxCompositePoints=r.parseUShort(),n.maxCompositeContours=r.parseUShort(),n.maxZones=r.parseUShort(),n.maxTwilightPoints=r.parseUShort(),n.maxStorage=r.parseUShort(),n.maxFunctionDefs=r.parseUShort(),n.maxInstructionDefs=r.parseUShort(),n.maxStackElements=r.parseUShort(),n.maxSizeOfInstructions=r.parseUShort(),n.maxComponentElements=r.parseUShort(),n.maxComponentDepth=r.parseUShort()),n}function a(e){return new i.Table("maxp",[{name:"version",type:"FIXED",value:20480},{name:"numGlyphs",type:"USHORT",value:e}])}var s=e("../parse"),i=e("../table");n.parse=r,n.make=a},{"../parse":10,"../table":13}],27:[function(e,t,n){function r(e,t){var n=new l.Parser(e,t),r=n.parseULong();o.argument(1===r,"Unsupported META table version."),n.parseULong(),n.parseULong();for(var a=n.parseULong(),s={},u=0;u<a;u++){var c=n.parseTag(),h=n.parseULong(),f=n.parseULong(),p=i.UTF8(e,t+h,f);s[c]=p}return s}function a(e){var t=Object.keys(e).length,n="",r=16+12*t,a=new u.Table("meta",[{name:"version",type:"ULONG",value:1},{name:"flags",type:"ULONG",value:0},{name:"offset",type:"ULONG",value:r},{name:"numTags",type:"ULONG",value:t}]);for(var s in e){var i=n.length;n+=e[s],a.fields.push({name:"tag "+s,type:"TAG",value:s}),a.fields.push({name:"offset "+s,type:"ULONG",value:r+i}),a.fields.push({name:"length "+s,type:"ULONG",value:e[s].length})}return a.fields.push({name:"stringPool",type:"CHARARRAY",value:n}),a}var s=e("../types"),i=s.decode,o=e("../check"),l=e("../parse"),u=e("../table");n.parse=r,n.make=a},{"../check":2,"../parse":10,"../table":13,"../types":32}],28:[function(e,t,n){function r(e,t,n){switch(e){case 0:if(65535===t)return"und";if(n)return n[t];break;case 1:return y[t];case 3:return b[t]}}function a(e,t,n){switch(e){case 0:return S;case 1:return C[n]||_[t];case 3:if(1===t||10===t)return S}}function s(e,t,n){for(var s={},i=new d.Parser(e,t),o=i.parseUShort(),l=i.parseUShort(),u=i.offset+i.parseUShort(),c=0;c<l;c++){var h=i.parseUShort(),p=i.parseUShort(),m=i.parseUShort(),y=i.parseUShort(),v=g[y]||y,b=i.parseUShort(),_=i.parseUShort(),C=r(h,m,n),x=a(h,p,m);if(void 0!==x&&void 0!==C){var T;if(T=x===S?f.UTF16(e,u+_,b):f.MACSTRING(e,u+_,b,x)){var w=s[v];void 0===w&&(w=s[v]={}),w[C]=T}}}var O=0;return 1===o&&(O=i.parseUShort()),s}function i(e){var t={};for(var n in e)t[e[n]]=parseInt(n);return t}function o(e,t,n,r,a,s){return new m.Record("NameRecord",[{name:"platformID",type:"USHORT",value:e},{name:"encodingID",type:"USHORT",value:t},{name:"languageID",type:"USHORT",value:n},{name:"nameID",type:"USHORT",value:r},{name:"length",type:"USHORT",value:a},{name:"offset",type:"USHORT",value:s}])}function l(e,t){var n=e.length,r=t.length-n+1;e:for(var a=0;a<r;a++)for(;a<r;a++){for(var s=0;s<n;s++)if(t[a+s]!==e[s])continue e;return a}return-1}function u(e,t){var n=l(e,t);if(n<0){n=t.length;for(var r=0,a=e.length;r<a;++r)t.push(e[r])}return n}function c(e,t){var n,r=[],s={},l=i(g);for(var c in e){var h=l[c];if(void 0===h&&(h=c),n=parseInt(h),isNaN(n))throw new Error('Name table entry "'+c+'" does not exist, see nameTableNames for complete list.');s[n]=e[c],r.push(n)}for(var f=i(y),d=i(b),S=[],_=[],C=0;C<r.length;C++){n=r[C];var x=s[n];for(var T in x){var w=x[T],O=1,N=f[T],D=v[N],L=a(O,D,N),F=p.MACSTRING(w,L);void 0===F&&(O=0,N=t.indexOf(T),N<0&&(N=t.length,t.push(T)),D=4,F=p.UTF16(w));var E=u(F,_);S.push(o(O,D,N,n,F.length,E));var U=d[T];if(void 0!==U){var k=p.UTF16(w),A=u(k,_);S.push(o(3,1,U,n,k.length,A))}}}S.sort(function(e,t){return e.platformID-t.platformID||e.encodingID-t.encodingID||e.languageID-t.languageID||e.nameID-t.nameID});for(var B=new m.Table("name",[{name:"format",type:"USHORT",value:0},{name:"count",type:"USHORT",value:S.length},{name:"stringOffset",type:"USHORT",value:6+12*S.length}]),I=0;I<S.length;I++)B.fields.push({name:"record_"+I,type:"RECORD",value:S[I]});return B.fields.push({name:"strings",type:"LITERAL",value:_}),B}var h=e("../types"),f=h.decode,p=h.encode,d=e("../parse"),m=e("../table"),g=["copyright","fontFamily","fontSubfamily","uniqueID","fullName","version","postScriptName","trademark","manufacturer","designer","description","manufacturerURL","designerURL","license","licenseURL","reserved","preferredFamily","preferredSubfamily","compatibleFullName","sampleText","postScriptFindFontName","wwsFamily","wwsSubfamily"],y={0:"en",1:"fr",2:"de",3:"it",4:"nl",5:"sv",6:"es",7:"da",8:"pt",9:"no",10:"he",11:"ja",12:"ar",13:"fi",14:"el",15:"is",16:"mt",17:"tr",18:"hr",19:"zh-Hant",20:"ur",21:"hi",22:"th",23:"ko",24:"lt",25:"pl",26:"hu",27:"es",28:"lv",29:"se",30:"fo",31:"fa",32:"ru",33:"zh",34:"nl-BE",35:"ga",36:"sq",37:"ro",38:"cz",39:"sk",40:"si",41:"yi",42:"sr",43:"mk",44:"bg",45:"uk",46:"be",47:"uz",48:"kk",49:"az-Cyrl",50:"az-Arab",51:"hy",52:"ka",53:"mo",54:"ky",55:"tg",56:"tk",57:"mn-CN",58:"mn",59:"ps",60:"ks",61:"ku",62:"sd",63:"bo",64:"ne",65:"sa",66:"mr",67:"bn",68:"as",69:"gu",70:"pa",71:"or",72:"ml",73:"kn",74:"ta",75:"te",76:"si",77:"my",78:"km",79:"lo",80:"vi",81:"id",82:"tl",83:"ms",84:"ms-Arab",85:"am",86:"ti",87:"om",88:"so",89:"sw",90:"rw",91:"rn",92:"ny",93:"mg",94:"eo",128:"cy",129:"eu",130:"ca",131:"la",132:"qu",133:"gn",134:"ay",135:"tt",136:"ug",137:"dz",138:"jv",139:"su",140:"gl",141:"af",142:"br",143:"iu",144:"gd",145:"gv",146:"ga",147:"to",148:"el-polyton",149:"kl",150:"az",151:"nn"},v={0:0,1:0,2:0,3:0,4:0,5:0,6:0,7:0,8:0,9:0,10:5,11:1,12:4,13:0,14:6,15:0,16:0,17:0,18:0,19:2,20:4,21:9,22:21,23:3,24:29,25:29,26:29,27:29,28:29,29:0,30:0,31:4,32:7,33:25,34:0,35:0,36:0,37:0,38:29,39:29,40:0,41:5,42:7,43:7,44:7,45:7,46:7,47:7,48:7,49:7,50:4,51:24,52:23,53:7,54:7,55:7,56:7,57:27,58:7,59:4,60:4,61:4,62:4,63:26,64:9,65:9,66:9,67:13,68:13,69:11,70:10,71:12,72:17,73:16,74:14,75:15,76:18,77:19,78:20,79:22,80:30,81:0,82:0,83:0,84:4,85:28,86:28,87:28,88:0,89:0,90:0,91:0,92:0,93:0,94:0,128:0,129:0,130:0,131:0,132:0,133:0,134:0,135:7,136:4,137:26,138:0,139:0,140:0,141:0,142:0,143:28,144:0,145:0,146:0,147:0,148:6,149:0,150:0,151:0},b={1078:"af",1052:"sq",1156:"gsw",1118:"am",5121:"ar-DZ",15361:"ar-BH",3073:"ar",2049:"ar-IQ",11265:"ar-JO",13313:"ar-KW",12289:"ar-LB",4097:"ar-LY",6145:"ary",8193:"ar-OM",16385:"ar-QA",1025:"ar-SA",10241:"ar-SY",7169:"aeb",14337:"ar-AE",9217:"ar-YE",1067:"hy",1101:"as",2092:"az-Cyrl",1068:"az",1133:"ba",1069:"eu",1059:"be",2117:"bn",1093:"bn-IN",8218:"bs-Cyrl",5146:"bs",1150:"br",1026:"bg",1027:"ca",3076:"zh-HK",5124:"zh-MO",2052:"zh",4100:"zh-SG",1028:"zh-TW",1155:"co",1050:"hr",4122:"hr-BA",1029:"cs",1030:"da",1164:"prs",1125:"dv",2067:"nl-BE",1043:"nl",3081:"en-AU",10249:"en-BZ",4105:"en-CA",9225:"en-029",16393:"en-IN",6153:"en-IE",8201:"en-JM",17417:"en-MY",5129:"en-NZ",13321:"en-PH",18441:"en-SG",7177:"en-ZA",11273:"en-TT",2057:"en-GB",1033:"en",12297:"en-ZW",1061:"et",1080:"fo",1124:"fil",1035:"fi",2060:"fr-BE",3084:"fr-CA",1036:"fr",5132:"fr-LU",6156:"fr-MC",4108:"fr-CH",1122:"fy",1110:"gl",1079:"ka",3079:"de-AT",1031:"de",5127:"de-LI",4103:"de-LU",2055:"de-CH",1032:"el",1135:"kl",1095:"gu",1128:"ha",1037:"he",1081:"hi",1038:"hu",1039:"is",1136:"ig",1057:"id",1117:"iu",2141:"iu-Latn",2108:"ga",1076:"xh",1077:"zu",1040:"it",2064:"it-CH",1041:"ja",1099:"kn",1087:"kk",1107:"km",1158:"quc",1159:"rw",1089:"sw",1111:"kok",1042:"ko",1088:"ky",1108:"lo",1062:"lv",1063:"lt",2094:"dsb",1134:"lb",1071:"mk",2110:"ms-BN",1086:"ms",1100:"ml",1082:"mt",1153:"mi",1146:"arn",1102:"mr",1148:"moh",1104:"mn",2128:"mn-CN",1121:"ne",1044:"nb",2068:"nn",1154:"oc",1096:"or",1123:"ps",1045:"pl",1046:"pt",2070:"pt-PT",1094:"pa",1131:"qu-BO",2155:"qu-EC",3179:"qu",1048:"ro",1047:"rm",1049:"ru",9275:"smn",4155:"smj-NO",5179:"smj",3131:"se-FI",1083:"se",2107:"se-SE",8251:"sms",6203:"sma-NO",7227:"sms",1103:"sa",7194:"sr-Cyrl-BA",3098:"sr",6170:"sr-Latn-BA",2074:"sr-Latn",1132:"nso",1074:"tn",1115:"si",1051:"sk",1060:"sl",11274:"es-AR",16394:"es-BO",13322:"es-CL",9226:"es-CO",5130:"es-CR",7178:"es-DO",12298:"es-EC",17418:"es-SV",4106:"es-GT",18442:"es-HN",2058:"es-MX",19466:"es-NI",6154:"es-PA",15370:"es-PY",10250:"es-PE",20490:"es-PR",3082:"es",1034:"es",21514:"es-US",14346:"es-UY",8202:"es-VE",2077:"sv-FI",1053:"sv",1114:"syr",1064:"tg",2143:"tzm",1097:"ta",1092:"tt",1098:"te",1054:"th",1105:"bo",1055:"tr",1090:"tk",1152:"ug",1058:"uk",1070:"hsb",1056:"ur",2115:"uz-Cyrl",1091:"uz",1066:"vi",1106:"cy",1160:"wo",1157:"sah",1144:"ii",1130:"yo"},S="utf-16",_={0:"macintosh",1:"x-mac-japanese",2:"x-mac-chinesetrad",3:"x-mac-korean",6:"x-mac-greek",7:"x-mac-cyrillic",9:"x-mac-devanagai",10:"x-mac-gurmukhi",11:"x-mac-gujarati",12:"x-mac-oriya",13:"x-mac-bengali",14:"x-mac-tamil",15:"x-mac-telugu",16:"x-mac-kannada",17:"x-mac-malayalam",18:"x-mac-sinhalese",19:"x-mac-burmese",20:"x-mac-khmer",21:"x-mac-thai",22:"x-mac-lao",23:"x-mac-georgian",24:"x-mac-armenian",25:"x-mac-chinesesimp",26:"x-mac-tibetan",27:"x-mac-mongolian",28:"x-mac-ethiopic",29:"x-mac-ce",30:"x-mac-vietnamese",31:"x-mac-extarabic"},C={15:"x-mac-icelandic",17:"x-mac-turkish",18:"x-mac-croatian",24:"x-mac-ce",25:"x-mac-ce",26:"x-mac-ce",27:"x-mac-ce",28:"x-mac-ce",30:"x-mac-icelandic",37:"x-mac-romanian",38:"x-mac-ce",39:"x-mac-ce",40:"x-mac-ce",143:"x-mac-inuit",146:"x-mac-gaelic"};n.parse=s,n.make=c},{"../parse":10,"../table":13,"../types":32}],29:[function(e,t,n){function r(e){for(var t=0;t<l.length;t+=1){var n=l[t];if(e>=n.begin&&e<n.end)return t}return-1}function a(e,t){var n={},r=new i.Parser(e,t);n.version=r.parseUShort(),n.xAvgCharWidth=r.parseShort(),n.usWeightClass=r.parseUShort(),n.usWidthClass=r.parseUShort(),n.fsType=r.parseUShort(),n.ySubscriptXSize=r.parseShort(),n.ySubscriptYSize=r.parseShort(),n.ySubscriptXOffset=r.parseShort(),n.ySubscriptYOffset=r.parseShort(),n.ySuperscriptXSize=r.parseShort(),n.ySuperscriptYSize=r.parseShort(),n.ySuperscriptXOffset=r.parseShort(),n.ySuperscriptYOffset=r.parseShort(),n.yStrikeoutSize=r.parseShort(),n.yStrikeoutPosition=r.parseShort(),n.sFamilyClass=r.parseShort(),n.panose=[];for(var a=0;a<10;a++)n.panose[a]=r.parseByte();return n.ulUnicodeRange1=r.parseULong(),n.ulUnicodeRange2=r.parseULong(),n.ulUnicodeRange3=r.parseULong(),n.ulUnicodeRange4=r.parseULong(),n.achVendID=String.fromCharCode(r.parseByte(),r.parseByte(),r.parseByte(),r.parseByte()),n.fsSelection=r.parseUShort(),n.usFirstCharIndex=r.parseUShort(),n.usLastCharIndex=r.parseUShort(),n.sTypoAscender=r.parseShort(),n.sTypoDescender=r.parseShort(),n.sTypoLineGap=r.parseShort(),n.usWinAscent=r.parseUShort(),n.usWinDescent=r.parseUShort(),n.version>=1&&(n.ulCodePageRange1=r.parseULong(),n.ulCodePageRange2=r.parseULong()),n.version>=2&&(n.sxHeight=r.parseShort(),
-n.sCapHeight=r.parseShort(),n.usDefaultChar=r.parseUShort(),n.usBreakChar=r.parseUShort(),n.usMaxContent=r.parseUShort()),n}function s(e){return new o.Table("OS/2",[{name:"version",type:"USHORT",value:3},{name:"xAvgCharWidth",type:"SHORT",value:0},{name:"usWeightClass",type:"USHORT",value:0},{name:"usWidthClass",type:"USHORT",value:0},{name:"fsType",type:"USHORT",value:0},{name:"ySubscriptXSize",type:"SHORT",value:650},{name:"ySubscriptYSize",type:"SHORT",value:699},{name:"ySubscriptXOffset",type:"SHORT",value:0},{name:"ySubscriptYOffset",type:"SHORT",value:140},{name:"ySuperscriptXSize",type:"SHORT",value:650},{name:"ySuperscriptYSize",type:"SHORT",value:699},{name:"ySuperscriptXOffset",type:"SHORT",value:0},{name:"ySuperscriptYOffset",type:"SHORT",value:479},{name:"yStrikeoutSize",type:"SHORT",value:49},{name:"yStrikeoutPosition",type:"SHORT",value:258},{name:"sFamilyClass",type:"SHORT",value:0},{name:"bFamilyType",type:"BYTE",value:0},{name:"bSerifStyle",type:"BYTE",value:0},{name:"bWeight",type:"BYTE",value:0},{name:"bProportion",type:"BYTE",value:0},{name:"bContrast",type:"BYTE",value:0},{name:"bStrokeVariation",type:"BYTE",value:0},{name:"bArmStyle",type:"BYTE",value:0},{name:"bLetterform",type:"BYTE",value:0},{name:"bMidline",type:"BYTE",value:0},{name:"bXHeight",type:"BYTE",value:0},{name:"ulUnicodeRange1",type:"ULONG",value:0},{name:"ulUnicodeRange2",type:"ULONG",value:0},{name:"ulUnicodeRange3",type:"ULONG",value:0},{name:"ulUnicodeRange4",type:"ULONG",value:0},{name:"achVendID",type:"CHARARRAY",value:"XXXX"},{name:"fsSelection",type:"USHORT",value:0},{name:"usFirstCharIndex",type:"USHORT",value:0},{name:"usLastCharIndex",type:"USHORT",value:0},{name:"sTypoAscender",type:"SHORT",value:0},{name:"sTypoDescender",type:"SHORT",value:0},{name:"sTypoLineGap",type:"SHORT",value:0},{name:"usWinAscent",type:"USHORT",value:0},{name:"usWinDescent",type:"USHORT",value:0},{name:"ulCodePageRange1",type:"ULONG",value:0},{name:"ulCodePageRange2",type:"ULONG",value:0},{name:"sxHeight",type:"SHORT",value:0},{name:"sCapHeight",type:"SHORT",value:0},{name:"usDefaultChar",type:"USHORT",value:0},{name:"usBreakChar",type:"USHORT",value:0},{name:"usMaxContext",type:"USHORT",value:0}],e)}var i=e("../parse"),o=e("../table"),l=[{begin:0,end:127},{begin:128,end:255},{begin:256,end:383},{begin:384,end:591},{begin:592,end:687},{begin:688,end:767},{begin:768,end:879},{begin:880,end:1023},{begin:11392,end:11519},{begin:1024,end:1279},{begin:1328,end:1423},{begin:1424,end:1535},{begin:42240,end:42559},{begin:1536,end:1791},{begin:1984,end:2047},{begin:2304,end:2431},{begin:2432,end:2559},{begin:2560,end:2687},{begin:2688,end:2815},{begin:2816,end:2943},{begin:2944,end:3071},{begin:3072,end:3199},{begin:3200,end:3327},{begin:3328,end:3455},{begin:3584,end:3711},{begin:3712,end:3839},{begin:4256,end:4351},{begin:6912,end:7039},{begin:4352,end:4607},{begin:7680,end:7935},{begin:7936,end:8191},{begin:8192,end:8303},{begin:8304,end:8351},{begin:8352,end:8399},{begin:8400,end:8447},{begin:8448,end:8527},{begin:8528,end:8591},{begin:8592,end:8703},{begin:8704,end:8959},{begin:8960,end:9215},{begin:9216,end:9279},{begin:9280,end:9311},{begin:9312,end:9471},{begin:9472,end:9599},{begin:9600,end:9631},{begin:9632,end:9727},{begin:9728,end:9983},{begin:9984,end:10175},{begin:12288,end:12351},{begin:12352,end:12447},{begin:12448,end:12543},{begin:12544,end:12591},{begin:12592,end:12687},{begin:43072,end:43135},{begin:12800,end:13055},{begin:13056,end:13311},{begin:44032,end:55215},{begin:55296,end:57343},{begin:67840,end:67871},{begin:19968,end:40959},{begin:57344,end:63743},{begin:12736,end:12783},{begin:64256,end:64335},{begin:64336,end:65023},{begin:65056,end:65071},{begin:65040,end:65055},{begin:65104,end:65135},{begin:65136,end:65279},{begin:65280,end:65519},{begin:65520,end:65535},{begin:3840,end:4095},{begin:1792,end:1871},{begin:1920,end:1983},{begin:3456,end:3583},{begin:4096,end:4255},{begin:4608,end:4991},{begin:5024,end:5119},{begin:5120,end:5759},{begin:5760,end:5791},{begin:5792,end:5887},{begin:6016,end:6143},{begin:6144,end:6319},{begin:10240,end:10495},{begin:40960,end:42127},{begin:5888,end:5919},{begin:66304,end:66351},{begin:66352,end:66383},{begin:66560,end:66639},{begin:118784,end:119039},{begin:119808,end:120831},{begin:1044480,end:1048573},{begin:65024,end:65039},{begin:917504,end:917631},{begin:6400,end:6479},{begin:6480,end:6527},{begin:6528,end:6623},{begin:6656,end:6687},{begin:11264,end:11359},{begin:11568,end:11647},{begin:19904,end:19967},{begin:43008,end:43055},{begin:65536,end:65663},{begin:65856,end:65935},{begin:66432,end:66463},{begin:66464,end:66527},{begin:66640,end:66687},{begin:66688,end:66735},{begin:67584,end:67647},{begin:68096,end:68191},{begin:119552,end:119647},{begin:73728,end:74751},{begin:119648,end:119679},{begin:7040,end:7103},{begin:7168,end:7247},{begin:7248,end:7295},{begin:43136,end:43231},{begin:43264,end:43311},{begin:43312,end:43359},{begin:43520,end:43615},{begin:65936,end:65999},{begin:66e3,end:66047},{begin:66208,end:66271},{begin:127024,end:127135}];n.unicodeRanges=l,n.getUnicodeRange=r,n.parse=a,n.make=s},{"../parse":10,"../table":13}],30:[function(e,t,n){function r(e,t){var n,r={},a=new i.Parser(e,t);switch(r.version=a.parseVersion(),r.italicAngle=a.parseFixed(),r.underlinePosition=a.parseShort(),r.underlineThickness=a.parseShort(),r.isFixedPitch=a.parseULong(),r.minMemType42=a.parseULong(),r.maxMemType42=a.parseULong(),r.minMemType1=a.parseULong(),r.maxMemType1=a.parseULong(),r.version){case 1:r.names=s.standardNames.slice();break;case 2:for(r.numberOfGlyphs=a.parseUShort(),r.glyphNameIndex=new Array(r.numberOfGlyphs),n=0;n<r.numberOfGlyphs;n++)r.glyphNameIndex[n]=a.parseUShort();for(r.names=[],n=0;n<r.numberOfGlyphs;n++)if(r.glyphNameIndex[n]>=s.standardNames.length){var o=a.parseChar();r.names.push(a.parseString(o))}break;case 2.5:for(r.numberOfGlyphs=a.parseUShort(),r.offset=new Array(r.numberOfGlyphs),n=0;n<r.numberOfGlyphs;n++)r.offset[n]=a.parseChar()}return r}function a(){return new o.Table("post",[{name:"version",type:"FIXED",value:196608},{name:"italicAngle",type:"FIXED",value:0},{name:"underlinePosition",type:"FWORD",value:0},{name:"underlineThickness",type:"FWORD",value:0},{name:"isFixedPitch",type:"ULONG",value:0},{name:"minMemType42",type:"ULONG",value:0},{name:"maxMemType42",type:"ULONG",value:0},{name:"minMemType1",type:"ULONG",value:0},{name:"maxMemType1",type:"ULONG",value:0}])}var s=e("../encoding"),i=e("../parse"),o=e("../table");n.parse=r,n.make=a},{"../encoding":4,"../parse":10,"../table":13}],31:[function(e,t,n){function r(e){return Math.log(e)/Math.log(2)|0}function a(e){for(;e.length%4!==0;)e.push(0);for(var t=0,n=0;n<e.length;n+=4)t+=(e[n]<<24)+(e[n+1]<<16)+(e[n+2]<<8)+e[n+3];return t%=Math.pow(2,32)}function s(e,t,n,r){return new h.Record("Table Record",[{name:"tag",type:"TAG",value:void 0!==e?e:""},{name:"checkSum",type:"ULONG",value:void 0!==t?t:0},{name:"offset",type:"ULONG",value:void 0!==n?n:0},{name:"length",type:"ULONG",value:void 0!==r?r:0}])}function i(e){var t=new h.Table("sfnt",[{name:"version",type:"TAG",value:"OTTO"},{name:"numTables",type:"USHORT",value:0},{name:"searchRange",type:"USHORT",value:0},{name:"entrySelector",type:"USHORT",value:0},{name:"rangeShift",type:"USHORT",value:0}]);t.tables=e,t.numTables=e.length;var n=Math.pow(2,r(t.numTables));t.searchRange=16*n,t.entrySelector=r(n),t.rangeShift=16*t.numTables-t.searchRange;for(var i=[],o=[],l=t.sizeOf()+s().sizeOf()*t.numTables;l%4!==0;)l+=1,o.push({name:"padding",type:"BYTE",value:0});for(var u=0;u<e.length;u+=1){var f=e[u];c.argument(4===f.tableName.length,"Table name"+f.tableName+" is invalid.");var p=f.sizeOf(),d=s(f.tableName,a(f.encode()),l,p);for(i.push({name:d.tag+" Table Record",type:"RECORD",value:d}),o.push({name:f.tableName+" table",type:"RECORD",value:f}),l+=p,c.argument(!isNaN(l),"Something went wrong calculating the offset.");l%4!==0;)l+=1,o.push({name:"padding",type:"BYTE",value:0})}return i.sort(function(e,t){return e.value.tag>t.value.tag?1:-1}),t.fields=t.fields.concat(i),t.fields=t.fields.concat(o),t}function o(e,t,n){for(var r=0;r<t.length;r+=1){var a=e.charToGlyphIndex(t[r]);if(a>0){var s=e.glyphs.get(a);return s.getMetrics()}}return n}function l(e){for(var t=0,n=0;n<e.length;n+=1)t+=e[n];return t/e.length}function u(e){for(var t,n=[],r=[],s=[],u=[],c=[],h=[],T=[],w=0,O=0,N=0,D=0,L=0,F=0;F<e.glyphs.length;F+=1){var E=e.glyphs.get(F),U=0|E.unicode;if(isNaN(E.advanceWidth))throw new Error("Glyph "+E.name+" ("+F+"): advanceWidth is not a number.");(t>U||void 0===t)&&U>0&&(t=U),w<U&&(w=U);var k=S.getUnicodeRange(U);if(k<32)O|=1<<k;else if(k<64)N|=1<<k-32;else if(k<96)D|=1<<k-64;else{if(!(k<123))throw new Error("Unicode ranges bits > 123 are reserved for internal usage");L|=1<<k-96}if(".notdef"!==E.name){var A=E.getMetrics();n.push(A.xMin),r.push(A.yMin),s.push(A.xMax),u.push(A.yMax),h.push(A.leftSideBearing),T.push(A.rightSideBearing),c.push(E.advanceWidth)}}var B={xMin:Math.min.apply(null,n),yMin:Math.min.apply(null,r),xMax:Math.max.apply(null,s),yMax:Math.max.apply(null,u),advanceWidthMax:Math.max.apply(null,c),advanceWidthAvg:l(c),minLeftSideBearing:Math.min.apply(null,h),maxLeftSideBearing:Math.max.apply(null,h),minRightSideBearing:Math.min.apply(null,T)};B.ascender=e.ascender,B.descender=e.descender;var I=d.make({flags:3,unitsPerEm:e.unitsPerEm,xMin:B.xMin,yMin:B.yMin,xMax:B.xMax,yMax:B.yMax,lowestRecPPEM:3,createdTimestamp:e.createdTimestamp}),R=m.make({ascender:B.ascender,descender:B.descender,advanceWidthMax:B.advanceWidthMax,minLeftSideBearing:B.minLeftSideBearing,minRightSideBearing:B.minRightSideBearing,xMaxExtent:B.maxLeftSideBearing+(B.xMax-B.xMin),numberOfHMetrics:e.glyphs.length}),P=v.make(e.glyphs.length),M=S.make({xAvgCharWidth:Math.round(B.advanceWidthAvg),usWeightClass:e.tables.os2.usWeightClass,usWidthClass:e.tables.os2.usWidthClass,usFirstCharIndex:t,usLastCharIndex:w,ulUnicodeRange1:O,ulUnicodeRange2:N,ulUnicodeRange3:D,ulUnicodeRange4:L,fsSelection:e.tables.os2.fsSelection,sTypoAscender:B.ascender,sTypoDescender:B.descender,sTypoLineGap:0,usWinAscent:B.yMax,usWinDescent:Math.abs(B.yMin),ulCodePageRange1:1,sxHeight:o(e,"xyvw",{yMax:Math.round(B.ascender/2)}).yMax,sCapHeight:o(e,"HIKLEFJMNTZBDPRAGOQSUVWXY",B).yMax,usDefaultChar:e.hasChar(" ")?32:0,usBreakChar:e.hasChar(" ")?32:0}),G=g.make(e.glyphs),H=f.make(e.glyphs),j=e.getEnglishName("fontFamily"),W=e.getEnglishName("fontSubfamily"),q=j+" "+W,V=e.getEnglishName("postScriptName");V||(V=j.replace(/\s/g,"")+"-"+W);var z={};for(var X in e.names)z[X]=e.names[X];z.uniqueID||(z.uniqueID={en:e.getEnglishName("manufacturer")+":"+q}),z.postScriptName||(z.postScriptName={en:V}),z.preferredFamily||(z.preferredFamily=e.names.fontFamily),z.preferredSubfamily||(z.preferredSubfamily=e.names.fontSubfamily);var Y=[],K=b.make(z,Y),J=Y.length>0?y.make(Y):void 0,Z=_.make(),Q=p.make(e.glyphs,{version:e.getEnglishName("version"),fullName:q,familyName:j,weightName:W,postScriptName:V,unitsPerEm:e.unitsPerEm,fontBBox:[0,B.yMin,B.ascender,B.advanceWidthMax]}),$=e.metas&&Object.keys(e.metas).length>0?x.make(e.metas):void 0,ee=[I,R,P,M,K,H,Z,Q,G];J&&ee.push(J),e.tables.gsub&&ee.push(C.make(e.tables.gsub)),$&&ee.push($);var te=i(ee),ne=te.encode(),re=a(ne),ae=te.fields,se=!1;for(F=0;F<ae.length;F+=1)if("head table"===ae[F].name){ae[F].value.checkSumAdjustment=2981146554-re,se=!0;break}if(!se)throw new Error("Could not find head table with checkSum to adjust.");return te}var c=e("../check"),h=e("../table"),f=e("./cmap"),p=e("./cff"),d=e("./head"),m=e("./hhea"),g=e("./hmtx"),y=e("./ltag"),v=e("./maxp"),b=e("./name"),S=e("./os2"),_=e("./post"),C=e("./gsub"),x=e("./meta");n.computeCheckSum=a,n.make=i,n.fontToTable=u},{"../check":2,"../table":13,"./cff":14,"./cmap":15,"./gsub":19,"./head":20,"./hhea":21,"./hmtx":22,"./ltag":25,"./maxp":26,"./meta":27,"./name":28,"./os2":29,"./post":30}],32:[function(e,t,n){function r(e){return function(){return e}}var a=e("./check"),s=32768,i=2147483648,o={},l={},u={};l.BYTE=function(e){return a.argument(e>=0&&e<=255,"Byte value should be between 0 and 255."),[e]},u.BYTE=r(1),l.CHAR=function(e){return[e.charCodeAt(0)]},u.CHAR=r(1),l.CHARARRAY=function(e){for(var t=[],n=0;n<e.length;n+=1)t[n]=e.charCodeAt(n);return t},u.CHARARRAY=function(e){return e.length},l.USHORT=function(e){return[e>>8&255,255&e]},u.USHORT=r(2),l.SHORT=function(e){return e>=s&&(e=-(2*s-e)),[e>>8&255,255&e]},u.SHORT=r(2),l.UINT24=function(e){return[e>>16&255,e>>8&255,255&e]},u.UINT24=r(3),l.ULONG=function(e){return[e>>24&255,e>>16&255,e>>8&255,255&e]},u.ULONG=r(4),l.LONG=function(e){return e>=i&&(e=-(2*i-e)),[e>>24&255,e>>16&255,e>>8&255,255&e]},u.LONG=r(4),l.FIXED=l.ULONG,u.FIXED=u.ULONG,l.FWORD=l.SHORT,u.FWORD=u.SHORT,l.UFWORD=l.USHORT,u.UFWORD=u.USHORT,l.LONGDATETIME=function(e){return[0,0,0,0,e>>24&255,e>>16&255,e>>8&255,255&e]},u.LONGDATETIME=r(8),l.TAG=function(e){return a.argument(4===e.length,"Tag should be exactly 4 ASCII characters."),[e.charCodeAt(0),e.charCodeAt(1),e.charCodeAt(2),e.charCodeAt(3)]},u.TAG=r(4),l.Card8=l.BYTE,u.Card8=u.BYTE,l.Card16=l.USHORT,u.Card16=u.USHORT,l.OffSize=l.BYTE,u.OffSize=u.BYTE,l.SID=l.USHORT,u.SID=u.USHORT,l.NUMBER=function(e){return e>=-107&&e<=107?[e+139]:e>=108&&e<=1131?(e-=108,[(e>>8)+247,255&e]):e>=-1131&&e<=-108?(e=-e-108,[(e>>8)+251,255&e]):e>=-32768&&e<=32767?l.NUMBER16(e):l.NUMBER32(e)},u.NUMBER=function(e){return l.NUMBER(e).length},l.NUMBER16=function(e){return[28,e>>8&255,255&e]},u.NUMBER16=r(3),l.NUMBER32=function(e){return[29,e>>24&255,e>>16&255,e>>8&255,255&e]},u.NUMBER32=r(5),l.REAL=function(e){var t=e.toString(),n=/\.(\d*?)(?:9{5,20}|0{5,20})\d{0,2}(?:e(.+)|$)/.exec(t);if(n){var r=parseFloat("1e"+((n[2]?+n[2]:0)+n[1].length));t=(Math.round(e*r)/r).toString()}var a,s,i="";for(a=0,s=t.length;a<s;a+=1){var o=t[a];i+="e"===o?"-"===t[++a]?"c":"b":"."===o?"a":"-"===o?"e":o}i+=1&i.length?"f":"ff";var l=[30];for(a=0,s=i.length;a<s;a+=2)l.push(parseInt(i.substr(a,2),16));return l},u.REAL=function(e){return l.REAL(e).length},l.NAME=l.CHARARRAY,u.NAME=u.CHARARRAY,l.STRING=l.CHARARRAY,u.STRING=u.CHARARRAY,o.UTF8=function(e,t,n){for(var r=[],a=n,s=0;s<a;s++,t+=1)r[s]=e.getUint8(t);return String.fromCharCode.apply(null,r)},o.UTF16=function(e,t,n){for(var r=[],a=n/2,s=0;s<a;s++,t+=2)r[s]=e.getUint16(t);return String.fromCharCode.apply(null,r)},l.UTF16=function(e){for(var t=[],n=0;n<e.length;n+=1){var r=e.charCodeAt(n);t[t.length]=r>>8&255,t[t.length]=255&r}return t},u.UTF16=function(e){return 2*e.length};var c={"x-mac-croatian":"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®Š™´¨≠ŽØ∞±≤≥∆µ∂∑∏š∫ªºΩžø¿¡¬√ƒ≈Ć«Č… ÀÃÕŒœĐ—“”‘’÷◊©⁄€‹›Æ»–·‚„‰ÂćÁčÈÍÎÏÌÓÔđÒÚÛÙıˆ˜¯πË˚¸Êæˇ","x-mac-cyrillic":"АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ†°Ґ£§•¶І®©™Ђђ≠Ѓѓ∞±≤≥іµґЈЄєЇїЉљЊњјЅ¬√ƒ≈∆«»… ЋћЌќѕ–—“”‘’÷„ЎўЏџ№Ёёяабвгдежзийклмнопрстуфхцчшщъыьэю","x-mac-gaelic":"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØḂ±≤≥ḃĊċḊḋḞḟĠġṀæøṁṖṗɼƒſṠ«»… ÀÃÕŒœ–—“”‘’ṡẛÿŸṪ€‹›Ŷŷṫ·Ỳỳ⁊ÂÊÁËÈÍÎÏÌÓÔ♣ÒÚÛÙıÝýŴŵẄẅẀẁẂẃ","x-mac-greek":"Ä¹²É³ÖÜ΅àâä΄¨çéèêë£™îï•½‰ôö¦€ùûü†ΓΔΘΛΞΠß®©ΣΪ§≠°·Α±≤≥¥ΒΕΖΗΙΚΜΦΫΨΩάΝ¬ΟΡ≈Τ«»… ΥΧΆΈœ–―“”‘’÷ΉΊΌΎέήίόΏύαβψδεφγηιξκλμνοπώρστθωςχυζϊϋΐΰ­","x-mac-icelandic":"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûüÝ°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€ÐðÞþý·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ","x-mac-inuit":"ᐃᐄᐅᐆᐊᐋᐱᐲᐳᐴᐸᐹᑉᑎᑏᑐᑑᑕᑖᑦᑭᑮᑯᑰᑲᑳᒃᒋᒌᒍᒎᒐᒑ°ᒡᒥᒦ•¶ᒧ®©™ᒨᒪᒫᒻᓂᓃᓄᓅᓇᓈᓐᓯᓰᓱᓲᓴᓵᔅᓕᓖᓗᓘᓚᓛᓪᔨᔩᔪᔫᔭ… ᔮᔾᕕᕖᕗ–—“”‘’ᕘᕙᕚᕝᕆᕇᕈᕉᕋᕌᕐᕿᖀᖁᖂᖃᖄᖅᖏᖐᖑᖒᖓᖔᖕᙱᙲᙳᙴᙵᙶᖖᖠᖡᖢᖣᖤᖥᖦᕼŁł","x-mac-ce":"ÄĀāÉĄÖÜáąČäčĆćéŹźĎíďĒēĖóėôöõúĚěü†°Ę£§•¶ß®©™ę¨≠ģĮįĪ≤≥īĶ∂∑łĻļĽľĹĺŅņŃ¬√ńŇ∆«»… ňŐÕőŌ–—“”‘’÷◊ōŔŕŘ‹›řŖŗŠ‚„šŚśÁŤťÍŽžŪÓÔūŮÚůŰűŲųÝýķŻŁżĢˇ",macintosh:"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ","x-mac-romanian":"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ĂȘ∞±≤≥¥µ∂∑∏π∫ªºΩăș¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›Țț‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ","x-mac-turkish":"ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸĞğİıŞş‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙˆ˜¯˘˙˚¸˝˛ˇ"};o.MACSTRING=function(e,t,n,r){var a=c[r];if(void 0!==a){for(var s="",i=0;i<n;i++){var o=e.getUint8(t+i);s+=o<=127?String.fromCharCode(o):a[127&o]}return s}};var h,f="function"==typeof WeakMap&&new WeakMap,p=function(e){if(!h){h={};for(var t in c)h[t]=new String(t)}var n=h[e];if(void 0!==n){if(f){var r=f.get(n);if(void 0!==r)return r}var a=c[e];if(void 0!==a){for(var s={},i=0;i<a.length;i++)s[a.charCodeAt(i)]=i+128;return f&&f.set(n,s),s}}};l.MACSTRING=function(e,t){var n=p(t);if(void 0!==n){for(var r=[],a=0;a<e.length;a++){var s=e.charCodeAt(a);if(s>=128&&(s=n[s],void 0===s))return;r[a]=s}return r}},u.MACSTRING=function(e,t){var n=l.MACSTRING(e,t);return void 0!==n?n.length:0},l.INDEX=function(e){var t,n=1,r=[n],a=[];for(t=0;t<e.length;t+=1){var s=l.OBJECT(e[t]);Array.prototype.push.apply(a,s),n+=s.length,r.push(n)}if(0===a.length)return[0,0];var i=[],o=1+Math.floor(Math.log(n)/Math.log(2))/8|0,u=[void 0,l.BYTE,l.USHORT,l.UINT24,l.ULONG][o];for(t=0;t<r.length;t+=1){var c=u(r[t]);Array.prototype.push.apply(i,c)}return Array.prototype.concat(l.Card16(e.length),l.OffSize(o),i,a)},u.INDEX=function(e){return l.INDEX(e).length},l.DICT=function(e){for(var t=[],n=Object.keys(e),r=n.length,a=0;a<r;a+=1){var s=parseInt(n[a],0),i=e[s];t=t.concat(l.OPERAND(i.value,i.type)),t=t.concat(l.OPERATOR(s))}return t},u.DICT=function(e){return l.DICT(e).length},l.OPERATOR=function(e){return e<1200?[e]:[12,e-1200]},l.OPERAND=function(e,t){var n=[];if(Array.isArray(t))for(var r=0;r<t.length;r+=1)a.argument(e.length===t.length,"Not enough arguments given for type"+t),n=n.concat(l.OPERAND(e[r],t[r]));else if("SID"===t)n=n.concat(l.NUMBER(e));else if("offset"===t)n=n.concat(l.NUMBER32(e));else if("number"===t)n=n.concat(l.NUMBER(e));else{if("real"!==t)throw new Error("Unknown operand type "+t);n=n.concat(l.REAL(e))}return n},l.OP=l.BYTE,u.OP=u.BYTE;var d="function"==typeof WeakMap&&new WeakMap;l.CHARSTRING=function(e){if(d){var t=d.get(e);if(void 0!==t)return t}for(var n=[],r=e.length,a=0;a<r;a+=1){var s=e[a];n=n.concat(l[s.type](s.value))}return d&&d.set(e,n),n},u.CHARSTRING=function(e){return l.CHARSTRING(e).length},l.OBJECT=function(e){var t=l[e.type];return a.argument(void 0!==t,"No encoding function for type "+e.type),t(e.value)},u.OBJECT=function(e){var t=u[e.type];return a.argument(void 0!==t,"No sizeOf function for type "+e.type),t(e.value)},l.TABLE=function(e){var t,n=[],r=e.fields.length,s=[],i=[];for(t=0;t<r;t+=1){var o=e.fields[t],u=l[o.type];a.argument(void 0!==u,"No encoding function for field type "+o.type+" ("+o.name+")");var c=e[o.name];void 0===c&&(c=o.value);var h=u(c);"TABLE"===o.type?(i.push(n.length),n=n.concat([0,0]),s.push(h)):n=n.concat(h)}for(t=0;t<s.length;t+=1){var f=i[t],p=n.length;a.argument(p<65536,"Table "+e.tableName+" too big."),n[f]=p>>8,n[f+1]=255&p,n=n.concat(s[t])}return n},u.TABLE=function(e){for(var t=0,n=e.fields.length,r=0;r<n;r+=1){var s=e.fields[r],i=u[s.type];a.argument(void 0!==i,"No sizeOf function for field type "+s.type+" ("+s.name+")");var o=e[s.name];void 0===o&&(o=s.value),t+=i(o),"TABLE"===s.type&&(t+=2)}return t},l.RECORD=l.TABLE,u.RECORD=u.TABLE,l.LITERAL=function(e){return e},u.LITERAL=function(e){return e.length},n.decode=o,n.encode=l,n.sizeOf=u},{"./check":2}],33:[function(e,t,n){"use strict";n.isBrowser=function(){return"undefined"!=typeof window},n.isNode=function(){return"undefined"==typeof window},n.nodeBufferToArrayBuffer=function(e){for(var t=new ArrayBuffer(e.length),n=new Uint8Array(t),r=0;r<e.length;++r)n[r]=e[r];return t},n.arrayBufferToNodeBuffer=function(e){for(var t=new Buffer(e.byteLength),n=new Uint8Array(e),r=0;r<t.length;++r)t[r]=n[r];return t},n.checkArgument=function(e,t){if(!e)throw t}},{}]},{},[9])(9)}),define("specimenTools/loadFonts",["opentype"],function(e){"use strict";function t(t,n,r,a){var s;if(!r)try{s=e.parse(a)}catch(e){r=e}r?(console.warn("Can't load font",n," with error:",r),this.countAll--):(this.pubsub.publish("loadFont",t,n,s,a),this.countLoaded+=1),this.countLoaded===this.countAll&&this.pubsub.publish("allFontsLoaded",this.countAll)}function n(e,t){var n=new XMLHttpRequest,r=e.url;n.open("get",r,!0),n.responseType="arraybuffer",n.onload=function(){return 200!==n.status?t("Font could not be loaded: "+n.statusText):t(null,n.response)},n.send()}function r(e,t){e(null,this.result)}function a(e,t){e(this.error)}function s(e,t){var n=new FileReader;n.onload=r.bind(n,t),n.onerror=a.bind(n,t),n.readAsArrayBuffer(e)}function i(e,t){l(e,t,s)}function o(e,t){var r,a,s=[];for(r=0,a=t.length;r<a;r++){if(!t[r])throw new Error("The url at index "+r+" appears to be invalid.");s.push({name:t[r],url:t[r]})}l(e,s,n)}function l(e,n,r){var a,s,i,o,l={countLoaded:0,countAll:n.length,pubsub:e};for(a=0,s=n.length;a<s;a++)i=n[a],e.publish("prepareFont",a,i.name,s),o=t.bind(l,a,i.name),r(i,o)}return i.needsPubSub=!0,{fromUrl:o,fromFileInput:i}}),define("specimenTools/initDocumentWidgets",[],function(){"use strict";function e(e,t,n){var r,a,s,i,o,l,u,c,h,f,p=[];for(r=0,a=t.length;r<a;r++)if(s=t[r][0],i=e.getElementsByClassName(s),i.length)for(o=t[r][1],l=0,u=i.length;l<u;l++)c=i[l],p.push(c),h=[c,n],Array.prototype.push.apply(h,t[r].slice(2)),f=Object.create(o.prototype),o.apply(f,h);return p}return e}),define("specimenTools/services/PubSub",[],function(){"use strict";function e(){this._callbacks=Object.create(null)}var t=e.prototype;return t.subscribe=function(e,t){var n=this._callbacks[e];n||(this._callbacks[e]=n=[]),n.push(t)},t.publish=function(e){var t,n,r=[],a=this._callbacks[e]||[];for(t=1,n=arguments.length;t<n;t++)r.push(arguments[t]);for(t=0,n=a.length;t<n;t++)a[t].apply(null,r)},e}),define("specimenTools/services/dom-tool",[],function(){"use strict";function e(e,t,n){if(t)if("string"==typeof t&&(t=t.split(" ").filter(function(e){return!!e})),e.classList)e.classList[n?"remove":"add"].apply(e.classList,t);else{var r,a,s;n?(r=new Set(t),s=function(e){return!r.has(e)}):(a=new Set,e.setAttribute("class",e.getAttribute("class")+(" "+t.join(" "))),s=function(e){return!a.has(e)&&(a.add(e),!0)}),e.setAttribute("class",e.getAttribute("class").split(" ").filter(s).join(" "))}}function t(e,t,n){var r=e.children||e.childNodes,a=r.length;void 0===n||n>a?n=a:n<0&&(n=r.length+n,n<0&&(n=0)),n===a?e.appendChild(t):e.insertBefore(t,r[n])}return{applyClasses:e,insertElement:t}}),define("specimenTools/_BaseWidget",["./services/dom-tool"],function(e){"use strict";function t(e){this._options=this._makeOptions(e)}t.defaultOptions={};var n=t.prototype;return n.constructor=t,n._makeOptions=function(e){var t,n,r=e?Object.keys(e):[],a=Object.create(this.constructor.defaultOptions);for(t=0,n=r.length;t<n;t++)a[r[t]]=e[r[t]];return a},n._applyClasses=e.applyClasses,n._cssName2jsName=function(e){var t,n,r=e.split("-");for(t=1,n=r.length;t<n;t++)r[t]=r[t][0].toUpperCase()+r[t].slice(1);return r.join("")},t}),define("require/text",["module"],function(e){"use strict";function t(e,t){return void 0===e||""===e?t:e}function n(e,n,r,a){if(n===a)return!0;if(e===r){if("http"===e)return t(n,"80")===t(a,"80");if("https"===e)return t(n,"443")===t(a,"443")}return!1}var r,a,s,i,o,l=["Msxml2.XMLHTTP","Microsoft.XMLHTTP","Msxml2.XMLHTTP.4.0"],u=/^\s*<\?xml(\s)+version=[\'\"](\d)*.(\d)*[\'\"](\s)*\?>/im,c=/<body[^>]*>\s*([\s\S]+)\s*<\/body>/im,h="undefined"!=typeof location&&location.href,f=h&&location.protocol&&location.protocol.replace(/\:/,""),p=h&&location.hostname,d=h&&(location.port||void 0),m={},g=e.config&&e.config()||{};return r={version:"2.0.15",strip:function(e){if(e){e=e.replace(u,"");var t=e.match(c);t&&(e=t[1])}else e="";return e},jsEscape:function(e){return e.replace(/(['\\])/g,"\\$1").replace(/[\f]/g,"\\f").replace(/[\b]/g,"\\b").replace(/[\n]/g,"\\n").replace(/[\t]/g,"\\t").replace(/[\r]/g,"\\r").replace(/[\u2028]/g,"\\u2028").replace(/[\u2029]/g,"\\u2029")},createXhr:g.createXhr||function(){var e,t,n;if("undefined"!=typeof XMLHttpRequest)return new XMLHttpRequest;if("undefined"!=typeof ActiveXObject)for(t=0;t<3;t+=1){n=l[t];try{e=new ActiveXObject(n)}catch(e){}if(e){l=[n];break}}return e},parseName:function(e){var t,n,r,a=!1,s=e.lastIndexOf("."),i=0===e.indexOf("./")||0===e.indexOf("../");return s!==-1&&(!i||s>1)?(t=e.substring(0,s),n=e.substring(s+1)):t=e,r=n||t,s=r.indexOf("!"),s!==-1&&(a="strip"===r.substring(s+1),r=r.substring(0,s),n?n=r:t=r),{moduleName:t,ext:n,strip:a}},xdRegExp:/^((\w+)\:)?\/\/([^\/\\]+)/,useXhr:function(e,t,a,s){var i,o,l,u=r.xdRegExp.exec(e);return!u||(i=u[2],o=u[3],o=o.split(":"),l=o[1],o=o[0],(!i||i===t)&&(!o||o.toLowerCase()===a.toLowerCase())&&(!l&&!o||n(i,l,t,s)))},finishLoad:function(e,t,n,a){n=t?r.strip(n):n,g.isBuild&&(m[e]=n),a(n)},load:function(e,t,n,a){if(a&&a.isBuild&&!a.inlineText)return void n();g.isBuild=a&&a.isBuild;var s=r.parseName(e),i=s.moduleName+(s.ext?"."+s.ext:""),o=t.toUrl(i),l=g.useXhr||r.useXhr;return 0===o.indexOf("empty:")?void n():void(!h||l(o,f,p,d)?r.get(o,function(t){r.finishLoad(e,s.strip,t,n)},function(e){n.error&&n.error(e)}):t([i],function(e){r.finishLoad(s.moduleName+"."+s.ext,s.strip,e,n)}))},write:function(e,t,n,a){if(m.hasOwnProperty(t)){var s=r.jsEscape(m[t]);n.asModule(e+"!"+t,"define(function () { return '"+s+"';});\n")}},writeFile:function(e,t,n,a,s){var i=r.parseName(t),o=i.ext?"."+i.ext:"",l=i.moduleName+o,u=n.toUrl(i.moduleName+o)+".js";r.load(l,n,function(t){var n=function(e){return a(u,e)};n.asModule=function(e,t){return a.asModule(e,u,t)},r.write(e,l,n,s)},s)}},"node"===g.env||!g.env&&"undefined"!=typeof process&&process.versions&&process.versions.node&&!process.versions["node-webkit"]&&!process.versions["atom-shell"]?(a=require.nodeRequire("fs"),r.get=function(e,t,n){try{var r=a.readFileSync(e,"utf8");"\ufeff"===r[0]&&(r=r.substring(1)),t(r)}catch(e){n&&n(e)}}):"xhr"===g.env||!g.env&&r.createXhr()?r.get=function(e,t,n,a){var s,i=r.createXhr();if(i.open("GET",e,!0),a)for(s in a)a.hasOwnProperty(s)&&i.setRequestHeader(s.toLowerCase(),a[s]);g.onXhr&&g.onXhr(i,e),i.onreadystatechange=function(r){var a,s;4===i.readyState&&(a=i.status||0,a>399&&a<600?(s=new Error(e+" HTTP status: "+a),s.xhr=i,n&&n(s)):t(i.responseText),g.onXhrComplete&&g.onXhrComplete(i,e))},i.send(null)}:"rhino"===g.env||!g.env&&"undefined"!=typeof Packages&&"undefined"!=typeof java?r.get=function(e,t){var n,r,a="utf-8",s=new java.io.File(e),i=java.lang.System.getProperty("line.separator"),o=new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(s),a)),l="";try{for(n=new java.lang.StringBuffer,r=o.readLine(),r&&r.length()&&65279===r.charAt(0)&&(r=r.substring(1)),null!==r&&n.append(r);null!==(r=o.readLine());)n.append(i),n.append(r);l=String(n.toString())}finally{o.close()}t(l)}:("xpconnect"===g.env||!g.env&&"undefined"!=typeof Components&&Components.classes&&Components.interfaces)&&(s=Components.classes,i=Components.interfaces,Components.utils.import("resource://gre/modules/FileUtils.jsm"),o="@mozilla.org/windows-registry-key;1"in s,r.get=function(e,t){var n,r,a,l={};o&&(e=e.replace(/\//g,"\\")),a=new FileUtils.File(e);try{n=s["@mozilla.org/network/file-input-stream;1"].createInstance(i.nsIFileInputStream),n.init(a,1,0,!1),r=s["@mozilla.org/intl/converter-input-stream;1"].createInstance(i.nsIConverterInputStream),r.init(n,"utf-8",n.available(),i.nsIConverterInputStream.DEFAULT_REPLACEMENT_CHARACTER),r.readString(n.available(),l),r.close(),n.close(),t(l.value)}catch(e){throw new Error((a&&a.path||"")+": "+e)}}),r}),define("require/text!specimenTools/services/languageCharSets.json",[],function(){return'{"Afrikaans":"aáâbcdeéèêëfghiîïjklmnoôöpqrstuûvwxyzAÁÂBCDEÉÈÊËFGHIÎÏJKLMNOÔÖPQRSTUÛVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Amharic":"ሀሁሂሃሄህሆለሉሊላሌልሎሏሐሑሒሓሔሕሖሗመሙሚማሜምሞሟሠሡሢሣሤሥሦሧረሩሪራሬርሮሯሰሱሲሳሴስሶሷሸሹሺሻሼሽሾሿቀቁቂቃቄቅቆቈቊቋቌቍበቡቢባቤብቦቧቨቩቪቫቬቭቮቯተቱቲታቴትቶቷቸቹቺቻቼችቾቿኀኁኂኃኄኅኆኈኊኋኌኍነኑኒናኔንኖኗኘኙኚኛኜኝኞኟአኡኢኣኤእኦኧከኩኪካኬክኮኰኲኳኴኵኸኹኺኻኼኽኾወዉዊዋዌውዎዐዑዒዓዔዕዖዘዙዚዛዜዝዞዟዠዡዢዣዤዥዦዧየዩዪያዬይዮደዱዲዳዴድዶዷጀጁጂጃጄጅጆጇገጉጊጋጌግጎጐጒጓጔጕጠጡጢጣጤጥጦጧጨጩጪጫጬጭጮጯጰጱጲጳጴጵጶጷጸጹጺጻጼጽጾጿፀፁፂፃፄፅፆፈፉፊፋፌፍፎፏፐፑፒፓፔፕፖፗ‐–,፡፣፤፥፦!?.።‹›«»()[]","Arabic":"ًٌٍَُِّْٰءأؤإئاآبةتثجحخدذرزسشصضطظعغفقكلمنهوىي-‐–—،؛:!؟.\'\\\\\\"()[]","Azerbaijani":"abcçdeəfgğhxıiİjkqlmnoöprsştuüvyzABCÇDEƏFGĞHXIJKQLMNOÖPRSŞTUÜVYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Belarusian":"абвгджзеёійклмнопрстуўфхцчшыьэюяАБВГДЖЗЕЁІЙКЛМНОПРСТУЎФХЦЧШЫЬЭЮЯ-,;:!?.«»()[]{}","Bulgarian":"абвгдежзийклмнопрстуфхцчшщъьюяАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЬЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„()[]§*/″№","Bangla":"়৺অআইঈউঊঋৠঌৡএঐওঔংঃঁক\\\\u09CDষখগঘঙচছজঝঞটঠডBঢণতৎথদধনপফবভমযরলশসহঽািীুূৃৄৢৣেৈোৌ্ৗU-,;:!?.()[]{}","Bosnian":"abcčćdžđefghijklmnoprsštuvzABCČĆDŽĐEFGHIJKLMNOPRSŠTUVZ-,;:!?.()[]{}","Catalan":"·aàbcçdeéèfghiíïjklmnoóòpqrstuúüvwxyzAÀBCÇDEÉÈFGHIÍÏJKLMNOÓÒPQRSTUÚÜVWXYZ-‐–—,;:!¡?¿.…\'‘’\\\\\\"“”«»()[]§@*/\\\\\\\\&#†‡′″","Czech":"aábcčdďeéěfghiíjklmnňoópqrřsštťuúůvwxyýzžAÁBCČDĎEÉĚFGHIÍJKLMNŇOÓPQRŘSŠTŤUÚŮVWXYÝZŽ-‐–,;:!?.…‘‚“„()[]§@*/&","Welsh":"aáàâäbchdeéèêëfgniíìîïjlmoóòôöprstuúùûüwẃẁŵẅyýỳŷÿAÁÀÂÄBCHDEÉÈÊËFGNIÍÌÎÏJLMOÓÒÔÖPRSTUÚÙÛÜWẂẀŴẄYÝỲŶŸ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Danish":"abcdefghijklmnopqrstuvwxyzæøåABCDEFGHIJKLMNOPQRSTUVWXYZÆØÅ-‐–,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†′″","German":"aäbcdefghijklmnoöpqrsßtuüvwxyzAÄBCDEFGHIJKLMNOÖPQRSSSTUÜVWXYZ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Greek":"αάβγδεέζηήθιίϊΐκλμνξοόπρσςτυύϋΰφχψωώΑΆΒΓΔΕΈΖΗΉΘΙΊΪΪ́ΚΛΜΝΞΟΌΠΡΣΤΥΎΫΫ́ΦΧΨΩΏ-‐–—,;:!.…\\\\\\"«»()[]§@*/\\\\\\\\&","English":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Spanish":"aábcdeéfghiíïjklmnñoópqrstuúüvwxyýzAÁBCDEÉFGHIÍÏJKLMNÑOÓPQRSTUÚÜVWXYÝZ-‐–—,;:!¡?¿.…\'‘’\\\\\\"“”«»()[]§@*/\\\\\\\\&#†‡′″","Estonian":"abcdefghijklmnopqrsšzžtuvwõäöüxyABCDEFGHIJKLMNOPQRSŠZŽTUVWÕÄÖÜXY-,;:!?.()[]{}","Basque":"abcçdefghijklmnñopqrstuvwxyzABCÇDEFGHIJKLMNÑOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Persian":"ًٌٍّٔآاءأؤئبپتثجچحخدذرزژسشصضطظعغفقکگلمنوهةی-‐،٫٬؛:!؟.…‹›«»()[]*/\\\\\\\\","Finnish":"abcdefghijklmnopqrsštuvwxyzžåäöABCDEFGHIJKLMNOPQRSŠTUVWXYZŽÅÄÖ‐–,;:!?.…’”»()[]§@*/\\\\\\\\&#","Filipino":"abcdefghijklmnñopqrstuvwxyzABCDEFGHIJKLMNÑOPQRSTUVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§*/&#′″","Faroese":"aábdðefghiíjklmnoóprstuúvyýæøAÁBDÐEFGHIÍJKLMNOÓPRSTUÚVYÝÆØ-‐–,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†′″","French":"aàâæbcçdeéèêëfghiîïjklmnoôœpqrstuùûüvwxyÿzAÀÂÆBCÇDEÉÈÊËFGHIÎÏJKLMNOÔŒPQRSTUÙÛÜVWXYŸZ-‐–—,;:!?.…’\\\\\\"“”«»()[]§@*/&#†‡","Irish":"aábcdeéfghiílmnoóprstuúAÁBCDEÉFGHIÍLMNOÓPRSTUÚ-,;:!?.()[]{}","Galician":"aábcdeéfghiíjklmnñoópqrstuúüvwxyzAÁBCDEÉFGHIÍJKLMNÑOÓPQRSTUÚÜVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Gujarati":"઼ૐંઁઃઅઆઇઈઉઊઋૠઍએઐઑઓઔકખગઘઙચછજઝઞટઠડઢણતથદધનપફબભમયરલવશષસહળઽાિીુૂૃૄૅેૈૉોૌ્-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Hebrew":"אבגדהוזחטיכךלמםנןסעפףצץקרשת-‐–—,;:!?.׳\'\\\\\\"()[]/״־","Hindi":"़ॐंँःअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलळवशषसहऽािीुूृॄॅेैॉोौ्-,;:!?.‘’“”()[]{}॰","Croatian":"abcčćdžđefghijklmnoprsštuvzABCČĆDŽĐEFGHIJKLMNOPRSŠTUVZ‐–—,;:!?.…\'‘’‚\\\\\\"“”„()[]@*/′″","Hungarian":"aábcsdzeéfgyhiíjklmnoóöőprtuúüűvAÁBCSDZEÉFGYHIÍJKLMNOÓÖŐPRTUÚÜŰV-–,;:!?.…\'’\\\\\\"”„«»()[]{}⟨⟩§@*/&#~⁒","Armenian":"աբգդեզէըթժիլխծկհձղճմյնշոչպջռսվտրցւփքևօֆԱԲԳԴԵԶԷԸԹԺԻԼԽԾԿՀՁՂՃՄՅՆՇՈՉՊՋՌՍՎՏՐՑՒՓՔԵՒՕՖ֊,՝:՜՞.«»՚՛՟","Indonesian":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ‐–—,;:!?.…\'‘’“”()[]/","Icelandic":"aábdðeéfghiíjklmnoóprstuúvxyýþæöAÁBDÐEÉFGHIÍJKLMNOÓPRSTUÚVXYÝÞÆÖ-‐–—,;:!?.…\'‘‚\\\\\\"“„()[]§@*/&#†‡′″","Italian":"aàbcdeéèfghiìjklmnoóòpqrstuùvwxyzAÀBCDEÉÈFGHIÌJKLMNOÓÒPQRSTUÙVWXYZ-—,;:!?.…\'’\\\\\\"“”«»()[]{}@/","Japanese":"々ゝヽゞヾーぁァあアぃィいイぅゥうウヴぇェえエぉォおオヵかカがガきキぎギくクぐグヶけケげゲこコごゴさサざザしシじジすスずズせセぜゼそソぞゾたタだダちチぢヂっッつツづヅてテでデとトどドなナにニぬヌねネのノはハばバぱパひヒびビぴピふフぶブぷプへヘべベぺペほホぼボぽポまマみミむムめメもモゃャやヤゅュゆユょョよヨらラりリるルれレろロゎヮわワゐヰゑヱをヲんン一丁七万丈三上下不与丑且世丘丙両並中丸丹主久乏乗乙九乱乳乾亀了予争事二互五井亜亡交亥亨享京亭人仁今介仏仕他付仙代令以仮仰仲件任企伊伏伐休会伝伯伴伸伺似但位低住佐体何余作佳併使例侍供依価侮侯侵便係促俊俗保信修俳俵俸俺倉個倍倒候借倣値倫倹偉偏停健側偵偶偽傍傑傘備催債傷傾働像僕僚僧儀億儒償優元兄充兆先光克免兎児党入全八公六共兵具典兼内円冊再冒冗写冠冬冷准凍凝凡処凶凸凹出刀刃分切刈刊刑列初判別利到制刷券刺刻則削前剖剛剣剤副剰割創劇力功加劣助努励労効劾勅勇勉動勘務勝募勢勤勧勲勺匁包化北匠匹区医匿十千升午半卑卒卓協南単博占卯印危即却卵卸厄厘厚原厳去参又及友双反収叔取受叙口古句叫召可台史右号司各合吉同名后吏吐向君吟否含吸吹呈呉告周味呼命和咲哀品員哲唆唇唐唯唱商問啓善喚喜喝喪喫営嗣嘆嘉嘱器噴嚇囚四回因団困囲図固国圏園土圧在地坂均坊坑坪垂型垣埋城域執培基埼堀堂堅堕堤堪報場塀塁塊塑塔塗塚塩塾境墓増墜墨墳墾壁壇壊壌士壬壮声壱売変夏夕外多夜夢大天太夫央失奇奈奉奏契奔奥奨奪奮女奴好如妃妄妊妙妥妨妹妻姉始姓委姫姻姿威娘娠娯婆婚婦婿媒嫁嫌嫡嬢子孔字存孝季孤学孫宅宇守安完宗官宙定宜宝実客宣室宮宰害宴宵家容宿寂寄寅密富寒寛寝察寡寧審寮寸寺対寿封専射将尉尊尋導小少尚就尺尼尽尾尿局居屈届屋展属層履屯山岐岡岩岬岳岸峠峡峰島崇崎崩川州巡巣工左巧巨差己巳巻市布帆希帝帥師席帯帰帳常帽幅幕幣干平年幸幹幻幼幽幾庁広床序底店庚府度座庫庭庶康庸廃廉廊延廷建弁弊式弐弓弔引弘弟弦弧弱張強弾当形彩彫彰影役彼往征径待律後徐徒従得御復循微徳徴徹心必忌忍志忘忙応忠快念怒怖思怠急性怪恋恐恒恥恨恩恭息恵悔悟悠患悦悩悪悲悼情惑惜惨惰想愁愉意愚愛感慈態慌慎慕慢慣慨慮慰慶憂憎憤憩憲憶憾懇懐懲懸戊戌成我戒戦戯戸戻房所扇扉手才打払扱扶批承技抄把抑投抗折抜択披抱抵抹押抽担拍拐拒拓拘拙招拝拠拡括拷拾持指挑挙挟振挿捕捜捨据掃授掌排掘掛採探接控推措掲描提揚換握揮援揺損搬搭携搾摂摘摩撃撤撮撲擁操擦擬支改攻放政故敏救敗教敢散敬数整敵敷文斉斎斗料斜斤斥断新方施旅旋族旗既日旧旨早旬昆昇昌明易昔星映春昨昭是昼時晩普景晴晶暁暇暑暖暗暦暫暮暴曇曜曲更書曹替最月有服朕朗望朝期木未末本札朱朴机朽杉材村束条来杯東松板析林枚果枝枠枢枯架柄某染柔柱柳査栄栓校株核根格栽桃案桑桜桟梅械棄棋棒棚棟森棺植検業極楼楽概構様槽標模権横樹橋機欄欠次欧欲欺款歌歓止正武歩歯歳歴死殉殊残殖殴段殺殻殿母毎毒比毛氏民気水氷永汁求汎汗汚江池決汽沈沖没沢河沸油治沼沿況泉泊泌法泡波泣泥注泰泳洋洗洞津洪活派流浄浅浜浦浪浮浴海浸消涙涯液涼淑淡深混添清渇済渉渋渓減渡渦温測港湖湯湾湿満源準溝溶滅滋滑滝滞滴漁漂漆漏演漠漢漫漬漸潔潜潟潤潮澄激濁濃濫濯瀬火灯灰災炉炊炎炭点為烈無焦然焼煙照煩煮熟熱燃燥爆爵父片版牙牛牧物牲特犠犬犯状狂狩独狭猛猟猪猫献猶猿獄獣獲玄率玉王珍珠班現球理琴環璽瓶甘甚生産用田由甲申男町画界畑畔留畜畝略番異畳疎疑疫疲疾病症痘痛痢痴療癒癖癸発登白百的皆皇皮皿盆益盗盛盟監盤目盲直相盾省看県真眠眺眼着睡督瞬矛矢知短矯石砂研砕砲破硝硫硬碁碑確磁磨礁礎示礼社祈祉祖祚祝神祥票祭禁禄禅禍禎福秀私秋科秒秘租秩称移程税稚種稲稼稿穀穂積穏穫穴究空突窃窒窓窮窯立竜章童端競竹笑笛符第筆等筋筒答策箇算管箱節範築篤簡簿籍米粉粋粒粗粘粛粧精糖糧糸系糾紀約紅紋納純紙級紛素紡索紫累細紳紹紺終組経結絞絡給統絵絶絹継続維綱網綿緊総緑緒線締編緩緯練縁縄縛縦縫縮績繁繊織繕繭繰缶罪置罰署罷羅羊美群義羽翁翌習翻翼老考者耐耕耗耳聖聞聴職肉肌肖肝肢肥肩肪肯育肺胃胆背胎胞胴胸能脂脅脈脚脱脳脹腐腕腰腸腹膚膜膨臓臣臨自臭至致興舌舎舗舞舟航般舶船艇艦良色芋芝花芳芸芽苗若苦英茂茎茶草荒荘荷菊菌菓菜華落葉著葬蒸蓄蔵薄薦薪薫薬藤藩藻虎虐虚虜虞虫蚊蚕蛇蛍蛮融血衆行術街衛衝衡衣表衰衷袋被裁裂装裏裕補裸製複褐褒襟襲西要覆覇見規視覚覧親観角解触言訂計討訓託記訟訪設許訳訴診証詐詔評詞詠試詩詰話該詳誇誉誌認誓誕誘語誠誤説読誰課調談請論諭諮諸諾謀謁謄謙講謝謡謹識譜警議譲護谷豆豊豚象豪貝貞負財貢貧貨販貫責貯貴買貸費貿賀賃賄資賊賓賛賜賞賠賢賦質購贈赤赦走赴起超越趣足距跡路跳践踊踏躍身車軌軍軒軟転軸軽較載輝輩輪輸轄辛辞辰辱農辺込迅迎近返迫迭述迷追退送逃逆透逐逓途通逝速造連逮週進逸遂遅遇遊運遍過道達違遠遣適遭遮遵遷選遺避還邦邪邸郊郎郡部郭郵郷都酉酌配酒酔酢酪酬酵酷酸醜醸釈里重野量金針釣鈍鈴鉄鉛鉢鉱銀銃銅銑銘銭鋭鋳鋼錘錠錬錯録鍛鎖鎮鏡鐘鑑長門閉開閏閑間関閣閥閲闘阪防阻附降限陛院陣除陥陪陰陳陵陶陸険陽隅隆隊階随隔際障隠隣隷隻雄雅集雇雉雌雑離難雨雪雰雲零雷電需震霊霜霧露青静非面革靴韓音韻響頂頃項順預頑頒領頭頻頼題額顔顕願類顧風飛食飢飯飲飼飽飾養餓館首香馬駄駅駆駐騎騒験騰驚骨髄高髪鬼魂魅魔魚鮮鯨鳥鳴鶏鹿麗麦麻黄黒黙鼓鼠鼻齢‾_＿-－‐—―〜・･,，、､;；:：!！?？.．‥…。｡＇‘’\\\\\\"＂“”(（)）[［]］{｛}｝〈〉《》「｢」｣『』【】〔〕‖§¶@＠*＊/／\\\\\\\\＼&＆#＃%％‰†‡′″〃※","Georgian":"აბგდევზთიკლმნოპჟრსტუფქღყშჩცძწჭხჯჰ-‐–—,;:!?.…჻\'‘‚“„«»()[]{}§@*/&#†‡′″№","Kazakh":"аәбвгғдеёжзийкқлмнңоөпрстуұүфхһцчшщъыіьэюяАӘБВГҒДЕЁЖЗИЙКҚЛМНҢОӨПРСТУҰҮФХҺЦЧШЩЪЫІЬЭЮЯ-‐–—,;:!?.…\'‘’\\\\\\"“”«»()[]{}§@*/&#","Khmer":"័ៈ់៉៊៍កខគឃងចឆជឈញដឋឌឍណតថទធនបផពភមយរឫឬលឭឮវសហឡអាឥឦឧឩឪឯឰឱឲឳិីឹឺុូួើឿៀេែៃោៅំះ្-,៖!?.។៕‘’\\\\\\"“”()[]{}៙៚","Kannada":"಼೦೧೨೩೪೫೬೭೮೯ಅಆಇಈಉಊಋೠಌೡಎಏಐಒಓಔಂಃಕಖಗಘಙಚಛಜಝಞಟಠಡಢಣತಥದಧನಪಫಬಭಮಯರಱಲವಶಷಸಹಳಽಾಿೀುೂೃೄೆೇೈೊೋೌ್ೕೖ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]@*/&#′″","Korean":"가각갂갃간갅갆갇갈갉갊갋갌갍갎갏감갑값갓갔강갖갗갘같갚갛개객갞갟갠갡갢갣갤갥갦갧갨갩갪갫갬갭갮갯갰갱갲갳갴갵갶갷갸갹갺갻갼갽갾갿걀걁걂걃걄걅걆걇걈걉걊걋걌걍걎걏걐걑걒걓걔걕걖걗걘걙걚걛걜걝걞걟걠걡걢걣걤걥걦걧걨걩걪걫걬걭걮걯거걱걲걳건걵걶걷걸걹걺걻걼걽걾걿검겁겂것겄겅겆겇겈겉겊겋게겍겎겏겐겑겒겓겔겕겖겗겘겙겚겛겜겝겞겟겠겡겢겣겤겥겦겧겨격겪겫견겭겮겯결겱겲겳겴겵겶겷겸겹겺겻겼경겾겿곀곁곂곃계곅곆곇곈곉곊곋곌곍곎곏곐곑곒곓곔곕곖곗곘곙곚곛곜곝곞곟고곡곢곣곤곥곦곧골곩곪곫곬곭곮곯곰곱곲곳곴공곶곷곸곹곺곻과곽곾곿관괁괂괃괄괅괆괇괈괉괊괋괌괍괎괏괐광괒괓괔괕괖괗괘괙괚괛괜괝괞괟괠괡괢괣괤괥괦괧괨괩괪괫괬괭괮괯괰괱괲괳괴괵괶괷괸괹괺괻괼괽괾괿굀굁굂굃굄굅굆굇굈굉굊굋굌굍굎굏교굑굒굓굔굕굖굗굘굙굚굛굜굝굞굟굠굡굢굣굤굥굦굧굨굩굪굫구국굮굯군굱굲굳굴굵굶굷굸굹굺굻굼굽굾굿궀궁궂궃궄궅궆궇궈궉궊궋권궍궎궏궐궑궒궓궔궕궖궗궘궙궚궛궜궝궞궟궠궡궢궣궤궥궦궧궨궩궪궫궬궭궮궯궰궱궲궳궴궵궶궷궸궹궺궻궼궽궾궿귀귁귂귃귄귅귆귇귈귉귊귋귌귍귎귏귐귑귒귓귔귕귖귗귘귙귚귛규귝귞귟균귡귢귣귤귥귦귧귨귩귪귫귬귭귮귯귰귱귲귳귴귵귶귷그극귺귻근귽귾귿글긁긂긃긄긅긆긇금급긊긋긌긍긎긏긐긑긒긓긔긕긖긗긘긙긚긛긜긝긞긟긠긡긢긣긤긥긦긧긨긩긪긫긬긭긮긯기긱긲긳긴긵긶긷길긹긺긻긼긽긾긿김깁깂깃깄깅깆깇깈깉깊깋까깍깎깏깐깑깒깓깔깕깖깗깘깙깚깛깜깝깞깟깠깡깢깣깤깥깦깧깨깩깪깫깬깭깮깯깰깱깲깳깴깵깶깷깸깹깺깻깼깽깾깿꺀꺁꺂꺃꺄꺅꺆꺇꺈꺉꺊꺋꺌꺍꺎꺏꺐꺑꺒꺓꺔꺕꺖꺗꺘꺙꺚꺛꺜꺝꺞꺟꺠꺡꺢꺣꺤꺥꺦꺧꺨꺩꺪꺫꺬꺭꺮꺯꺰꺱꺲꺳꺴꺵꺶꺷꺸꺹꺺꺻꺼꺽꺾꺿껀껁껂껃껄껅껆껇껈껉껊껋껌껍껎껏껐껑껒껓껔껕껖껗께껙껚껛껜껝껞껟껠껡껢껣껤껥껦껧껨껩껪껫껬껭껮껯껰껱껲껳껴껵껶껷껸껹껺껻껼껽껾껿꼀꼁꼂꼃꼄꼅꼆꼇꼈꼉꼊꼋꼌꼍꼎꼏꼐꼑꼒꼓꼔꼕꼖꼗꼘꼙꼚꼛꼜꼝꼞꼟꼠꼡꼢꼣꼤꼥꼦꼧꼨꼩꼪꼫꼬꼭꼮꼯꼰꼱꼲꼳꼴꼵꼶꼷꼸꼹꼺꼻꼼꼽꼾꼿꽀꽁꽂꽃꽄꽅꽆꽇꽈꽉꽊꽋꽌꽍꽎꽏꽐꽑꽒꽓꽔꽕꽖꽗꽘꽙꽚꽛꽜꽝꽞꽟꽠꽡꽢꽣꽤꽥꽦꽧꽨꽩꽪꽫꽬꽭꽮꽯꽰꽱꽲꽳꽴꽵꽶꽷꽸꽹꽺꽻꽼꽽꽾꽿꾀꾁꾂꾃꾄꾅꾆꾇꾈꾉꾊꾋꾌꾍꾎꾏꾐꾑꾒꾓꾔꾕꾖꾗꾘꾙꾚꾛꾜꾝꾞꾟꾠꾡꾢꾣꾤꾥꾦꾧꾨꾩꾪꾫꾬꾭꾮꾯꾰꾱꾲꾳꾴꾵꾶꾷꾸꾹꾺꾻꾼꾽꾾꾿꿀꿁꿂꿃꿄꿅꿆꿇꿈꿉꿊꿋꿌꿍꿎꿏꿐꿑꿒꿓꿔꿕꿖꿗꿘꿙꿚꿛꿜꿝꿞꿟꿠꿡꿢꿣꿤꿥꿦꿧꿨꿩꿪꿫꿬꿭꿮꿯꿰꿱꿲꿳꿴꿵꿶꿷꿸꿹꿺꿻꿼꿽꿾꿿뀀뀁뀂뀃뀄뀅뀆뀇뀈뀉뀊뀋뀌뀍뀎뀏뀐뀑뀒뀓뀔뀕뀖뀗뀘뀙뀚뀛뀜뀝뀞뀟뀠뀡뀢뀣뀤뀥뀦뀧뀨뀩뀪뀫뀬뀭뀮뀯뀰뀱뀲뀳뀴뀵뀶뀷뀸뀹뀺뀻뀼뀽뀾뀿끀끁끂끃끄끅끆끇끈끉끊끋끌끍끎끏끐끑끒끓끔끕끖끗끘끙끚끛끜끝끞끟끠끡끢끣끤끥끦끧끨끩끪끫끬끭끮끯끰끱끲끳끴끵끶끷끸끹끺끻끼끽끾끿낀낁낂낃낄낅낆낇낈낉낊낋낌낍낎낏낐낑낒낓낔낕낖낗나낙낚낛난낝낞낟날낡낢낣낤낥낦낧남납낪낫났낭낮낯낰낱낲낳내낵낶낷낸낹낺낻낼낽낾낿냀냁냂냃냄냅냆냇냈냉냊냋냌냍냎냏냐냑냒냓냔냕냖냗냘냙냚냛냜냝냞냟냠냡냢냣냤냥냦냧냨냩냪냫냬냭냮냯냰냱냲냳냴냵냶냷냸냹냺냻냼냽냾냿넀넁넂넃넄넅넆넇너넉넊넋넌넍넎넏널넑넒넓넔넕넖넗넘넙넚넛넜넝넞넟넠넡넢넣네넥넦넧넨넩넪넫넬넭넮넯넰넱넲넳넴넵넶넷넸넹넺넻넼넽넾넿녀녁녂녃년녅녆녇녈녉녊녋녌녍녎녏념녑녒녓녔녕녖녗녘녙녚녛녜녝녞녟녠녡녢녣녤녥녦녧녨녩녪녫녬녭녮녯녰녱녲녳녴녵녶녷노녹녺녻논녽녾녿놀놁놂놃놄놅놆놇놈놉놊놋놌농놎놏놐놑높놓놔놕놖놗놘놙놚놛놜놝놞놟놠놡놢놣놤놥놦놧놨놩놪놫놬놭놮놯놰놱놲놳놴놵놶놷놸놹놺놻놼놽놾놿뇀뇁뇂뇃뇄뇅뇆뇇뇈뇉뇊뇋뇌뇍뇎뇏뇐뇑뇒뇓뇔뇕뇖뇗뇘뇙뇚뇛뇜뇝뇞뇟뇠뇡뇢뇣뇤뇥뇦뇧뇨뇩뇪뇫뇬뇭뇮뇯뇰뇱뇲뇳뇴뇵뇶뇷뇸뇹뇺뇻뇼뇽뇾뇿눀눁눂눃누눅눆눇눈눉눊눋눌눍눎눏눐눑눒눓눔눕눖눗눘눙눚눛눜눝눞눟눠눡눢눣눤눥눦눧눨눩눪눫눬눭눮눯눰눱눲눳눴눵눶눷눸눹눺눻눼눽눾눿뉀뉁뉂뉃뉄뉅뉆뉇뉈뉉뉊뉋뉌뉍뉎뉏뉐뉑뉒뉓뉔뉕뉖뉗뉘뉙뉚뉛뉜뉝뉞뉟뉠뉡뉢뉣뉤뉥뉦뉧뉨뉩뉪뉫뉬뉭뉮뉯뉰뉱뉲뉳뉴뉵뉶뉷뉸뉹뉺뉻뉼뉽뉾뉿늀늁늂늃늄늅늆늇늈늉늊늋늌늍늎늏느늑늒늓는늕늖늗늘늙늚늛늜늝늞늟늠늡늢늣늤능늦늧늨늩늪늫늬늭늮늯늰늱늲늳늴늵늶늷늸늹늺늻늼늽늾늿닀닁닂닃닄닅닆닇니닉닊닋닌닍닎닏닐닑닒닓닔닕닖닗님닙닚닛닜닝닞닟닠닡닢닣다닥닦닧단닩닪닫달닭닮닯닰닱닲닳담답닶닷닸당닺닻닼닽닾닿대댁댂댃댄댅댆댇댈댉댊댋댌댍댎댏댐댑댒댓댔댕댖댗댘댙댚댛댜댝댞댟댠댡댢댣댤댥댦댧댨댩댪댫댬댭댮댯댰댱댲댳댴댵댶댷댸댹댺댻댼댽댾댿덀덁덂덃덄덅덆덇덈덉덊덋덌덍덎덏덐덑덒덓더덕덖덗던덙덚덛덜덝덞덟덠덡덢덣덤덥덦덧덨덩덪덫덬덭덮덯데덱덲덳덴덵덶덷델덹덺덻덼덽덾덿뎀뎁뎂뎃뎄뎅뎆뎇뎈뎉뎊뎋뎌뎍뎎뎏뎐뎑뎒뎓뎔뎕뎖뎗뎘뎙뎚뎛뎜뎝뎞뎟뎠뎡뎢뎣뎤뎥뎦뎧뎨뎩뎪뎫뎬뎭뎮뎯뎰뎱뎲뎳뎴뎵뎶뎷뎸뎹뎺뎻뎼뎽뎾뎿돀돁돂돃도독돆돇돈돉돊돋돌돍돎돏돐돑돒돓돔돕돖돗돘동돚돛돜돝돞돟돠돡돢돣돤돥돦돧돨돩돪돫돬돭돮돯돰돱돲돳돴돵돶돷돸돹돺돻돼돽돾돿됀됁됂됃됄됅됆됇됈됉됊됋됌됍됎됏됐됑됒됓됔됕됖됗되됙됚됛된됝됞됟될됡됢됣됤됥됦됧됨됩됪됫됬됭됮됯됰됱됲됳됴됵됶됷됸됹됺됻됼됽됾됿둀둁둂둃둄둅둆둇둈둉둊둋둌둍둎둏두둑둒둓둔둕둖둗둘둙둚둛둜둝둞둟둠둡둢둣둤둥둦둧둨둩둪둫둬둭둮둯둰둱둲둳둴둵둶둷둸둹둺둻둼둽둾둿뒀뒁뒂뒃뒄뒅뒆뒇뒈뒉뒊뒋뒌뒍뒎뒏뒐뒑뒒뒓뒔뒕뒖뒗뒘뒙뒚뒛뒜뒝뒞뒟뒠뒡뒢뒣뒤뒥뒦뒧뒨뒩뒪뒫뒬뒭뒮뒯뒰뒱뒲뒳뒴뒵뒶뒷뒸뒹뒺뒻뒼뒽뒾뒿듀듁듂듃듄듅듆듇듈듉듊듋듌듍듎듏듐듑듒듓듔듕듖듗듘듙듚듛드득듞듟든듡듢듣들듥듦듧듨듩듪듫듬듭듮듯듰등듲듳듴듵듶듷듸듹듺듻듼듽듾듿딀딁딂딃딄딅딆딇딈딉딊딋딌딍딎딏딐딑딒딓디딕딖딗딘딙딚딛딜딝딞딟딠딡딢딣딤딥딦딧딨딩딪딫딬딭딮딯따딱딲딳딴딵딶딷딸딹딺딻딼딽딾딿땀땁땂땃땄땅땆땇땈땉땊땋때땍땎땏땐땑땒땓땔땕땖땗땘땙땚땛땜땝땞땟땠땡땢땣땤땥땦땧땨땩땪땫땬땭땮땯땰땱땲땳땴땵땶땷땸땹땺땻땼땽땾땿떀떁떂떃떄떅떆떇떈떉떊떋떌떍떎떏떐떑떒떓떔떕떖떗떘떙떚떛떜떝떞떟떠떡떢떣떤떥떦떧떨떩떪떫떬떭떮떯떰떱떲떳떴떵떶떷떸떹떺떻떼떽떾떿뗀뗁뗂뗃뗄뗅뗆뗇뗈뗉뗊뗋뗌뗍뗎뗏뗐뗑뗒뗓뗔뗕뗖뗗뗘뗙뗚뗛뗜뗝뗞뗟뗠뗡뗢뗣뗤뗥뗦뗧뗨뗩뗪뗫뗬뗭뗮뗯뗰뗱뗲뗳뗴뗵뗶뗷뗸뗹뗺뗻뗼뗽뗾뗿똀똁똂똃똄똅똆똇똈똉똊똋똌똍똎똏또똑똒똓똔똕똖똗똘똙똚똛똜똝똞똟똠똡똢똣똤똥똦똧똨똩똪똫똬똭똮똯똰똱똲똳똴똵똶똷똸똹똺똻똼똽똾똿뙀뙁뙂뙃뙄뙅뙆뙇뙈뙉뙊뙋뙌뙍뙎뙏뙐뙑뙒뙓뙔뙕뙖뙗뙘뙙뙚뙛뙜뙝뙞뙟뙠뙡뙢뙣뙤뙥뙦뙧뙨뙩뙪뙫뙬뙭뙮뙯뙰뙱뙲뙳뙴뙵뙶뙷뙸뙹뙺뙻뙼뙽뙾뙿뚀뚁뚂뚃뚄뚅뚆뚇뚈뚉뚊뚋뚌뚍뚎뚏뚐뚑뚒뚓뚔뚕뚖뚗뚘뚙뚚뚛뚜뚝뚞뚟뚠뚡뚢뚣뚤뚥뚦뚧뚨뚩뚪뚫뚬뚭뚮뚯뚰뚱뚲뚳뚴뚵뚶뚷뚸뚹뚺뚻뚼뚽뚾뚿뛀뛁뛂뛃뛄뛅뛆뛇뛈뛉뛊뛋뛌뛍뛎뛏뛐뛑뛒뛓뛔뛕뛖뛗뛘뛙뛚뛛뛜뛝뛞뛟뛠뛡뛢뛣뛤뛥뛦뛧뛨뛩뛪뛫뛬뛭뛮뛯뛰뛱뛲뛳뛴뛵뛶뛷뛸뛹뛺뛻뛼뛽뛾뛿뜀뜁뜂뜃뜄뜅뜆뜇뜈뜉뜊뜋뜌뜍뜎뜏뜐뜑뜒뜓뜔뜕뜖뜗뜘뜙뜚뜛뜜뜝뜞뜟뜠뜡뜢뜣뜤뜥뜦뜧뜨뜩뜪뜫뜬뜭뜮뜯뜰뜱뜲뜳뜴뜵뜶뜷뜸뜹뜺뜻뜼뜽뜾뜿띀띁띂띃띄띅띆띇띈띉띊띋띌띍띎띏띐띑띒띓띔띕띖띗띘띙띚띛띜띝띞띟띠띡띢띣띤띥띦띧띨띩띪띫띬띭띮띯띰띱띲띳띴띵띶띷띸띹띺띻라락띾띿란랁랂랃랄랅랆랇랈랉랊랋람랍랎랏랐랑랒랓랔랕랖랗래랙랚랛랜랝랞랟랠랡랢랣랤랥랦랧램랩랪랫랬랭랮랯랰랱랲랳랴략랶랷랸랹랺랻랼랽랾랿럀럁럂럃럄럅럆럇럈량럊럋럌럍럎럏럐럑럒럓럔럕럖럗럘럙럚럛럜럝럞럟럠럡럢럣럤럥럦럧럨럩럪럫러럭럮럯런럱럲럳럴럵럶럷럸럹럺럻럼럽럾럿렀렁렂렃렄렅렆렇레렉렊렋렌렍렎렏렐렑렒렓렔렕렖렗렘렙렚렛렜렝렞렟렠렡렢렣려력렦렧련렩렪렫렬렭렮렯렰렱렲렳렴렵렶렷렸령렺렻렼렽렾렿례롁롂롃롄롅롆롇롈롉롊롋롌롍롎롏롐롑롒롓롔롕롖롗롘롙롚롛로록롞롟론롡롢롣롤롥롦롧롨롩롪롫롬롭롮롯롰롱롲롳롴롵롶롷롸롹롺롻롼롽롾롿뢀뢁뢂뢃뢄뢅뢆뢇뢈뢉뢊뢋뢌뢍뢎뢏뢐뢑뢒뢓뢔뢕뢖뢗뢘뢙뢚뢛뢜뢝뢞뢟뢠뢡뢢뢣뢤뢥뢦뢧뢨뢩뢪뢫뢬뢭뢮뢯뢰뢱뢲뢳뢴뢵뢶뢷뢸뢹뢺뢻뢼뢽뢾뢿룀룁룂룃룄룅룆룇룈룉룊룋료룍룎룏룐룑룒룓룔룕룖룗룘룙룚룛룜룝룞룟룠룡룢룣룤룥룦룧루룩룪룫룬룭룮룯룰룱룲룳룴룵룶룷룸룹룺룻룼룽룾룿뤀뤁뤂뤃뤄뤅뤆뤇뤈뤉뤊뤋뤌뤍뤎뤏뤐뤑뤒뤓뤔뤕뤖뤗뤘뤙뤚뤛뤜뤝뤞뤟뤠뤡뤢뤣뤤뤥뤦뤧뤨뤩뤪뤫뤬뤭뤮뤯뤰뤱뤲뤳뤴뤵뤶뤷뤸뤹뤺뤻뤼뤽뤾뤿륀륁륂륃륄륅륆륇륈륉륊륋륌륍륎륏륐륑륒륓륔륕륖륗류륙륚륛륜륝륞륟률륡륢륣륤륥륦륧륨륩륪륫륬륭륮륯륰륱륲륳르륵륶륷른륹륺륻를륽륾륿릀릁릂릃름릅릆릇릈릉릊릋릌릍릎릏릐릑릒릓릔릕릖릗릘릙릚릛릜릝릞릟릠릡릢릣릤릥릦릧릨릩릪릫리릭릮릯린릱릲릳릴릵릶릷릸릹릺릻림립릾릿맀링맂맃맄맅맆맇마막맊맋만맍많맏말맑맒맓맔맕맖맗맘맙맚맛맜망맞맟맠맡맢맣매맥맦맧맨맩맪맫맬맭맮맯맰맱맲맳맴맵맶맷맸맹맺맻맼맽맾맿먀먁먂먃먄먅먆먇먈먉먊먋먌먍먎먏먐먑먒먓먔먕먖먗먘먙먚먛먜먝먞먟먠먡먢먣먤먥먦먧먨먩먪먫먬먭먮먯먰먱먲먳먴먵먶먷머먹먺먻먼먽먾먿멀멁멂멃멄멅멆멇멈멉멊멋멌멍멎멏멐멑멒멓메멕멖멗멘멙멚멛멜멝멞멟멠멡멢멣멤멥멦멧멨멩멪멫멬멭멮멯며멱멲멳면멵멶멷멸멹멺멻멼멽멾멿몀몁몂몃몄명몆몇몈몉몊몋몌몍몎몏몐몑몒몓몔몕몖몗몘몙몚몛몜몝몞몟몠몡몢몣몤몥몦몧모목몪몫몬몭몮몯몰몱몲몳몴몵몶몷몸몹몺못몼몽몾몿뫀뫁뫂뫃뫄뫅뫆뫇뫈뫉뫊뫋뫌뫍뫎뫏뫐뫑뫒뫓뫔뫕뫖뫗뫘뫙뫚뫛뫜뫝뫞뫟뫠뫡뫢뫣뫤뫥뫦뫧뫨뫩뫪뫫뫬뫭뫮뫯뫰뫱뫲뫳뫴뫵뫶뫷뫸뫹뫺뫻뫼뫽뫾뫿묀묁묂묃묄묅묆묇묈묉묊묋묌묍묎묏묐묑묒묓묔묕묖묗묘묙묚묛묜묝묞묟묠묡묢묣묤묥묦묧묨묩묪묫묬묭묮묯묰묱묲묳무묵묶묷문묹묺묻물묽묾묿뭀뭁뭂뭃뭄뭅뭆뭇뭈뭉뭊뭋뭌뭍뭎뭏뭐뭑뭒뭓뭔뭕뭖뭗뭘뭙뭚뭛뭜뭝뭞뭟뭠뭡뭢뭣뭤뭥뭦뭧뭨뭩뭪뭫뭬뭭뭮뭯뭰뭱뭲뭳뭴뭵뭶뭷뭸뭹뭺뭻뭼뭽뭾뭿뮀뮁뮂뮃뮄뮅뮆뮇뮈뮉뮊뮋뮌뮍뮎뮏뮐뮑뮒뮓뮔뮕뮖뮗뮘뮙뮚뮛뮜뮝뮞뮟뮠뮡뮢뮣뮤뮥뮦뮧뮨뮩뮪뮫뮬뮭뮮뮯뮰뮱뮲뮳뮴뮵뮶뮷뮸뮹뮺뮻뮼뮽뮾뮿므믁믂믃믄믅믆믇믈믉믊믋믌믍믎믏믐믑믒믓믔믕믖믗믘믙믚믛믜믝믞믟믠믡믢믣믤믥믦믧믨믩믪믫믬믭믮믯믰믱믲믳믴믵믶믷미믹믺믻민믽믾믿밀밁밂밃밄밅밆밇밈밉밊밋밌밍밎및밐밑밒밓바박밖밗반밙밚받발밝밞밟밠밡밢밣밤밥밦밧밨방밪밫밬밭밮밯배백밲밳밴밵밶밷밸밹밺밻밼밽밾밿뱀뱁뱂뱃뱄뱅뱆뱇뱈뱉뱊뱋뱌뱍뱎뱏뱐뱑뱒뱓뱔뱕뱖뱗뱘뱙뱚뱛뱜뱝뱞뱟뱠뱡뱢뱣뱤뱥뱦뱧뱨뱩뱪뱫뱬뱭뱮뱯뱰뱱뱲뱳뱴뱵뱶뱷뱸뱹뱺뱻뱼뱽뱾뱿벀벁벂벃버벅벆벇번벉벊벋벌벍벎벏벐벑벒벓범법벖벗벘벙벚벛벜벝벞벟베벡벢벣벤벥벦벧벨벩벪벫벬벭벮벯벰벱벲벳벴벵벶벷벸벹벺벻벼벽벾벿변볁볂볃별볅볆볇볈볉볊볋볌볍볎볏볐병볒볓볔볕볖볗볘볙볚볛볜볝볞볟볠볡볢볣볤볥볦볧볨볩볪볫볬볭볮볯볰볱볲볳보복볶볷본볹볺볻볼볽볾볿봀봁봂봃봄봅봆봇봈봉봊봋봌봍봎봏봐봑봒봓봔봕봖봗봘봙봚봛봜봝봞봟봠봡봢봣봤봥봦봧봨봩봪봫봬봭봮봯봰봱봲봳봴봵봶봷봸봹봺봻봼봽봾봿뵀뵁뵂뵃뵄뵅뵆뵇뵈뵉뵊뵋뵌뵍뵎뵏뵐뵑뵒뵓뵔뵕뵖뵗뵘뵙뵚뵛뵜뵝뵞뵟뵠뵡뵢뵣뵤뵥뵦뵧뵨뵩뵪뵫뵬뵭뵮뵯뵰뵱뵲뵳뵴뵵뵶뵷뵸뵹뵺뵻뵼뵽뵾뵿부북붂붃분붅붆붇불붉붊붋붌붍붎붏붐붑붒붓붔붕붖붗붘붙붚붛붜붝붞붟붠붡붢붣붤붥붦붧붨붩붪붫붬붭붮붯붰붱붲붳붴붵붶붷붸붹붺붻붼붽붾붿뷀뷁뷂뷃뷄뷅뷆뷇뷈뷉뷊뷋뷌뷍뷎뷏뷐뷑뷒뷓뷔뷕뷖뷗뷘뷙뷚뷛뷜뷝뷞뷟뷠뷡뷢뷣뷤뷥뷦뷧뷨뷩뷪뷫뷬뷭뷮뷯뷰뷱뷲뷳뷴뷵뷶뷷뷸뷹뷺뷻뷼뷽뷾뷿븀븁븂븃븄븅븆븇븈븉븊븋브븍븎븏븐븑븒븓블븕븖븗븘븙븚븛븜븝븞븟븠븡븢븣븤븥븦븧븨븩븪븫븬븭븮븯븰븱븲븳븴븵븶븷븸븹븺븻븼븽븾븿빀빁빂빃비빅빆빇빈빉빊빋빌빍빎빏빐빑빒빓빔빕빖빗빘빙빚빛빜빝빞빟빠빡빢빣빤빥빦빧빨빩빪빫빬빭빮빯빰빱빲빳빴빵빶빷빸빹빺빻빼빽빾빿뺀뺁뺂뺃뺄뺅뺆뺇뺈뺉뺊뺋뺌뺍뺎뺏뺐뺑뺒뺓뺔뺕뺖뺗뺘뺙뺚뺛뺜뺝뺞뺟뺠뺡뺢뺣뺤뺥뺦뺧뺨뺩뺪뺫뺬뺭뺮뺯뺰뺱뺲뺳뺴뺵뺶뺷뺸뺹뺺뺻뺼뺽뺾뺿뻀뻁뻂뻃뻄뻅뻆뻇뻈뻉뻊뻋뻌뻍뻎뻏뻐뻑뻒뻓뻔뻕뻖뻗뻘뻙뻚뻛뻜뻝뻞뻟뻠뻡뻢뻣뻤뻥뻦뻧뻨뻩뻪뻫뻬뻭뻮뻯뻰뻱뻲뻳뻴뻵뻶뻷뻸뻹뻺뻻뻼뻽뻾뻿뼀뼁뼂뼃뼄뼅뼆뼇뼈뼉뼊뼋뼌뼍뼎뼏뼐뼑뼒뼓뼔뼕뼖뼗뼘뼙뼚뼛뼜뼝뼞뼟뼠뼡뼢뼣뼤뼥뼦뼧뼨뼩뼪뼫뼬뼭뼮뼯뼰뼱뼲뼳뼴뼵뼶뼷뼸뼹뼺뼻뼼뼽뼾뼿뽀뽁뽂뽃뽄뽅뽆뽇뽈뽉뽊뽋뽌뽍뽎뽏뽐뽑뽒뽓뽔뽕뽖뽗뽘뽙뽚뽛뽜뽝뽞뽟뽠뽡뽢뽣뽤뽥뽦뽧뽨뽩뽪뽫뽬뽭뽮뽯뽰뽱뽲뽳뽴뽵뽶뽷뽸뽹뽺뽻뽼뽽뽾뽿뾀뾁뾂뾃뾄뾅뾆뾇뾈뾉뾊뾋뾌뾍뾎뾏뾐뾑뾒뾓뾔뾕뾖뾗뾘뾙뾚뾛뾜뾝뾞뾟뾠뾡뾢뾣뾤뾥뾦뾧뾨뾩뾪뾫뾬뾭뾮뾯뾰뾱뾲뾳뾴뾵뾶뾷뾸뾹뾺뾻뾼뾽뾾뾿뿀뿁뿂뿃뿄뿅뿆뿇뿈뿉뿊뿋뿌뿍뿎뿏뿐뿑뿒뿓뿔뿕뿖뿗뿘뿙뿚뿛뿜뿝뿞뿟뿠뿡뿢뿣뿤뿥뿦뿧뿨뿩뿪뿫뿬뿭뿮뿯뿰뿱뿲뿳뿴뿵뿶뿷뿸뿹뿺뿻뿼뿽뿾뿿쀀쀁쀂쀃쀄쀅쀆쀇쀈쀉쀊쀋쀌쀍쀎쀏쀐쀑쀒쀓쀔쀕쀖쀗쀘쀙쀚쀛쀜쀝쀞쀟쀠쀡쀢쀣쀤쀥쀦쀧쀨쀩쀪쀫쀬쀭쀮쀯쀰쀱쀲쀳쀴쀵쀶쀷쀸쀹쀺쀻쀼쀽쀾쀿쁀쁁쁂쁃쁄쁅쁆쁇쁈쁉쁊쁋쁌쁍쁎쁏쁐쁑쁒쁓쁔쁕쁖쁗쁘쁙쁚쁛쁜쁝쁞쁟쁠쁡쁢쁣쁤쁥쁦쁧쁨쁩쁪쁫쁬쁭쁮쁯쁰쁱쁲쁳쁴쁵쁶쁷쁸쁹쁺쁻쁼쁽쁾쁿삀삁삂삃삄삅삆삇삈삉삊삋삌삍삎삏삐삑삒삓삔삕삖삗삘삙삚삛삜삝삞삟삠삡삢삣삤삥삦삧삨삩삪삫사삭삮삯산삱삲삳살삵삶삷삸삹삺삻삼삽삾삿샀상샂샃샄샅샆샇새색샊샋샌샍샎샏샐샑샒샓샔샕샖샗샘샙샚샛샜생샞샟샠샡샢샣샤샥샦샧샨샩샪샫샬샭샮샯샰샱샲샳샴샵샶샷샸샹샺샻샼샽샾샿섀섁섂섃섄섅섆섇섈섉섊섋섌섍섎섏섐섑섒섓섔섕섖섗섘섙섚섛서석섞섟선섡섢섣설섥섦섧섨섩섪섫섬섭섮섯섰성섲섳섴섵섶섷세섹섺섻센섽섾섿셀셁셂셃셄셅셆셇셈셉셊셋셌셍셎셏셐셑셒셓셔셕셖셗션셙셚셛셜셝셞셟셠셡셢셣셤셥셦셧셨셩셪셫셬셭셮셯셰셱셲셳셴셵셶셷셸셹셺셻셼셽셾셿솀솁솂솃솄솅솆솇솈솉솊솋소속솎솏손솑솒솓솔솕솖솗솘솙솚솛솜솝솞솟솠송솢솣솤솥솦솧솨솩솪솫솬솭솮솯솰솱솲솳솴솵솶솷솸솹솺솻솼솽솾솿쇀쇁쇂쇃쇄쇅쇆쇇쇈쇉쇊쇋쇌쇍쇎쇏쇐쇑쇒쇓쇔쇕쇖쇗쇘쇙쇚쇛쇜쇝쇞쇟쇠쇡쇢쇣쇤쇥쇦쇧쇨쇩쇪쇫쇬쇭쇮쇯쇰쇱쇲쇳쇴쇵쇶쇷쇸쇹쇺쇻쇼쇽쇾쇿숀숁숂숃숄숅숆숇숈숉숊숋숌숍숎숏숐숑숒숓숔숕숖숗수숙숚숛순숝숞숟술숡숢숣숤숥숦숧숨숩숪숫숬숭숮숯숰숱숲숳숴숵숶숷숸숹숺숻숼숽숾숿쉀쉁쉂쉃쉄쉅쉆쉇쉈쉉쉊쉋쉌쉍쉎쉏쉐쉑쉒쉓쉔쉕쉖쉗쉘쉙쉚쉛쉜쉝쉞쉟쉠쉡쉢쉣쉤쉥쉦쉧쉨쉩쉪쉫쉬쉭쉮쉯쉰쉱쉲쉳쉴쉵쉶쉷쉸쉹쉺쉻쉼쉽쉾쉿슀슁슂슃슄슅슆슇슈슉슊슋슌슍슎슏슐슑슒슓슔슕슖슗슘슙슚슛슜슝슞슟슠슡슢슣스슥슦슧슨슩슪슫슬슭슮슯슰슱슲슳슴습슶슷슸승슺슻슼슽슾슿싀싁싂싃싄싅싆싇싈싉싊싋싌싍싎싏싐싑싒싓싔싕싖싗싘싙싚싛시식싞싟신싡싢싣실싥싦싧싨싩싪싫심십싮싯싰싱싲싳싴싵싶싷싸싹싺싻싼싽싾싿쌀쌁쌂쌃쌄쌅쌆쌇쌈쌉쌊쌋쌌쌍쌎쌏쌐쌑쌒쌓쌔쌕쌖쌗쌘쌙쌚쌛쌜쌝쌞쌟쌠쌡쌢쌣쌤쌥쌦쌧쌨쌩쌪쌫쌬쌭쌮쌯쌰쌱쌲쌳쌴쌵쌶쌷쌸쌹쌺쌻쌼쌽쌾쌿썀썁썂썃썄썅썆썇썈썉썊썋썌썍썎썏썐썑썒썓썔썕썖썗썘썙썚썛썜썝썞썟썠썡썢썣썤썥썦썧써썩썪썫썬썭썮썯썰썱썲썳썴썵썶썷썸썹썺썻썼썽썾썿쎀쎁쎂쎃쎄쎅쎆쎇쎈쎉쎊쎋쎌쎍쎎쎏쎐쎑쎒쎓쎔쎕쎖쎗쎘쎙쎚쎛쎜쎝쎞쎟쎠쎡쎢쎣쎤쎥쎦쎧쎨쎩쎪쎫쎬쎭쎮쎯쎰쎱쎲쎳쎴쎵쎶쎷쎸쎹쎺쎻쎼쎽쎾쎿쏀쏁쏂쏃쏄쏅쏆쏇쏈쏉쏊쏋쏌쏍쏎쏏쏐쏑쏒쏓쏔쏕쏖쏗쏘쏙쏚쏛쏜쏝쏞쏟쏠쏡쏢쏣쏤쏥쏦쏧쏨쏩쏪쏫쏬쏭쏮쏯쏰쏱쏲쏳쏴쏵쏶쏷쏸쏹쏺쏻쏼쏽쏾쏿쐀쐁쐂쐃쐄쐅쐆쐇쐈쐉쐊쐋쐌쐍쐎쐏쐐쐑쐒쐓쐔쐕쐖쐗쐘쐙쐚쐛쐜쐝쐞쐟쐠쐡쐢쐣쐤쐥쐦쐧쐨쐩쐪쐫쐬쐭쐮쐯쐰쐱쐲쐳쐴쐵쐶쐷쐸쐹쐺쐻쐼쐽쐾쐿쑀쑁쑂쑃쑄쑅쑆쑇쑈쑉쑊쑋쑌쑍쑎쑏쑐쑑쑒쑓쑔쑕쑖쑗쑘쑙쑚쑛쑜쑝쑞쑟쑠쑡쑢쑣쑤쑥쑦쑧쑨쑩쑪쑫쑬쑭쑮쑯쑰쑱쑲쑳쑴쑵쑶쑷쑸쑹쑺쑻쑼쑽쑾쑿쒀쒁쒂쒃쒄쒅쒆쒇쒈쒉쒊쒋쒌쒍쒎쒏쒐쒑쒒쒓쒔쒕쒖쒗쒘쒙쒚쒛쒜쒝쒞쒟쒠쒡쒢쒣쒤쒥쒦쒧쒨쒩쒪쒫쒬쒭쒮쒯쒰쒱쒲쒳쒴쒵쒶쒷쒸쒹쒺쒻쒼쒽쒾쒿쓀쓁쓂쓃쓄쓅쓆쓇쓈쓉쓊쓋쓌쓍쓎쓏쓐쓑쓒쓓쓔쓕쓖쓗쓘쓙쓚쓛쓜쓝쓞쓟쓠쓡쓢쓣쓤쓥쓦쓧쓨쓩쓪쓫쓬쓭쓮쓯쓰쓱쓲쓳쓴쓵쓶쓷쓸쓹쓺쓻쓼쓽쓾쓿씀씁씂씃씄씅씆씇씈씉씊씋씌씍씎씏씐씑씒씓씔씕씖씗씘씙씚씛씜씝씞씟씠씡씢씣씤씥씦씧씨씩씪씫씬씭씮씯씰씱씲씳씴씵씶씷씸씹씺씻씼씽씾씿앀앁앂앃아악앆앇안앉않앋알앍앎앏앐앑앒앓암압앖앗았앙앚앛앜앝앞앟애액앢앣앤앥앦앧앨앩앪앫앬앭앮앯앰앱앲앳앴앵앶앷앸앹앺앻야약앾앿얀얁얂얃얄얅얆얇얈얉얊얋얌얍얎얏얐양얒얓얔얕얖얗얘얙얚얛얜얝얞얟얠얡얢얣얤얥얦얧얨얩얪얫얬얭얮얯얰얱얲얳어억얶얷언얹얺얻얼얽얾얿엀엁엂엃엄업없엇었엉엊엋엌엍엎엏에엑엒엓엔엕엖엗엘엙엚엛엜엝엞엟엠엡엢엣엤엥엦엧엨엩엪엫여역엮엯연엱엲엳열엵엶엷엸엹엺엻염엽엾엿였영옂옃옄옅옆옇예옉옊옋옌옍옎옏옐옑옒옓옔옕옖옗옘옙옚옛옜옝옞옟옠옡옢옣오옥옦옧온옩옪옫올옭옮옯옰옱옲옳옴옵옶옷옸옹옺옻옼옽옾옿와왁왂왃완왅왆왇왈왉왊왋왌왍왎왏왐왑왒왓왔왕왖왗왘왙왚왛왜왝왞왟왠왡왢왣왤왥왦왧왨왩왪왫왬왭왮왯왰왱왲왳왴왵왶왷외왹왺왻왼왽왾왿욀욁욂욃욄욅욆욇욈욉욊욋욌욍욎욏욐욑욒욓요욕욖욗욘욙욚욛욜욝욞욟욠욡욢욣욤욥욦욧욨용욪욫욬욭욮욯우욱욲욳운욵욶욷울욹욺욻욼욽욾욿움웁웂웃웄웅웆웇웈웉웊웋워웍웎웏원웑웒웓월웕웖웗웘웙웚웛웜웝웞웟웠웡웢웣웤웥웦웧웨웩웪웫웬웭웮웯웰웱웲웳웴웵웶웷웸웹웺웻웼웽웾웿윀윁윂윃위윅윆윇윈윉윊윋윌윍윎윏윐윑윒윓윔윕윖윗윘윙윚윛윜윝윞윟유육윢윣윤윥윦윧율윩윪윫윬윭윮윯윰윱윲윳윴융윶윷윸윹윺윻으윽윾윿은읁읂읃을읅읆읇읈읉읊읋음읍읎읏읐응읒읓읔읕읖읗의읙읚읛읜읝읞읟읠읡읢읣읤읥읦읧읨읩읪읫읬읭읮읯읰읱읲읳이익읶읷인읹읺읻일읽읾읿잀잁잂잃임입잆잇있잉잊잋잌잍잎잏자작잒잓잔잕잖잗잘잙잚잛잜잝잞잟잠잡잢잣잤장잦잧잨잩잪잫재잭잮잯잰잱잲잳잴잵잶잷잸잹잺잻잼잽잾잿쟀쟁쟂쟃쟄쟅쟆쟇쟈쟉쟊쟋쟌쟍쟎쟏쟐쟑쟒쟓쟔쟕쟖쟗쟘쟙쟚쟛쟜쟝쟞쟟쟠쟡쟢쟣쟤쟥쟦쟧쟨쟩쟪쟫쟬쟭쟮쟯쟰쟱쟲쟳쟴쟵쟶쟷쟸쟹쟺쟻쟼쟽쟾쟿저적젂젃전젅젆젇절젉젊젋젌젍젎젏점접젒젓젔정젖젗젘젙젚젛제젝젞젟젠젡젢젣젤젥젦젧젨젩젪젫젬젭젮젯젰젱젲젳젴젵젶젷져젹젺젻젼젽젾젿졀졁졂졃졄졅졆졇졈졉졊졋졌졍졎졏졐졑졒졓졔졕졖졗졘졙졚졛졜졝졞졟졠졡졢졣졤졥졦졧졨졩졪졫졬졭졮졯조족졲졳존졵졶졷졸졹졺졻졼졽졾졿좀좁좂좃좄종좆좇좈좉좊좋좌좍좎좏좐좑좒좓좔좕좖좗좘좙좚좛좜좝좞좟좠좡좢좣좤좥좦좧좨좩좪좫좬좭좮좯좰좱좲좳좴좵좶좷좸좹좺좻좼좽좾좿죀죁죂죃죄죅죆죇죈죉죊죋죌죍죎죏죐죑죒죓죔죕죖죗죘죙죚죛죜죝죞죟죠죡죢죣죤죥죦죧죨죩죪죫죬죭죮죯죰죱죲죳죴죵죶죷죸죹죺죻주죽죾죿준줁줂줃줄줅줆줇줈줉줊줋줌줍줎줏줐중줒줓줔줕줖줗줘줙줚줛줜줝줞줟줠줡줢줣줤줥줦줧줨줩줪줫줬줭줮줯줰줱줲줳줴줵줶줷줸줹줺줻줼줽줾줿쥀쥁쥂쥃쥄쥅쥆쥇쥈쥉쥊쥋쥌쥍쥎쥏쥐쥑쥒쥓쥔쥕쥖쥗쥘쥙쥚쥛쥜쥝쥞쥟쥠쥡쥢쥣쥤쥥쥦쥧쥨쥩쥪쥫쥬쥭쥮쥯쥰쥱쥲쥳쥴쥵쥶쥷쥸쥹쥺쥻쥼쥽쥾쥿즀즁즂즃즄즅즆즇즈즉즊즋즌즍즎즏즐즑즒즓즔즕즖즗즘즙즚즛즜증즞즟즠즡즢즣즤즥즦즧즨즩즪즫즬즭즮즯즰즱즲즳즴즵즶즷즸즹즺즻즼즽즾즿지직짂짃진짅짆짇질짉짊짋짌짍짎짏짐집짒짓짔징짖짗짘짙짚짛짜짝짞짟짠짡짢짣짤짥짦짧짨짩짪짫짬짭짮짯짰짱짲짳짴짵짶짷째짹짺짻짼짽짾짿쨀쨁쨂쨃쨄쨅쨆쨇쨈쨉쨊쨋쨌쨍쨎쨏쨐쨑쨒쨓쨔쨕쨖쨗쨘쨙쨚쨛쨜쨝쨞쨟쨠쨡쨢쨣쨤쨥쨦쨧쨨쨩쨪쨫쨬쨭쨮쨯쨰쨱쨲쨳쨴쨵쨶쨷쨸쨹쨺쨻쨼쨽쨾쨿쩀쩁쩂쩃쩄쩅쩆쩇쩈쩉쩊쩋쩌쩍쩎쩏쩐쩑쩒쩓쩔쩕쩖쩗쩘쩙쩚쩛쩜쩝쩞쩟쩠쩡쩢쩣쩤쩥쩦쩧쩨쩩쩪쩫쩬쩭쩮쩯쩰쩱쩲쩳쩴쩵쩶쩷쩸쩹쩺쩻쩼쩽쩾쩿쪀쪁쪂쪃쪄쪅쪆쪇쪈쪉쪊쪋쪌쪍쪎쪏쪐쪑쪒쪓쪔쪕쪖쪗쪘쪙쪚쪛쪜쪝쪞쪟쪠쪡쪢쪣쪤쪥쪦쪧쪨쪩쪪쪫쪬쪭쪮쪯쪰쪱쪲쪳쪴쪵쪶쪷쪸쪹쪺쪻쪼쪽쪾쪿쫀쫁쫂쫃쫄쫅쫆쫇쫈쫉쫊쫋쫌쫍쫎쫏쫐쫑쫒쫓쫔쫕쫖쫗쫘쫙쫚쫛쫜쫝쫞쫟쫠쫡쫢쫣쫤쫥쫦쫧쫨쫩쫪쫫쫬쫭쫮쫯쫰쫱쫲쫳쫴쫵쫶쫷쫸쫹쫺쫻쫼쫽쫾쫿쬀쬁쬂쬃쬄쬅쬆쬇쬈쬉쬊쬋쬌쬍쬎쬏쬐쬑쬒쬓쬔쬕쬖쬗쬘쬙쬚쬛쬜쬝쬞쬟쬠쬡쬢쬣쬤쬥쬦쬧쬨쬩쬪쬫쬬쬭쬮쬯쬰쬱쬲쬳쬴쬵쬶쬷쬸쬹쬺쬻쬼쬽쬾쬿쭀쭁쭂쭃쭄쭅쭆쭇쭈쭉쭊쭋쭌쭍쭎쭏쭐쭑쭒쭓쭔쭕쭖쭗쭘쭙쭚쭛쭜쭝쭞쭟쭠쭡쭢쭣쭤쭥쭦쭧쭨쭩쭪쭫쭬쭭쭮쭯쭰쭱쭲쭳쭴쭵쭶쭷쭸쭹쭺쭻쭼쭽쭾쭿쮀쮁쮂쮃쮄쮅쮆쮇쮈쮉쮊쮋쮌쮍쮎쮏쮐쮑쮒쮓쮔쮕쮖쮗쮘쮙쮚쮛쮜쮝쮞쮟쮠쮡쮢쮣쮤쮥쮦쮧쮨쮩쮪쮫쮬쮭쮮쮯쮰쮱쮲쮳쮴쮵쮶쮷쮸쮹쮺쮻쮼쮽쮾쮿쯀쯁쯂쯃쯄쯅쯆쯇쯈쯉쯊쯋쯌쯍쯎쯏쯐쯑쯒쯓쯔쯕쯖쯗쯘쯙쯚쯛쯜쯝쯞쯟쯠쯡쯢쯣쯤쯥쯦쯧쯨쯩쯪쯫쯬쯭쯮쯯쯰쯱쯲쯳쯴쯵쯶쯷쯸쯹쯺쯻쯼쯽쯾쯿찀찁찂찃찄찅찆찇찈찉찊찋찌찍찎찏찐찑찒찓찔찕찖찗찘찙찚찛찜찝찞찟찠찡찢찣찤찥찦찧차착찪찫찬찭찮찯찰찱찲찳찴찵찶찷참찹찺찻찼창찾찿챀챁챂챃채책챆챇챈챉챊챋챌챍챎챏챐챑챒챓챔챕챖챗챘챙챚챛챜챝챞챟챠챡챢챣챤챥챦챧챨챩챪챫챬챭챮챯챰챱챲챳챴챵챶챷챸챹챺챻챼챽챾챿첀첁첂첃첄첅첆첇첈첉첊첋첌첍첎첏첐첑첒첓첔첕첖첗처척첚첛천첝첞첟철첡첢첣첤첥첦첧첨첩첪첫첬청첮첯첰첱첲첳체첵첶첷첸첹첺첻첼첽첾첿쳀쳁쳂쳃쳄쳅쳆쳇쳈쳉쳊쳋쳌쳍쳎쳏쳐쳑쳒쳓쳔쳕쳖쳗쳘쳙쳚쳛쳜쳝쳞쳟쳠쳡쳢쳣쳤쳥쳦쳧쳨쳩쳪쳫쳬쳭쳮쳯쳰쳱쳲쳳쳴쳵쳶쳷쳸쳹쳺쳻쳼쳽쳾쳿촀촁촂촃촄촅촆촇초촉촊촋촌촍촎촏촐촑촒촓촔촕촖촗촘촙촚촛촜총촞촟촠촡촢촣촤촥촦촧촨촩촪촫촬촭촮촯촰촱촲촳촴촵촶촷촸촹촺촻촼촽촾촿쵀쵁쵂쵃쵄쵅쵆쵇쵈쵉쵊쵋쵌쵍쵎쵏쵐쵑쵒쵓쵔쵕쵖쵗쵘쵙쵚쵛최쵝쵞쵟쵠쵡쵢쵣쵤쵥쵦쵧쵨쵩쵪쵫쵬쵭쵮쵯쵰쵱쵲쵳쵴쵵쵶쵷쵸쵹쵺쵻쵼쵽쵾쵿춀춁춂춃춄춅춆춇춈춉춊춋춌춍춎춏춐춑춒춓추축춖춗춘춙춚춛출춝춞춟춠춡춢춣춤춥춦춧춨충춪춫춬춭춮춯춰춱춲춳춴춵춶춷춸춹춺춻춼춽춾춿췀췁췂췃췄췅췆췇췈췉췊췋췌췍췎췏췐췑췒췓췔췕췖췗췘췙췚췛췜췝췞췟췠췡췢췣췤췥췦췧취췩췪췫췬췭췮췯췰췱췲췳췴췵췶췷췸췹췺췻췼췽췾췿츀츁츂츃츄츅츆츇츈츉츊츋츌츍츎츏츐츑츒츓츔츕츖츗츘츙츚츛츜츝츞츟츠측츢츣츤츥츦츧츨츩츪츫츬츭츮츯츰츱츲츳츴층츶츷츸츹츺츻츼츽츾츿칀칁칂칃칄칅칆칇칈칉칊칋칌칍칎칏칐칑칒칓칔칕칖칗치칙칚칛친칝칞칟칠칡칢칣칤칥칦칧침칩칪칫칬칭칮칯칰칱칲칳카칵칶칷칸칹칺칻칼칽칾칿캀캁캂캃캄캅캆캇캈캉캊캋캌캍캎캏캐캑캒캓캔캕캖캗캘캙캚캛캜캝캞캟캠캡캢캣캤캥캦캧캨캩캪캫캬캭캮캯캰캱캲캳캴캵캶캷캸캹캺캻캼캽캾캿컀컁컂컃컄컅컆컇컈컉컊컋컌컍컎컏컐컑컒컓컔컕컖컗컘컙컚컛컜컝컞컟컠컡컢컣커컥컦컧컨컩컪컫컬컭컮컯컰컱컲컳컴컵컶컷컸컹컺컻컼컽컾컿케켁켂켃켄켅켆켇켈켉켊켋켌켍켎켏켐켑켒켓켔켕켖켗켘켙켚켛켜켝켞켟켠켡켢켣켤켥켦켧켨켩켪켫켬켭켮켯켰켱켲켳켴켵켶켷켸켹켺켻켼켽켾켿콀콁콂콃콄콅콆콇콈콉콊콋콌콍콎콏콐콑콒콓코콕콖콗콘콙콚콛콜콝콞콟콠콡콢콣콤콥콦콧콨콩콪콫콬콭콮콯콰콱콲콳콴콵콶콷콸콹콺콻콼콽콾콿쾀쾁쾂쾃쾄쾅쾆쾇쾈쾉쾊쾋쾌쾍쾎쾏쾐쾑쾒쾓쾔쾕쾖쾗쾘쾙쾚쾛쾜쾝쾞쾟쾠쾡쾢쾣쾤쾥쾦쾧쾨쾩쾪쾫쾬쾭쾮쾯쾰쾱쾲쾳쾴쾵쾶쾷쾸쾹쾺쾻쾼쾽쾾쾿쿀쿁쿂쿃쿄쿅쿆쿇쿈쿉쿊쿋쿌쿍쿎쿏쿐쿑쿒쿓쿔쿕쿖쿗쿘쿙쿚쿛쿜쿝쿞쿟쿠쿡쿢쿣쿤쿥쿦쿧쿨쿩쿪쿫쿬쿭쿮쿯쿰쿱쿲쿳쿴쿵쿶쿷쿸쿹쿺쿻쿼쿽쿾쿿퀀퀁퀂퀃퀄퀅퀆퀇퀈퀉퀊퀋퀌퀍퀎퀏퀐퀑퀒퀓퀔퀕퀖퀗퀘퀙퀚퀛퀜퀝퀞퀟퀠퀡퀢퀣퀤퀥퀦퀧퀨퀩퀪퀫퀬퀭퀮퀯퀰퀱퀲퀳퀴퀵퀶퀷퀸퀹퀺퀻퀼퀽퀾퀿큀큁큂큃큄큅큆큇큈큉큊큋큌큍큎큏큐큑큒큓큔큕큖큗큘큙큚큛큜큝큞큟큠큡큢큣큤큥큦큧큨큩큪큫크큭큮큯큰큱큲큳클큵큶큷큸큹큺큻큼큽큾큿킀킁킂킃킄킅킆킇킈킉킊킋킌킍킎킏킐킑킒킓킔킕킖킗킘킙킚킛킜킝킞킟킠킡킢킣키킥킦킧킨킩킪킫킬킭킮킯킰킱킲킳킴킵킶킷킸킹킺킻킼킽킾킿타탁탂탃탄탅탆탇탈탉탊탋탌탍탎탏탐탑탒탓탔탕탖탗탘탙탚탛태택탞탟탠탡탢탣탤탥탦탧탨탩탪탫탬탭탮탯탰탱탲탳탴탵탶탷탸탹탺탻탼탽탾탿턀턁턂턃턄턅턆턇턈턉턊턋턌턍턎턏턐턑턒턓턔턕턖턗턘턙턚턛턜턝턞턟턠턡턢턣턤턥턦턧턨턩턪턫턬턭턮턯터턱턲턳턴턵턶턷털턹턺턻턼턽턾턿텀텁텂텃텄텅텆텇텈텉텊텋테텍텎텏텐텑텒텓텔텕텖텗텘텙텚텛템텝텞텟텠텡텢텣텤텥텦텧텨텩텪텫텬텭텮텯텰텱텲텳텴텵텶텷텸텹텺텻텼텽텾텿톀톁톂톃톄톅톆톇톈톉톊톋톌톍톎톏톐톑톒톓톔톕톖톗톘톙톚톛톜톝톞톟토톡톢톣톤톥톦톧톨톩톪톫톬톭톮톯톰톱톲톳톴통톶톷톸톹톺톻톼톽톾톿퇀퇁퇂퇃퇄퇅퇆퇇퇈퇉퇊퇋퇌퇍퇎퇏퇐퇑퇒퇓퇔퇕퇖퇗퇘퇙퇚퇛퇜퇝퇞퇟퇠퇡퇢퇣퇤퇥퇦퇧퇨퇩퇪퇫퇬퇭퇮퇯퇰퇱퇲퇳퇴퇵퇶퇷퇸퇹퇺퇻퇼퇽퇾퇿툀툁툂툃툄툅툆툇툈툉툊툋툌툍툎툏툐툑툒툓툔툕툖툗툘툙툚툛툜툝툞툟툠툡툢툣툤툥툦툧툨툩툪툫투툭툮툯툰툱툲툳툴툵툶툷툸툹툺툻툼툽툾툿퉀퉁퉂퉃퉄퉅퉆퉇퉈퉉퉊퉋퉌퉍퉎퉏퉐퉑퉒퉓퉔퉕퉖퉗퉘퉙퉚퉛퉜퉝퉞퉟퉠퉡퉢퉣퉤퉥퉦퉧퉨퉩퉪퉫퉬퉭퉮퉯퉰퉱퉲퉳퉴퉵퉶퉷퉸퉹퉺퉻퉼퉽퉾퉿튀튁튂튃튄튅튆튇튈튉튊튋튌튍튎튏튐튑튒튓튔튕튖튗튘튙튚튛튜튝튞튟튠튡튢튣튤튥튦튧튨튩튪튫튬튭튮튯튰튱튲튳튴튵튶튷트특튺튻튼튽튾튿틀틁틂틃틄틅틆틇틈틉틊틋틌틍틎틏틐틑틒틓틔틕틖틗틘틙틚틛틜틝틞틟틠틡틢틣틤틥틦틧틨틩틪틫틬틭틮틯티틱틲틳틴틵틶틷틸틹틺틻틼틽틾틿팀팁팂팃팄팅팆팇팈팉팊팋파팍팎팏판팑팒팓팔팕팖팗팘팙팚팛팜팝팞팟팠팡팢팣팤팥팦팧패팩팪팫팬팭팮팯팰팱팲팳팴팵팶팷팸팹팺팻팼팽팾팿퍀퍁퍂퍃퍄퍅퍆퍇퍈퍉퍊퍋퍌퍍퍎퍏퍐퍑퍒퍓퍔퍕퍖퍗퍘퍙퍚퍛퍜퍝퍞퍟퍠퍡퍢퍣퍤퍥퍦퍧퍨퍩퍪퍫퍬퍭퍮퍯퍰퍱퍲퍳퍴퍵퍶퍷퍸퍹퍺퍻퍼퍽퍾퍿펀펁펂펃펄펅펆펇펈펉펊펋펌펍펎펏펐펑펒펓펔펕펖펗페펙펚펛펜펝펞펟펠펡펢펣펤펥펦펧펨펩펪펫펬펭펮펯펰펱펲펳펴펵펶펷편펹펺펻펼펽펾펿폀폁폂폃폄폅폆폇폈평폊폋폌폍폎폏폐폑폒폓폔폕폖폗폘폙폚폛폜폝폞폟폠폡폢폣폤폥폦폧폨폩폪폫포폭폮폯폰폱폲폳폴폵폶폷폸폹폺폻폼폽폾폿퐀퐁퐂퐃퐄퐅퐆퐇퐈퐉퐊퐋퐌퐍퐎퐏퐐퐑퐒퐓퐔퐕퐖퐗퐘퐙퐚퐛퐜퐝퐞퐟퐠퐡퐢퐣퐤퐥퐦퐧퐨퐩퐪퐫퐬퐭퐮퐯퐰퐱퐲퐳퐴퐵퐶퐷퐸퐹퐺퐻퐼퐽퐾퐿푀푁푂푃푄푅푆푇푈푉푊푋푌푍푎푏푐푑푒푓푔푕푖푗푘푙푚푛표푝푞푟푠푡푢푣푤푥푦푧푨푩푪푫푬푭푮푯푰푱푲푳푴푵푶푷푸푹푺푻푼푽푾푿풀풁풂풃풄풅풆풇품풉풊풋풌풍풎풏풐풑풒풓풔풕풖풗풘풙풚풛풜풝풞풟풠풡풢풣풤풥풦풧풨풩풪풫풬풭풮풯풰풱풲풳풴풵풶풷풸풹풺풻풼풽풾풿퓀퓁퓂퓃퓄퓅퓆퓇퓈퓉퓊퓋퓌퓍퓎퓏퓐퓑퓒퓓퓔퓕퓖퓗퓘퓙퓚퓛퓜퓝퓞퓟퓠퓡퓢퓣퓤퓥퓦퓧퓨퓩퓪퓫퓬퓭퓮퓯퓰퓱퓲퓳퓴퓵퓶퓷퓸퓹퓺퓻퓼퓽퓾퓿픀픁픂픃프픅픆픇픈픉픊픋플픍픎픏픐픑픒픓픔픕픖픗픘픙픚픛픜픝픞픟픠픡픢픣픤픥픦픧픨픩픪픫픬픭픮픯픰픱픲픳픴픵픶픷픸픹픺픻피픽픾픿핀핁핂핃필핅핆핇핈핉핊핋핌핍핎핏핐핑핒핓핔핕핖핗하학핚핛한핝핞핟할핡핢핣핤핥핦핧함합핪핫핬항핮핯핰핱핲핳해핵핶핷핸핹핺핻핼핽핾핿햀햁햂햃햄햅햆햇했행햊햋햌햍햎햏햐햑햒햓햔햕햖햗햘햙햚햛햜햝햞햟햠햡햢햣햤향햦햧햨햩햪햫햬햭햮햯햰햱햲햳햴햵햶햷햸햹햺햻햼햽햾햿헀헁헂헃헄헅헆헇허헉헊헋헌헍헎헏헐헑헒헓헔헕헖헗험헙헚헛헜헝헞헟헠헡헢헣헤헥헦헧헨헩헪헫헬헭헮헯헰헱헲헳헴헵헶헷헸헹헺헻헼헽헾헿혀혁혂혃현혅혆혇혈혉혊혋혌혍혎혏혐협혒혓혔형혖혗혘혙혚혛혜혝혞혟혠혡혢혣혤혥혦혧혨혩혪혫혬혭혮혯혰혱혲혳혴혵혶혷호혹혺혻혼혽혾혿홀홁홂홃홄홅홆홇홈홉홊홋홌홍홎홏홐홑홒홓화확홖홗환홙홚홛활홝홞홟홠홡홢홣홤홥홦홧홨황홪홫홬홭홮홯홰홱홲홳홴홵홶홷홸홹홺홻홼홽홾홿횀횁횂횃횄횅횆횇횈횉횊횋회획횎횏횐횑횒횓횔횕횖횗횘횙횚횛횜횝횞횟횠횡횢횣횤횥횦횧효횩횪횫횬횭횮횯횰횱횲횳횴횵횶횷횸횹횺횻횼횽횾횿훀훁훂훃후훅훆훇훈훉훊훋훌훍훎훏훐훑훒훓훔훕훖훗훘훙훚훛훜훝훞훟훠훡훢훣훤훥훦훧훨훩훪훫훬훭훮훯훰훱훲훳훴훵훶훷훸훹훺훻훼훽훾훿휀휁휂휃휄휅휆휇휈휉휊휋휌휍휎휏휐휑휒휓휔휕휖휗휘휙휚휛휜휝휞휟휠휡휢휣휤휥휦휧휨휩휪휫휬휭휮휯휰휱휲휳휴휵휶휷휸휹휺휻휼휽휾휿흀흁흂흃흄흅흆흇흈흉흊흋흌흍흎흏흐흑흒흓흔흕흖흗흘흙흚흛흜흝흞흟흠흡흢흣흤흥흦흧흨흩흪흫희흭흮흯흰흱흲흳흴흵흶흷흸흹흺흻흼흽흾흿힀힁힂힃힄힅힆힇히힉힊힋힌힍힎힏힐힑힒힓힔힕힖힗힘힙힚힛힜힝힞힟힠힡힢힣‾_＿-－‐—―〜・,，、;；:：!！¡?？¿.．‥…。·＇‘’\\\\\\"＂“”(（)）[［]］{｛}｝〈〉《》「」『』【】〔〕§¶@＠*＊/／\\\\\\\\＼&＆#＃%％‰†‡′″〃※","Kyrgyz":"абгдеёжзийклмнӊоөпрстуүхчшъыэюяАБГДЕЁЖЗИЙКЛМНӉОӨПРСТУҮХЧШЪЫЭЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Lao":"່້໊໋໌ໍໆກຂຄງຈສຊຍດຕຖທນບປຜຝພຟມຢຣລວຫໜໝອຮຯະັາຳິີຶືຸູົຼຽເແໂໃໄ-,;:!?.()[]{}","Lithuanian":"aąbcčdeęėfghiįyjklmnoprsštuųūvzžAĄBCČDEĘĖFGHIĮYJKLMNOPRSŠTUŲŪVZŽ-‐–—,;:!?.…“„()[]{}","Latvian":"aābcčdeēfgģhiījkķlļmnņoprsštuūvzžAĀBCČDEĒFGĢHIĪJKĶLĻMNŅOPRSŠTUŪVZŽ-‐–—,;:!?.…\'‘’‚\\\\\\"“”„()[]§@*/&#†‡′″","Macedonian":"абвгдѓежзѕијклљмнњопрстќуфхцчџшАБВГДЃЕЖЗЅИЈКЛЉМНЊОПРСТЌУФХЦЧЏШ-‐–—,;:!?.…‘‚“„()[]{}","Malayalam":"‌ഃഅആഇഈഉഊഋൠഌൡഎഏഐഒഓഔകൿഖഗഘങചഛജഝഞടഠഡഢണൺതഥദധനൻപഫബഭമംയരർലൽവശഷസഹളൾഴറാിീുൂൃെേൈൊോൌൗ്-,;:!?.\'‘’\\\\\\"“”()[]{}","Mongolian":"абвгдеёжзийклмноөпрстуүфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОӨПРСТУҮФХЦЧШЩЪЫЬЭЮЯ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Marathi":"़ॐंँःअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसहळऽािीुूृॄॅेैॉोौ्-‐–—,;:!?.…\'‘’\\\\\\"“”()[]@*/&#′″","Malay":"aiubcdzefghjklmnyopqrstvwxAIUBCDZEFGHJKLMNYOPQRSTVWX-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Burmese":"ကခဂဃငစဆဇဈဉညဋဌဍဎဏတထဒဓနပဖဗဘမယရလဝသဟဠအဣဤဥဦဧဩဪာါိီုူေဲံဿျြွှ့္်း၊။‘’“”","Norwegian Bokmål":"aàbcdeéfghijklmnoóòôpqrstuvwxyzæøåAÀBCDEÉFGHIJKLMNOÓÒÔPQRSTUVWXYZÆØÅ-–,;:!?.\'\\\\\\"«»()[]{}§@*/\\\\\\\\","Nepali":"़ँंःॐअआइईउऊऋऌऍएऐऑओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलळवशषसहऽािीुूृॄॅेैॉोौ्-,;:!?.()[]{}","Dutch":"aáäbcdeéëfghiíïj\\\\u031klmnoóöpqrstúüvwxyzAÁÄBCDEÉËFGHIÍÏJUKLMNOÓÖPQRSTÚÜVWXYZ-‐–—,;:!?.…\'‘’\\"“”()[]§@*/&#†‡′″","Punjabi":"ੱੰ਼੦੧੨੩੪੫੬੭੮੯ੴੳਉਊਓਅਆਐਔੲਇਈਏਸ\\\\u0A3Cਹਕਖਗਘਙਚਛਜਝਞਟਠਡਢਣਤਥਦਧਨਪਫਬਭਮਯਰਲਵੜ੍ਾਿੀੁੂੇੈੋੌU-‐–—,;:!?.\'‘’\\"“”()[]/&′″","Polish":"aąbcćdeęfghijklłmnńoóprsśtuwyzźżAĄBCĆDEĘFGHIJKLŁMNŃOÓPRSŚTUWYZŹŻ-‐–—,;:!?.…\'\\\\\\"”„«»()[]{}§@*/&#%†‡′″°~","Portuguese":"aáàâãbcçdeéêfghiíjklmnoóòôõpqrstuúvwxyzAÁÀÂÃBCÇDEÉÊFGHIÍJKLMNOÓÒÔÕPQRSTUÚVWXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Romanian":"aăâbcdefghiîjklmnoprsștțuvxzAĂÂBCDEFGHIÎJKLMNOPRSȘTȚUVXZ-‐–—,;:!?.…\'‘\\\\\\"“”„«»()[]@*/","Russian":"абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ-‐–—,;:!?.…\'‘‚\\\\\\"“„«»()[]{}§@*/&#","Sinhala":"අආඇඈඉඊඋඌඍඑඒඓඔඕඖංඃකඛගඝඞඟචඡජඣඥඤටඨඩඪණඬතථදධනඳපඵබභමඹයරලවශෂසහළෆාැෑිීුූෘෲෟෙේෛොෝෞ්-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Slovak":"aáäbcčdďeéfghiíjklĺľmnňoóôpqrŕsštťuúvwxyýzžAÁÄBCČDĎEÉFGHIÍJKLĹĽMNŇOÓÔPQRŔSŠTŤUÚVWXYÝZŽ-‐–,;:!?.…‘‚“„()[]§@*/&","Slovenian":"abcčdefghijklmnoprsštuvzžABCČDEFGHIJKLMNOPRSŠTUVZŽ-,;:!?.()[]{}","Albanian":"abcçdheëfgjiklmnopqrstuvxyzABCÇDHEËFGJIKLMNOPQRSTUVXYZ-‐–—,;:!?.…\'‘’\\\\\\"“”«»()[]§@*/&#′″~","Serbian":"абвгдђежзијклљмнњопрстћуфхцчџшАБВГДЂЕЖЗИЈКЛЉМНЊОПРСТЋУФХЦЧЏШ-‐–,;:!?.…‘‚“„()[]{}*#","Swedish":"aàbcdeéfghijklmnopqrstuvwxyzåäöAÀBCDEÉFGHIJKLMNOPQRSTUVWXYZÅÄÖ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Swahili":"abchdefgijklmnoprstuvwyzABCHDEFGIJKLMNOPRSTUVWYZ-,;:!?.()[]{}","Tamil":"அஆஇஈஉஊஎஏஐஒஓஔஃகஙசஞடணதநபமயரலவழளறனஜஷஸஹாிீுூெேைொோௌ்-,;:!?.()[]{}","Telugu":"అఆఇఈఉఊఋౠఌౡఎఏఐఒఓఔఁంఃకఖగఘఙచఛజఝఞటఠడఢణతథదధనపఫబభమయరఱలవశషసహళాిీుూృౄెేైొోౌ్ౕౖ-,;:!?.\'‘’\\\\\\"“”()[]{}","Thai":"ฯๆ๎์็่้๊๋กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรฤลฦวศษสหฬอฮํะัาๅำิีึืุูเแโใไฺ!\\\\\\"#\'()*,-./:@[]‐–—‘’“”…′″","Tongan":"aáāeéēfhiíīklmngoóōpstuúūvʻAÁĀEÉĒFHIÍĪKLMNGOÓŌPSTUÚŪV-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Turkish":"abcçdefgğhıiİjklmnoöprsştuüvyzABCÇDEFGĞHIJKLMNOÖPRSŞTUÜVYZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Ukrainian":"абвгґдеєжзиіїйклмнопрстуфхцчшщьюяʼАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ-–,;:!?.\'\\\\\\"“„«»()[]{}§@*/\\\\\\\\№","Urdu":"اأآبپتٹثجچحخدڈذرڑزژسشصضطظعغفقکگلمنںوؤہۂھءیئےةه،؍٫٬؛:؟.۔()[]","Uzbek":"abdefghijklmnopqrstuvxyzʻcʼABDEFGHIJKLMNOPQRSTUVXYZC-‐–—,;:!?.…\'‘’\\\\\\"“”„«»()[]{}§@*/&#′″","Vietnamese":"aàảãáạăằẳẵắặâầẩẫấậbcdđeèẻẽéẹêềểễếệfghiìỉĩíịjklmnoòỏõóọôồổỗốộơờởỡớợpqrstuùủũúụưừửữứựvwxyỳỷỹýỵzAÀẢÃÁẠĂẰẲẴẮẶÂẦẨẪẤẬBCDĐEÈẺẼÉẸÊỀỂỄẾỆFGHIÌỈĨÍỊJKLMNOÒỎÕÓỌÔỒỔỖỐỘƠỜỞỠỚỢPQRSTUÙỦŨÚỤƯỪỬỮỨỰVWXYỲỶỸÝỴZ-‐–—,;:!?.…\'‘’\\\\\\"“”()[]§@*/&#†‡′″","Cantonese":"一丁七丈三上下丌不丑且世丘丙丟並中串丸丹主乃久么之乎乏乖乘乙九也乾亂了予事二于云互五井些亞亡交亥亦亨享京亮人什仁仇今介仍仔他付仙代令以仰仲件任份企伊伍伐休伙伯估伴伸似伽但佈佉位低住佔何余佛作你佩佳使來例供依侯侵便係促俄俊俗保俠信修俱俾個倍們倒候倚借倫值假偉偏做停健側偵偶偷傑備傢傣傲傳傷傻傾僅像僑僧價儀億儒儘優允元兄充兇先光克免兒兔入內全兩八公六兮共兵其具典兼冊再冒冠冬冰冷准凌凝凡凰凱出函刀分切刊列初判別利刪到制刷刺刻則剌前剛剩剪副割創劃劇劉劍力功加助努劫勁勇勉勒動務勝勞勢勤勵勸勿包匈化北匹區十千升午半卒卓協南博卜卡卯印危即卷卻厄厘厚原厭厲去參又及友反叔取受口古句另只叫召叭可台史右司吃各合吉吊同名后吐向吒君吝吞吟吠否吧含吳吵吸吹吾呀呂呆告呢周味呵呼命和咖咦咧咪咬咱哀品哇哈哉哎員哥哦哩哪哭哲唉唐唔唬售唯唱唷唸商啊問啟啡啥啦啪喀喂善喇喊喔喜喝喬單喵嗎嗚嗨嗯嘆嘉嘗嘛嘴嘻嘿器噴嚇嚴囉四回因困固圈國圍園圓圖團圜土在圭地圾址均坎坐坡坤坦坪垂垃型埃城埔域執培基堂堅堆堡堪報場塊塔塗塞填塵境增墨墮壁壇壓壘壞壢士壬壯壽夏夕外多夜夠夢夥大天太夫央失夷夸夾奇奈奉奎奏契奔套奧奪奮女奴奶她好如妙妝妥妨妮妳妹妻姆姊始姐姑姓委姿威娃娘娛婁婆婚婦媒媽嫌嫩子孔字存孝孟季孤孩孫學它宅宇守安宋完宏宗官宙定宛宜客宣室宮害家容宿寂寄寅密富寒寞察寢實寧寨審寫寬寮寵寶封射將專尊尋對導小少尖尚尤就尺尼尾局屁居屆屋屏展屠層屬山岡岩岸峰島峽崇崙崴嵐嶺川州巡工左巧巨巫差己已巳巴巷市布希帕帖帛帝帥師席帳帶常帽幅幕幣幫干平年幸幹幻幼幽幾庇床序底店庚府度座庫庭康庸廉廖廠廢廣廳延廷建弄式引弗弘弟弦弱張強彈彊彌彎彝彞形彥彩彬彭彰影役彼往征待很律後徐徑徒得從復微徵德徹心必忌忍志忘忙忠快念忽怎怒怕怖思怡急性怨怪恆恐恢恥恨恩恭息恰悅悉悔悟悠您悲悶情惑惜惠惡惱想惹愁愈愉意愚愛感慈態慕慘慢慣慧慮慰慶慾憂憐憑憲憶憾懂應懶懷懼戀戈戊戌成我戒或截戰戲戴戶房所扁扇手才扎打托扣扥扭扯批找承技抄把抓投抗折披抬抱抵抹抽拆拉拋拍拏拒拔拖招拜括拳拼拾拿持指按挑挖挪振挺捐捕捨捲捷掃授掉掌排掛採探接控推措描提插揚換握揮援損搖搜搞搬搭搶摘摩摸撐撒撞撣撥播撾撿擁擇擊擋操擎擔據擠擦擬擴擺擾攝支收改攻放政故效敍敏救敗敘教敝敢散敦敬整敵數文斐斗料斯新斷方於施旁旅旋族旗既日旦早旭旺昂昆昇昌明昏易星映春昨昭是時晉晒晚晨普景晴晶智暑暖暗暫暴曆曉曰曲更書曼曾替最會月有朋服朗望朝期木未末本札朱朵杉李材村杜束杯杰東松板析林果枝架柏某染柔查柬柯柳柴校核根格桃案桌桑梁梅條梨梯械梵棄棉棋棒棚森椅植椰楊楓楚業極概榜榮構槍樂樓標樞模樣樹橋機橫檀檔檢欄權次欣欲欺欽款歉歌歐歡止正此步武歲歷歸死殊殘段殺殼毀毅母每毒比毛毫氏民氣水永求汗汝江池污汪汶決汽沃沈沉沒沖沙河油治沿況泉泊法泡波泥注泰泳洋洗洛洞洩洪洲活洽派流浦浩浪浮海涇消涉涯液涵涼淑淚淡淨深混淺清減渡測港游湖湯源準溝溪溫滄滅滋滑滴滾滿漂漏演漠漢漫漲漸潔潘潛潮澤澳激濃濟濤濫濱瀏灌灣火灰災炎炮炸為烈烏烤無焦然煙煞照煩熊熟熱燃燈燒營爆爐爛爪爬爭爵父爸爺爽爾牆片版牌牙牛牠牧物牲特牽犧犯狀狂狐狗狠狼猛猜猴猶獄獅獎獨獲獸獻玄率玉王玩玫玲玻珊珍珠珥班現球理琉琪琴瑙瑜瑞瑟瑤瑪瑰環瓜瓦瓶甘甚甜生產用田由甲申男甸界留畢略番畫異當疆疏疑疼病痕痛痴瘋療癡癸登發白百的皆皇皮盃益盛盜盟盡監盤盧目盲直相盼盾省眉看真眠眼眾睛睡督瞧瞭矛矣知短石砂砍研砲破硬碎碗碟碧碩碰確碼磁磨磯礎礙示社祕祖祚祛祝神祥票祿禁禍禎福禪禮秀私秋科秒秘租秤秦移稅程稍種稱稿穆穌積穩究穹空穿突窗窩窮窶立站竟章童端競竹笑笛符笨第筆等筋答策简算管箭箱節範篇築簡簫簽簿籃籌籍籤米粉粗粵精糊糕糟系糾紀約紅納紐純紙級紛素索紫累細紹終組結絕絡給統絲經綜綠維綱網緊緒線緣編緩緬緯練縛縣縮縱總績繁繆織繞繪繳繼續缸缺罕罪置罰署罵罷羅羊美羞群義羽翁習翔翰翹翻翼耀老考者而耍耐耗耳耶聊聖聚聞聯聰聲職聽肉肚股肥肩肯育背胎胖胞胡胸能脆脫腓腔腦腰腳腿膽臉臘臣臥臨自臭至致臺與興舉舊舌舍舒舞舟航般船艦良色艾芝芬花芳若苦英茅茫茲茶草荒荷荼莉莊莎莫菜菩華菲萄萊萬落葉著葛葡蒂蒙蒲蒼蓋蓮蔕蔡蔣蕭薄薦薩薪藉藍藏藝藤藥蘆蘇蘭虎處虛號虧蛇蛋蛙蜂蜜蝶融螢蟲蟹蠍蠻血行術街衛衝衡衣表袋被裁裂裕補裝裡製複褲西要覆見規視親覺覽觀角解觸言訂計訊討訓託記訥訪設許訴註証評詞詢試詩話該詳誇誌認誓誕語誠誤說誰課誼調談請諒論諸諺諾謀謂講謝證識譜警譯議護譽讀變讓讚谷豆豈豐象豪豬貌貓貝貞負財貢貨貪貫責貴買費貼賀資賈賓賜賞賢賣賤賦質賭賴賺購賽贈贊贏赤赫走起超越趕趙趣趨足跌跎跑距跟跡路跳踏踢蹟蹤躍身躲車軌軍軒軟較載輔輕輛輝輩輪輯輸轉轟辛辦辨辭辯辰辱農迅迎近返迦迪迫述迴迷追退送逃逆透逐途這通逛逝速造逢連週進逸逼遇遊運遍過道達違遙遜遠適遭遮遲遷選遺避邀邁還邊邏那邦邪邱郎部郭郵都鄂鄉鄭鄰酉配酒酷酸醉醒醜醫采釋里重野量金針釣鈴鉢銀銅銖銘銳銷鋒鋼錄錢錦錫錯鍋鍵鍾鎊鎖鎮鏡鐘鐵鑑長門閃閉開閏閒間閣閱闆闊闍闐關闡防阻阿陀附降限院陣除陪陰陳陵陶陷陸陽隆隊階隔際障隨險隱隻雄雅集雉雖雙雜雞離難雨雪雲零雷電需震霍霧露霸霹靂靈青靖靜非靠面革靼鞋韃韋韓音韻響頁頂項順須預頑頓頗領頞頭頻顆題額顏願類顧顯風飄飛食飯飲飽飾餅養餐餘館首香馬駐駕駛騎騙騷驅驗驚骨體高髮鬆鬥鬧鬱鬼魁魂魅魔魚魯鮮鳥鳳鳴鴻鵝鷹鹿麗麥麵麻麼黃黎黑默點黨鼓鼠鼻齊齋齒齡龍龜‾﹉﹊﹋﹌_＿﹍﹎﹏︳︴-－﹣‐–︲—﹘︱,，﹐、﹑;；﹔:：﹕!！﹗?？﹖.．﹒‥︰…。·＇‘’\\\\\\"＂“”〝〞(（﹙︵)）﹚︶[［]］{｛﹛︷}｝﹜︸〈︿〉﹀《︽》︾「﹁」﹂『﹃』﹄【︻】︼〔﹝︹〕﹞︺§@＠﹫*＊﹡/／\\\\\\\\＼﹨&＆﹠#＃﹟%％﹪‰†‡‧′″‵〃※","Chinese":"一丁七万丈三上下丌不与丑专且世丘丙业东丝丢两严丧个中丰串临丸丹为主丽举乃久么义之乌乍乎乏乐乔乖乘乙九也习乡书买乱乾了予争事二于亏云互五井亚些亡交亥亦产亨享京亮亲人亿什仁仅仇今介仍从仔他付仙代令以仪们仰仲件价任份仿企伊伍伏伐休众优伙会伟传伤伦伯估伴伸似伽但位低住佐佑体何余佛作你佤佩佳使例供依侠侦侧侨侬侯侵便促俄俊俗保信俩修俱俾倍倒候倚借倦值倾假偌偏做停健偶偷储催傲傻像僧儒儿允元兄充兆先光克免兑兔党入全八公六兮兰共关兴兵其具典兹养兼兽内冈册再冒写军农冠冬冰冲决况冷准凌减凝几凡凤凭凯凰出击函刀分切刊刑划列刘则刚创初判利别到制刷券刺刻剂前剑剧剩剪副割力劝办功加务劣动助努劫励劲劳势勇勉勋勒勤勾勿包匆匈化北匙匹区医十千升午半华协卒卓单卖南博占卡卢卫卯印危即却卷厂厄厅历厉压厌厍厚原去县参又叉及友双反发叔取受变叙口古句另只叫召叭可台史右叶号司叹吃各合吉吊同名后吐向吓吗君吝吟否吧含听启吵吸吹吻吾呀呆呈告呐员呜呢呦周味呵呼命和咖咦咧咨咪咬咯咱哀品哇哈哉响哎哟哥哦哩哪哭哲唉唐唤唬售唯唱唷商啊啡啥啦啪喀喂善喇喊喏喔喜喝喵喷喻嗒嗨嗯嘉嘛嘴嘻嘿器四回因团园困围固国图圆圈土圣在圭地圳场圾址均坎坐坑块坚坛坜坡坤坦坪垂垃型垒埃埋城埔域培基堂堆堕堡堪塑塔塞填境增墨壁壤士壬壮声处备复夏夕外多夜够夥大天太夫央失头夷夸夹夺奇奈奉奋奏契奔奖套奥女奴奶她好如妇妈妖妙妥妨妮妹妻姆姊始姐姑姓委姿威娃娄娘娜娟娱婆婚媒嫁嫌嫩子孔孕字存孙孜孝孟季孤学孩宁它宇守安宋完宏宗官宙定宛宜宝实审客宣室宪害宴家容宽宾宿寂寄寅密寇富寒寝寞察寡寨寸对寻导寿封射将尊小少尔尖尘尚尝尤就尺尼尽尾局屁层居屋屏展属屠山岁岂岗岘岚岛岳岸峡峰崇崩崴川州巡工左巧巨巫差己已巳巴巷币市布帅师希帐帕帖帝带席帮常帽幅幕干平年并幸幻幼幽广庆床序库应底店庙庚府庞废度座庭康庸廉廖延廷建开异弃弄弊式引弗弘弟张弥弦弯弱弹强归当录彝形彩彬彭彰影彷役彻彼往征径待很律後徐徒得循微徵德心必忆忌忍志忘忙忠忧快念忽怀态怎怒怕怖思怡急性怨怪总恋恐恢恨恩恭息恰恶恼悄悉悔悟悠患您悲情惑惜惠惧惨惯想惹愁愈愉意愚感愧慈慎慕慢慧慰憾懂懒戈戊戌戏成我戒或战截戴户房所扁扇手才扎扑打托扣执扩扫扬扭扮扯批找承技抄把抑抓投抗折抢护报披抬抱抵抹抽担拆拉拍拒拔拖拘招拜拟拥拦拨择括拳拷拼拾拿持指按挑挖挝挡挤挥挪振挺捉捐捕损捡换据捷授掉掌排探接控推掩措掸描提插握援搜搞搬搭摄摆摊摔摘摩摸撒撞播操擎擦支收改攻放政故效敌敏救教敝敢散敦敬数敲整文斋斐斗料斜斥断斯新方於施旁旅旋族旗无既日旦旧旨早旭时旺昂昆昌明昏易星映春昨昭是显晃晋晒晓晚晨普景晴晶智暂暑暖暗暮暴曰曲更曹曼曾替最月有朋服朗望朝期木未末本札术朱朵机杀杂权杉李材村杜束条来杨杯杰松板极构析林果枝枢枪枫架柏某染柔查柬柯柳柴标栋栏树校样核根格桃框案桌桑档桥梁梅梦梯械梵检棉棋棒棚森椅植椰楚楼概榜模樱檀欠次欢欣欧欲欺款歉歌止正此步武歪死殊残段毅母每毒比毕毛毫氏民气氛水永求汇汉汗汝江池污汤汪汶汽沃沈沉沙沟没沧河油治沿泉泊法泛泡波泣泥注泰泳泽洋洗洛洞津洪洲活洽派流浅测济浏浑浓浙浦浩浪浮浴海涅消涉涛涨涯液涵淋淑淘淡深混添清渐渡渣温港渴游湖湾源溜溪滋滑满滥滨滴漂漏演漠漫潘潜潮澎澳激灌火灭灯灰灵灿炉炎炮炸点烂烈烤烦烧热焦然煌煞照煮熊熟燃燕爆爪爬爱爵父爷爸爽片版牌牙牛牡牢牧物牲牵特牺犯状犹狂狐狗狠独狮狱狼猛猜猪献猴玄率玉王玛玩玫环现玲玻珀珊珍珠班球理琊琪琳琴琼瑙瑜瑞瑟瑰瑶璃瓜瓦瓶甘甚甜生用田由甲申电男甸画畅界留略番疆疏疑疗疯疲疼疾病痕痛痴癸登白百的皆皇皮盈益监盒盖盘盛盟目直相盼盾省眉看真眠眼着睛睡督瞧矛矣知短石矶码砂砍研破础硕硬确碍碎碗碟碧碰磁磅磨示礼社祖祚祝神祥票祯祸禁禅福离秀私秋种科秒秘租秤秦秩积称移稀程稍税稣稳稿穆究穷穹空穿突窗窝立站竞竟章童端竹笑笔笛符笨第等筋筑答策筹签简算管箭箱篇篮簿籍米类粉粒粗粤粹精糊糕糖糟系素索紧紫累繁红约级纪纯纲纳纵纷纸纽线练组细织终绍经结绕绘给络绝统继绩绪续维绵综绿缅缓编缘缠缩缴缶缸缺罐网罕罗罚罢罪置署羊美羞群羯羽翁翅翔翘翠翰翻翼耀老考者而耍耐耗耳耶聊职联聘聚聪肉肖肚股肤肥肩肯育胁胆背胎胖胜胞胡胶胸能脆脑脱脸腊腐腓腰腹腾腿臂臣自臭至致舌舍舒舞舟航般舰船良色艺艾节芒芝芦芬芭花芳苍苏苗若苦英茂范茨茫茶草荐荒荣药荷莉莎莪莫莱莲获菜菩菲萄萍萤营萧萨落著葛葡蒂蒋蒙蓉蓝蓬蔑蔡薄薪藉藏藤虎虑虫虹虽虾蚁蛇蛋蛙蛮蜂蜜蝶融蟹蠢血行街衡衣补表袋被袭裁裂装裕裤西要覆见观规视览觉角解言誉誓警计订认讨让训议讯记讲讷许论设访证评识诉词译试诗诚话诞询该详语误说请诸诺读课谁调谅谈谊谋谓谜谢谨谱谷豆象豪貌贝贞负贡财责贤败货质贩贪购贯贱贴贵贸费贺贼贾资赋赌赏赐赔赖赚赛赞赠赢赤赫走赵起趁超越趋趣足跃跌跑距跟路跳踏踢踩身躲车轨轩转轮软轰轻载较辅辆辈辉辑输辛辞辨辩辰辱边达迁迅过迈迎运近返还这进远违连迟迦迪迫述迷追退送适逃逆选逊透逐递途通逛逝速造逢逸逻逼遇遍道遗遭遮遵避邀邓那邦邪邮邱邻郎郑部郭都鄂酉酋配酒酷酸醉醒采释里重野量金针钓钟钢钦钱钻铁铃铜铢铭银铺链销锁锅锋错锡锦键锺镇镜镭长门闪闭问闰闲间闷闹闻阁阅阐阔队阮防阳阴阵阶阻阿陀附际陆陈降限院除险陪陵陶陷隆随隐隔障难雄雅集雉雨雪雯雳零雷雾需震霍霖露霸霹青靖静非靠面革靼鞋鞑韦韩音页顶项顺须顽顾顿预领颇频颗题额风飘飙飞食餐饭饮饰饱饼馆首香馨马驱驶驻驾验骑骗骚骤骨高鬼魂魅魔鱼鲁鲜鸟鸡鸣鸭鸿鹅鹤鹰鹿麦麻黄黎黑默鼓鼠鼻齐齿龄龙龟﹉﹊﹋﹌_＿﹍﹎﹏︳︴-－﹣‐–—︱―,，﹐、﹑;；﹔:：﹕!！﹗?？﹖.．﹒‥︰…。·＇‘’\\\\\\"＂“”〝〞(（﹙︵)）﹚︶[［]］{｛﹛︷}｝﹜︸〈︿〉﹀《︽》︾「﹁」﹂『﹃』﹄【︻】︼〔﹝︹〕﹞︺〖〗‖§@＠﹫*＊﹡/／\\\\\\\\＼﹨&＆﹠#＃﹟%％﹪‰′″‵〃※","Zulu":"abhcdlyefgqxijkpmntsoruvwzABHCDLYEFGQXIJKPMNTSORUVWZ-,;:!?.()[]{}"}\n';
-}),define("specimenTools/services/FontsData",["specimenTools/_BaseWidget","!require/text!specimenTools/services/languageCharSets.json"],function(e,t){"use strict";function n(t,n){e.call(this,n),this._pubSub=t,this._pubSub.subscribe("loadFont",this._onLoadFont.bind(this)),this._data=[],Object.defineProperty(this._data,"globalCache",{value:Object.create(null)})}function r(e,t){var n,r,a,s,i,o=[];for(a=t[1],s=Object.keys(a).sort(),n=0,r=s.length;n<r;n++)i=a[s[n]],"normal"in i&&o.push(i.normal),"italic"in i&&o.push(i.italic);return e.concat(o)}var a={250:"Thin",275:"ExtraLight",300:"Light",400:"Regular",500:"Medium",600:"SemiBold",700:"Bold",800:"ExtraBold",900:"Black",260:"Thin",280:"ExtraLight"},s={250:"100",275:"200",300:"300",400:"400",500:"500",600:"600",700:"700",800:"800",900:"900",260:"100",280:"200"},i=n.prototype=Object.create(e.prototype);return i.constructor=n,n.defaultOptions={useLaxDetection:!1},n._cacheDecorator=function(e){return function(t){var n,r,a,s,i=[];for(n=0,r=arguments.length;n<r;n++)i[n]=arguments[n];return a=this._aquireFontData(t),s=e in a.cache?a.cache[e]:a.cache[e]=this[e].apply(this,i)}},n._installPublicCachedInterface=function(e){var t,r;for(t in e)r=t.slice(1),0!==t.indexOf("_get")||"function"!=typeof e[t]||r in e||(e[r]=n._cacheDecorator(t))},n._getFeatures=function(e,t,n){var r,a,s,i;for(r=0,a=n.length;r<a;r++)s=n[r],i=e[s].tag,this[i]||(this[i]=[]),this[i].push(t)},n.getFeatures=function(e){var t,r,a,s,i,o,l,u,c,h={};if(!("gsub"in e.tables&&e.tables.gsub.scripts))return h;for(t=e.tables.gsub,r=e.tables.gsub.scripts,a=0,s=r.length;a<s;a++){if(l=r[a].script,u=r[a].tag,l.defaultLangSys&&(c="Default",n._getFeatures.call(h,t.features,[u,c].join(":"),l.defaultLangSys.featureIndexes)),l.langSysRecords)for(i=0,o=l.langSysRecords.length;i<o;i++)c=l.langSysRecords[i].tag,n._getFeatures.call(h,t.features,[u,c].join(":"),l.langSysRecords[i].langSys.featureIndexes);return h}},n.languageCharSets=JSON.parse(t),n.sortCoverage=function(e,t){return e[1]===t[1]?e[0].localeCompare(t[0]):t[1]-e[1]},n.DEFAULT_LAX_CHAR_LIST=new Set([8208,8242,8243,10216,10217,8274]),n.getLanguageCoverage=function(e,t){var r,a,s,i,o,l,u,c,h,f,p,d=[];if("string"==typeof t)for(p=new Set,c=0,h=t.length;c<h;c++)p.add(t.codePointAt(c));else p=n.DEFAULT_LAX_CHAR_LIST;for(i in n.languageCharSets){for(o=n.languageCharSets[i],u=0,f=h=o.length,r=[],a=[],s=[],c=0;c<h;c++)l=o.codePointAt(c),l in e.encoding.cmap.glyphIndexMap?(u+=1,r.push(l)):t&&p.has(l)?(f-=1,s.push(l)):a.push(l);d.push([i,u/f,u,f,a,r,s])}return d.sort(n.sortCoverage),d},i._aquireFontData=function(e){var t=this._data[e];if(!t)throw new Error('FontIndex "'+e+'" is not available.');return t},i._onLoadFont=function(e,t,n,r){this._data[e]={font:n,fileName:t,originalArraybuffer:r,cache:Object.create(null)}},i._getLanguageCoverage=function(e){return n.getLanguageCoverage(this._data[e].font,this._options.useLaxDetection)},i._getLanguageCoverageStrict=function(e){return n.getLanguageCoverage(this._data[e].font,!1)},i._getLanguageCoverageLax=function(e){return n.getLanguageCoverage(this._data[e].font,!0)},i._getSupportedLanguages=function(e){var t,n,r,a,s=this.getLanguageCoverage(e),i=[];for(t=0,n=s.length;t<n;t++)r=s[t][0],a=s[t][1],1===a&&i.push(r);return i.sort(),i},i._getNumberGlyphs=function(e){return this._data[e].font.glyphNames.names.length},i._getFeatures=function(e){return n.getFeatures(this._data[e].font)},i._getFamilyName=function(e){var t,n=this._data[e].font;return t=n.names.postScriptName.en||Object.values(n.names.postScriptName)[0]||n.names.fontFamily,t=t.split("-")[0]},i._getOS2FontWeight=function(e){var t=this._data[e].font;return t.tables.os2.usWeightClass},i._getCSSFamilyName=i._getFamilyName,i._getIsItalic=function(e){var t=this._data[e].font;return!!(t.tables.os2.fsSelection&t.fsSelectionValues.ITALIC)},i.getFamiliesData=function(){var e="getFamiliesData";if(e in this._data.globalCache)return this._data.globalCache[e];var t,n,r,a,s,i,o,l,u=Object.create(null);for(i=0,o=this._data.length;i<o;i++)r=this.getFamilyName(i),a=this.getCSSWeight(i),s=this.getCSSStyle(i),t=u[r],t||(u[r]=t=Object.create(null)),n=t[a],n||(t[a]=n=Object.create(null)),s in n?console.warn("A font with weight "+a+' and style "'+s+'" has already appeared for "'+r+'".\nFirst was the file: '+n[s]+" "+this.getFileName(n[s])+".\nNow the file: "+i+" "+this.getFileName(i)+" is in conflict.\nThis may hint to a bad OS/2 table entry.\nSkipping."):n[s]=i;return l=Object.keys(u).sort().map(function(e){return[e,this[e]]},u),this._data.globalCache[e]=l,l},i.getNumberSupportedLanguages=function(e){return this.getSupportedLanguages(e).length},i.getFont=function(e){return this._aquireFontData(e).font},i.getFileName=function(e){return this._aquireFontData(e).fileName},i.getOriginalArraybuffer=function(e){return this._aquireFontData(e).originalArraybuffer},i.getCSSWeight=function(e){return s[this.getOS2FontWeight(e)]},i.getWeightName=function(e){return a[this.getOS2FontWeight(e)]},i.getCSSStyle=function(e){return this.getIsItalic(e)?"italic":"normal"},i.getStyleName=function(e){return this.getWeightName(e)+(this.getIsItalic(e)?" Italic":"")},i.getPostScriptName=function(e){return this._aquireFontData(e).font.names.postScriptName},i.getGlyphByName=function(e,t){var n=this._aquireFontData(e).font,r=n.glyphNames.nameToGlyphIndex(t),a=n.glyphs.get(r);return a},i.getFontValue=function(e,t){var n=this._aquireFontData(e).font;switch(t){case"xHeight":return n.tables.os2.sxHeight;case"capHeight":return n.tables.os2.sCapHeight;case"ascender":case"descender":return n[t];default:console.warn("getFontValue: don't know how to get \""+t+'".')}},i.getFontIndexesInFamilyOrder=function(){var e=this.getFamiliesData();return e.reduce(r,[])},i.getFontIndexes=function(){var e,t,n=[];for(e=0,t=this._data.length;e<t;e++)n.push(e);return n},n._installPublicCachedInterface(i),n}),define("specimenTools/services/WebfontProvider",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._window=t,this._pubSub=n,this._fontData=r,this._pubSub.subscribe("loadFont",this._onLoadFont.bind(this)),this._data=[],this._blobs=[],this.__stylesheet=null}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={},Object.defineProperty(n,"_styleSheet",{get:function(){if(!this.__stylesheet){var e=this._window.document.createElement("style");e.appendChild(this._window.document.createTextNode("")),this._window.document.head.appendChild(e),this.__stylesheet=e.sheet}return this.__stylesheet}}),n._makeWebfont=function(e){var t,n,r,a,s=this._fontData.getOriginalArraybuffer(e),i=this._fontData.getCSSFamilyName(e),o=this._fontData.getCSSWeight(e),l=this._fontData.getCSSStyle(e);this._data[e]=a=Object.create(null),a["font-style"]=l,a["font-weight"]=o,a["font-family"]=i,Object.defineProperty(a,"_props",{value:null,enumerable:!1,writable:!0}),"FontFace"in this._window?(t=new this._window.FontFace(i,s,{weight:o,style:l}),this._window.document.fonts.add(t)):(r=new this._window.Blob([s],{type:"font/opentype"}),this._blobs[e]=r,n=this._window.URL.createObjectURL(r),this._styleSheet.insertRule(["@font-face {",this.getStyleProperties(e),"src: url("+n+");","}"].join(""),this._styleSheet.cssRules.length))},n._onLoadFont=function(e){this._makeWebfont(e)},n.getStyleProperties=function(e){var t,n,r=this._data[e];if(!r)throw new Error('FontIndex "'+e+'" is not loaded.');if(t=r._props,!t){t=[];for(n in r)t.push(n,": ",r[n],";");t=t.join("")}return t},n.setStyleOfElement=function(e,t){var n,r=this._data[e];if(!r)throw new Error('FontIndex "'+e+'" is not loaded.');for(n in r)t.style[this._cssName2jsName(n)]=r[n]},t}),define("Atem-Errors/errors",[],function(){"use strict";function e(e){var n=new t.Unhandled(e+"\n"+e.stack);n.originalError=e,setTimeout(function(){throw n},0)}var t=Object.create(null),n=function(e,t,n,r){void 0===r&&(r=Error),void 0===n&&(n=function(e,r){void 0!==e&&(this.name=t+"Error",this.message=e||"(no error message)"),r||"function"!=typeof Error.captureStackTrace?this.stack=r||(new Error).stack||"(no stack available)":Error.captureStackTrace(this,n)}),n.prototype=Object.create(r.prototype),n.prototype.constructor=n,e[t]=n};return t.makeError=n,n(t,"Error"),n(t,"Unhandled"),n(t,"Type",void 0,TypeError),n(t,"Assertion",void 0,t.Error),n(t,"Value",void 0,t.Error),n(t,"Key",void 0,t.Error),n(t,"NotImplemented",void 0,t.Error),n(t,"Deprecated",void 0,t.Error),n(t,"AbstractInterface",void 0,t.Error),n(t,"Event",void 0,t.Error),n(t,"Emitter",void 0,t.Event),n(t,"Receiver",void 0,t.Event),t.assert=function(e,n){if(!e)throw new t.Assertion(n)},t.warn=function(e){"undefined"!=typeof console&&console.warn&&console.warn("WARNING: "+e)},t.unhandledPromise=e,Object.freeze(t),t}),define("Atem-Pen-Case/tools/decomposeSuperSegments",["Atem-Errors/errors"],function(e){"use strict";function t(e){var t,n,a,s,i,o,l,u=e.length-1,c=[],h=e[0],f=null,p=null;for(r(u>1,"Expecting at least 3 Points here"),t=2;t<=u;t++)for(a=Math.min(t,3,u-t+2),n=1;n<a;n++)s=n/a,i=e[t-1],o=e[t-2],l=[o[0]+s*(i[0]-o[0]),o[1]+s*(i[1]-o[1])],null===f?f=l:(p=[.5*(f[0]+l[0]),.5*(f[1]+l[1])],c.push([h,f,p]),h=l,f=null,p=null);return c.push([h,e[e.length-2],e[e.length-1]]),c}function n(e){var t,n,a,s,i,o,l=e.length-1,u=[];for(r(l>0,"Expecting at least 2 Points here"),t=0;t<l-1;t++)n=e[t][0],a=e[t][1],s=e[t+1][0],i=e[t+1][1],o=[.5*(n+s),.5*(a+i)],u.push([e[t],o]);return u.push([e[e.length-2],e[e.length-1]]),u}var r=e.assert;return{decomposeSuperBezierSegment:t,decomposeQuadraticSegment:n}}),define("Atem-Pen-Case/pens/AbstractPen",["Atem-Errors/errors"],function(e){"use strict";function t(){}var n=e.NotImplemented,r=t.prototype;return r.moveTo=function(e){throw new n("AbstractPen has not implemented moveTo")},r.lineTo=function(e){throw new n("AbstractPen has not implemented lineTo")},r.curveTo=function(){throw new n("AbstractPen has not implemented curveTo")},r.qCurveTo=function(){throw new n("AbstractPen has not implemented qCurveTo")},r.closePath=function(){},r.endPath=function(){},r.addComponent=function(e,t){throw new n("AbstractPen has not implemented addComponent")},t}),define("Atem-Math-Tools/transform",["Atem-Errors/errors"],function(e){"use strict";function t(e){return Math.abs(e)<i?e=0:e>o?e=1:e<l&&(e=-1),e}function n(e){var t=[1,0,0,1,0,0];if(this.__get=function(e){if(void 0===t[e])throw new s("The key "+e+"does not exist in"+this);return t[e]},this.__affine=function(){return t.slice(0)},void 0!==e)for(var n=0;n<6;n++)void 0!==e[n]&&null!==e[n]&&(t[n]=e[n])}function r(e,t){return e=e||0,t=t||0,new n([1,0,0,1,e,t])}function a(e,t){return void 0!==t&&null!==t||(t=e),new n([e,0,0,t,0,0])}var s=e.Key,i=1e-15,o=1-i,l=-1+i,u=n.prototype;u.transformPoint=function(e){var t=this[0],n=this[1],r=this[2],a=this[3],s=this[4],i=this[5],o=e[0],l=e[1];return[t*o+r*l+s,n*o+a*l+i]},u.transformPoints=function(e){return e.map(this.transformPoint,this)},u.translate=function(e,t){return e=e||0,t=t||0,this.transform([1,0,0,1,e,t])},u.scale=function(e,t){return void 0===e&&(e=1),void 0!==t&&null!==t||(t=e),this.transform([e,0,0,t,0,0])},u.rotate=function(e){var n=t(Math.cos(e)),r=t(Math.sin(e));return this.transform([n,r,-r,n,0,0])},u.skew=function(e,t){return e=e||0,t=t||0,this.transform([1,Math.tan(t),Math.tan(e),1,0,0])},u.transform=function(e){var t=e[0],r=e[1],a=e[2],s=e[3],i=e[4],o=e[5],l=this[0],u=this[1],c=this[2],h=this[3],f=this[4],p=this[5];return new n([t*l+r*c,t*u+r*h,a*l+s*c,a*u+s*h,l*i+c*o+f,u*i+h*o+p])},u.reverseTransform=function(e){var t=this[0],r=this[1],a=this[2],s=this[3],i=this[4],o=this[5],l=e[0],u=e[1],c=e[2],h=e[3],f=e[4],p=e[5];return new n([t*l+r*c,t*u+r*h,a*l+s*c,a*u+s*h,l*i+c*o+f,u*i+h*o+p])},u.inverse=function(){if(this.cmp(c))return this;var e=this[0],t=this[1],r=this[2],a=this[3],s=this[4],i=this[5],o=e*a-r*t,l=a/o,u=-t/o,h=-r/o,f=e/o,p=-l*s-h*i,d=-u*s-f*i;return new n([l,u,h,f,p,d])},u.toPS=function(){return["[",this.__affine().join(" "),"]"].join("")},u.cmp=function(e){return e[0]===this[0]&&e[1]===this[1]&&e[2]===this[2]&&e[3]===this[3]&&e[4]===this[4]&&e[5]===this[5]},u.valueOf=function(){return["<Transform ",this.toPS(),">"].join("")},u.toString=function(){return this.__affine().join(" ")},Object.defineProperty(u,"length",{get:function(){return 6}}),u.slice=function(e,t){return this.__affine().slice(e,t)},Object.defineProperties(u,{0:{get:function(){return this.__get(0)}},1:{get:function(){return this.__get(1)}},2:{get:function(){return this.__get(2)}},3:{get:function(){return this.__get(3)}},4:{get:function(){return this.__get(4)}},5:{get:function(){return this.__get(5)}}});var c=new n;return{Transform:n,Identity:c,Offset:r,Scale:a}}),define("Atem-Pen-Case/pens/TransformPen",["./AbstractPen","Atem-Math-Tools/transform"],function(e,t){"use strict";function n(e,t){t instanceof Array&&(t=new r(t)),this._transformation=t,this._transformPoint=function(e){return t.transformPoint(e)},this._outPen=e,this._stack=[]}var r=t.Transform,a=n.prototype=Object.create(e.prototype);return a.constructor=n,a.moveTo=function(e){this._outPen.moveTo(this._transformPoint(e))},a.lineTo=function(e){this._outPen.lineTo(this._transformPoint(e))},a.curveTo=function(){var e=[].slice.call(arguments);this._outPen.curveTo.apply(this._outPen,this._transformPoints(e))},a.qCurveTo=function(){var e=[].slice.call(arguments);null===e[e.length-1]?(e=this._transformPoints(e.slice(0,-1)),e.push(null)):e=this._transformPoints(e),this._outPen.qCurveTo.apply(this._outPen,e)},a._transformPoints=function(e){return e.map(this._transformPoint)},a.closePath=function(){this._outPen.closePath()},a.addComponent=function(e,t){t=this._transformation.transform(t),this._outPen.addComponent(e,t)},n}),define("Atem-Pen-Case/pens/BasePen",["Atem-Errors/errors","Atem-Pen-Case/tools/decomposeSuperSegments","./AbstractPen","./TransformPen"],function(e,t,n,r){"use strict";function a(e){this.glyphSet=e,this.__currentPoint=null}var s=e.NotImplemented,i=e.Assertion,o=t.decomposeSuperBezierSegment,l=t.decomposeQuadraticSegment,u=e.assert,c=a.prototype=Object.create(n.prototype);return c.constructor=a,c._moveTo=function(e,t){throw new s("implement _moveTo")},c._lineTo=function(e){throw new s("implement _lineTo")},c._curveToOne=function(e,t,n){throw new s("implement _curveToOne")},c._closePath=function(){},c._endPath=function(){},c._qCurveToOne=function(e,t){var n=this.__currentPoint[0],r=this.__currentPoint[1],a=e[0],s=e[1],i=t[0],o=t[1],l=n+.6666666666666666*(a-n),u=r+.6666666666666666*(s-r),c=i+.6666666666666666*(a-i),h=o+.6666666666666666*(s-o);this._curveToOne([l,u],[c,h],t)},c.addComponent=function(e,t,n){var a="function"==typeof this.glyphSet.get?this.glyphSet.get(e):this.glyphSet[e];if(void 0!==a){var s=new r(this,t);a.draw(!1,s)}},c._getCurrentPoint=function(){return this.__currentPoint},c.closePath=function(){this._closePath(),this.__currentPoint=null},c.endPath=function(){this._endPath(),this.__currentPoint=null},c.moveTo=function(e,t){this._moveTo.apply(this,arguments),this.__currentPoint=e},c.lineTo=function(e){this._lineTo(e),this.__currentPoint=e},c.curveTo=function(){var e=[].slice.call(arguments),t=e.length-1;if(u(t>=0,"curveTo needs at least one point"),2===t)this._curveToOne.apply(this,e),this.__currentPoint=e[e.length-1];else if(t>2){var n,r,a=this._curveToOne,s=o(e);for(r in s)n=s[r],a.apply(this,n),this.__currentPoint=n[2]}else if(1===t)this.qCurveTo.apply(this,e);else{if(0!==t)throw new i("curveTo() can't get there from here");this.lineTo(e[0])}},c.qCurveTo=function(){var e=[].slice.call(arguments),t=e.length-1;if(u(t>=0,"qCurveTo needs at least one point"),null===e[e.length-1]){var n=e[e.length-2][0],r=e[e.length-2][1],a=e[0][0],s=e[0][1],i=[.5*(n+a),.5*(r+s)];this.__currentPoint=i,this._moveTo(i),e.splice(-1,1,i)}if(t>0){var o,c,h=this._qCurveToOne,f=l(e);for(c in f)o=f[c],h.apply(this,o),this.__currentPoint=o[1]}else this.lineTo(e[0])},a}),define("Atem-Pen-Case/pens/SVGPen",["./BasePen"],function(e){"use strict";function t(t,n){e.call(this,n),this.path=t}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,n._addSegment=function(e){var t=this.path.getAttribute("d");this.path.setAttribute("d",(t?t+" ":"")+e)},n._moveTo=function(e){this._addSegment(["M",e[0],e[1]].join(" "))},n._lineTo=function(e){this._addSegment(["L",e[0],e[1]].join(" "))},n._curveToOne=function(e,t,n){this._addSegment(["C",e[0],e[1],t[0],t[1],n[0],n[1]].join(" "))},n._closePath=function(){this._addSegment("z")},n.clear=function(){this.path.setAttribute("d","")},t}),define("specimenTools/widgets/GlyphTable",["specimenTools/_BaseWidget","Atem-Pen-Case/pens/SVGPen"],function(e,t){"use strict";function n(t,n,r){e.call(this,r),this._element=t.createElement("div"),this._font=n,this._setDimensions=null,this._loadProgress=[0,null],this.__initCells=this._initCells.bind(this),this._element.addEventListener("click",this._glyphClickHandler.bind(this))}function r(e,t){var n,r,a;for(n=0,r=e.path.commands.length;n<r;n++)switch(a=e.path.commands[n],a.type){case"M":t.moveTo([a.x,a.y]);break;case"Z":t.closePath();break;case"Q":t.qCurveTo([a.x1,a.y1],[a.x,a.y]);break;case"C":t.curveTo([a.x1,a.y1],[a.x2,a.y2],[a.x,a.y]);break;case"L":t.lineTo([a.x,a.y]);break;default:console.warn("Unknown path command:",a.type)}}var a="http://www.w3.org/2000/svg",s=n.prototype=Object.create(e.prototype);return s.constructor=n,n.defaultOptions={glyphClass:"glyph",loadAtOnce:50,loadSerial:!1,glyphActiveClass:"active"},Object.defineProperty(s,"element",{get:function(){return this.activate(),this._element}}),s.setDimensions=function(e,t,n){this._setDimensions={width:e,ascent:t,descent:n}},s.getDimensions=function(e){var t,n,r,a,s;return!e&&this._setDimensions?(r=this._setDimensions.width,t=this._setDimensions.ascent,n=this._setDimensions.descent):(a=this._font.tables.head.yMax,s=this._font.tables.head.yMin,r=a+(s>0?0:Math.abs(s)),t=this._font.tables.os2.usWinAscent,n=this._font.tables.os2.usWinDescent),{width:r,height:t+n,ascent:t,descent:n}},s._glyphClickHandler=function(e){var t,n,r,a=this._element.getElementsByClassName(this._options.glyphActiveClass),s=null;for(r=e.target;r&&r!==this._element;){if(r.classList.contains(this._options.glyphClass)){s=r;break}r=r.parentElement}for(t=0,n=a.length;t<n;t++)a[t]===s&&(s=null),a[t].classList.remove(this._options.glyphActiveClass);s&&s.classList.add(this._options.glyphActiveClass)},s._initCell=function(e,n){var s=this._element.ownerDocument.createElement("div"),i=this._element.ownerDocument.createElementNS(a,"svg"),o=this._element.ownerDocument.createElementNS(a,"path"),l={},u=new t(o,l),c=this._font.glyphs.get(n),h=this.getDimensions(),f=h.width,p=h.height,d=h.ascent,m=(c.xMax||0)-(c.xMin||0),g=-(c.xMin||0)+.5*f-.5*m,y=[1,0,0,-1,g,d];s.classList.add(this._options.glyphClass),i.setAttribute("viewBox",[0,0,f,p].join(" ")),o.setAttribute("transform","matrix("+y.join(", ")+")"),i.appendChild(o),r(c,u),s.appendChild(i),s.setAttribute("title",c.name),this._element.appendChild(s)},s._initCells=function(){for(var e=this._loadProgress[0],t=this._font.glyphNames.names.length,n=this._options.loadAtOnce;e<t&&n>0;e++,n--)this._initCell(this._font.glyphNames[e],e);this._loadProgress[0]=e,this._loadProgress[1]=null,e<t&&(this._loadProgress[1]=window.requestAnimationFrame(this.__initCells))},s._initCellsSerial=function(){for(var e=0,t=this._font.glyphNames.names.length;e<t;e++)this._initCell(this._font.glyphNames[e],e);this._loadProgress[0]=t},s.activate=function(){null!==this._loadProgress[1]||this._loadProgress[0]>=this._font.glyphNames.names.length||(this._options.loadSerial?this._initCellsSerial():this._initCells())},s.deactivate=function(){null!==this._loadProgress[1]&&(window.cancelAnimationFrame(this._loadProgress[1]),this._loadProgress[1]=null)},n}),define("specimenTools/widgets/GlyphTables",["specimenTools/_BaseWidget","./GlyphTable"],function(e,t){"use strict";function n(t,n,r){e.call(this,r),this._container=t,this._pubSub=n,this._activeTable=null,this._options=this._makeOptions(r),this._tables=[],this._tablesContainer=this._container.ownerDocument.createElement("div"),this._container.appendChild(this._tablesContainer),this._pubSub.subscribe("loadFont",this._onLoadFont.bind(this)),this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this)),this._pubSub.subscribe("allFontsLoaded",this._onAllFontsLoaded.bind(this))}var r=n.prototype=Object.create(e.prototype);return r.constructor=n,n.defaultOptions={glyphTable:{}},r._onLoadFont=function(e,n,r){var a=new t(this._tablesContainer.ownerDocument,r,this._options.glyphTable);this._tables[e]=a},r._onAllFontsLoaded=function(e){var t,n,r,a=null,s=null,i=null;for(t=0,n=this._tables.length;t<n;t++)r=this._tables[t].getDimensions(!0),a=Math.max(a||0,r.ascent),s=Math.max(s||0,r.descent),i=Math.max(i||0,r.width);for(t=0,n=this._tables.length;t<n;t++)this._tables[t].setDimensions(i,a,s)},r._onActivateFont=function(e){if(this._activeTable!==e){for(;this._tablesContainer.children.length;)this._tablesContainer.removeChild(this._tablesContainer.lastChild);null!==this._activeTable&&this._tables[this._activeTable].deactivate(),this._tables[e].activate(),this._tablesContainer.appendChild(this._tables[e].element),this._activeTable=e}},n}),define("specimenTools/widgets/FamilyChooser",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._container=t,this._pubSub=n,this._fontsDataObject=r,this._switches=[],this._switchesContainer=this._container.ownerDocument.createElement("div"),this._container.appendChild(this._switchesContainer),this._pubSub.subscribe("loadFont",this._onLoadFont.bind(this)),this._pubSub.subscribe("allFontsLoaded",this._onAllFontsLoaded.bind(this)),this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this)),this._fonts=[],this._activeFont=null,this._familiesData=null,this._fontData=null,this._familyElements=null}var n={100:"Thin",200:"ExtraLight",300:"Light",400:"Regular",500:"Medium",600:"SemiBold",700:"Bold",800:"ExtraBold",900:"Black",260:"Thin",280:"ExtraLight"},r=t.prototype=Object.create(e.prototype);return r.constructor=t,t.defaultOptions={italicSwitchContainerClasses:[],italicSwitchCheckboxClasses:[],italicSwitchLabelClasses:[],setItalicSwitch:function(e,t,n){e.checkbox.disabled=!t,e.checkbox.checked=n},weightButtonClasses:[],weightButtonActiveClass:"active"},r._otherStyle=function(e){return"normal"===e?"italic":"normal"},r._onLoadFont=function(e,t,n){this._fonts[e]=n},r._switchItalic=function(e){var t,n=this._fontData[this._activeFont];e.checked&&"italic"===n.style||n&&null!==n.otherStyle&&(t=n.otherStyle,this._pubSub.publish("activateFont",t))},r._switchFont=function(e,t){var n=null!==this._activeFont?this._fontData[this._activeFont].style:"normal",r=this._familiesData[e][1][t],a=n in r?r[n]:r[this._otherStyle(n)];this._pubSub.publish("activateFont",a)},r._makeItalicSwitch=function(){var e=this._container.ownerDocument,t={};return t.container=e.createElement("label"),this._applyClasses(t.container,this._options.italicSwitchContainerClasses),t.checkbox=e.createElement("input"),t.checkbox.setAttribute("type","checkbox"),this._applyClasses(t.checkbox,this._options.italicSwitchCheckboxClasses),t.checkbox.addEventListener("change",this._switchItalic.bind(this,t.checkbox)),t.label=e.createElement("span"),t.label.textContent="italic",t.label.classList.add("mdl-switch__label"),this._applyClasses(t.label,this._options.italicSwitchLabelClasses),t.container.appendChild(t.checkbox),t.container.appendChild(t.label),t},r._makeWeightButton=function(e,t){var r=this._container.ownerDocument,a=r.createElement("button"),s=t+" "+n[t];return a.textContent=s,this._applyClasses(a,this._options.weightButtonClasses),a.addEventListener("click",this._switchFont.bind(this,e,t)),a},r._makeFamilyElement=function(e,t,n){var r,a,s,i,o,l,u=Object.keys(n).sort(),c=!1,h=Object.create(null),f=this._container.ownerDocument;for(h.weights=Object.create(null),h.element=f.createElement("div"),r=f.createElement("h4"),r.textContent=t,h.element.appendChild(r),i=0,o=u.length;i<o;i++)if(l=n[u[i]],"normal"in l&&"italic"in l){c=!0;break}for(c&&(h.italicSwitch=this._makeItalicSwitch(),h.element.appendChild(h.italicSwitch.container)),a=f.createElement("div"),i=0,o=u.length;i<o;i++)l=u[i],s=this._makeWeightButton(e,l),a.appendChild(s),h.weights[l]=s;return h.element.appendChild(a),h},r._getFontData=function(e){var t,n,r,a,s,i,o,l,u,c=[];for(t=0,r=e.length;t<r;t++){a=e[t][0],s=e[t][1];for(i in s){o=s[i];for(l in o)n=o[l],u=o[this._otherStyle(l)],u=void 0!==u?u:null,c[n]={familyIndex:t,weight:i,style:l,otherStyle:u}}}return c},r._onAllFontsLoaded=function(e){var t,n,r=this._fontsDataObject.getFamiliesData(),a=[],s=this._container.ownerDocument;for(t=0,n=r.length;t<n;t++)t>0&&this._container.appendChild(s.createElement("hr")),a[t]=this._makeFamilyElement(t,r[t][0],r[t][1]),this._container.appendChild(a[t].element);this._familiesData=r,this._fontData=this._getFontData(r),this._familyElements=a},r._activateFont=function(e){this._pubSub.publish("activateFont",e)},r._setWeightButton=function(e,t){this._applyClasses(e,this._options.weightButtonActiveClass,!t)},r._setItalicSwitch=function(e,t,n){var r,a,s=[];for(r=0,a=arguments.length;r<a;r++)s.push(arguments[r]);this._options.setItalicSwitch.apply(this,s)},r._setFamilyElement=function(e,t){e.classList[t?"add":"remove"]("active")},r._onActivateFont=function(e){var t,n,r,a,s,i,o,l,u=this._fontData[e],c=u.familyIndex,h="italic"===u.style;for(t=0,n=this._familyElements.length;t<n;t++){l=t===c,this._setFamilyElement(this._familyElements[t].element,l),r=this._familyElements[t].italicSwitch,r&&(a=t===c&&null!==u.otherStyle,this._setItalicSwitch(r,a,h)),s=this._familyElements[t].weights;for(i in s)o=t===c&&i===u.weight,this._setWeightButton(s[i],o)}this._activeFont=e},t}),define("specimenTools/widgets/GenericFontData",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._container=t,this._pubSub=n,this._fontData=r,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this))}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={getValue:null},n._defaultGetValue=function(e){var t,n;if(n=t=this._container.getAttribute("data-getter"),0!==n.indexOf("get")&&(n=["get",n[0].toUpperCase(),n.slice(1)].join("")),!(n in this._fontData)||"function"!=typeof this._fontData[n])throw new Error('Unknown getter "'+t+'"'+(n!==t?'(as "'+n+'")':"")+".");return this._fontData[n](e)},n._getValue=function(e){var t;return null!==this._options.getValue?this._options.getValue.call(this,e):(t=this._defaultGetValue(e),"number"==typeof t.length&&"string"!=typeof t&&(t=Array.prototype.join.call(t,", ")),t)},n._onActivateFont=function(e){this._container.textContent=this._getValue(e)},t}),define("specimenTools/widgets/CurrentWebFont",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._container=t,this._webFontProvider=r,this._pubSub=n,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this))}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={},n._onActivateFont=function(e){this._webFontProvider.setStyleOfElement(e,this._container)},t}),define("specimenTools/services/OTFeatureInfo",["specimenTools/_BaseWidget"],function(e){"use strict";function t(e){var n;if("object"==typeof e){for(n in e)t(e[n]);Object.freeze(e)}}function n(t,n){e.call(this,n),this._pubsub=t,this._caches={optional:null,default:null,unknown:null,all:null}}function r(e,t,n){function r(){var e,r=this._caches[t];if(null===r){this._caches[t]=r=Object.create(null);for(e in a)n&&!n(a[e])||(r[e]=a[e]);Object.freeze(r)}return r}Object.defineProperty(e,t,{get:r,enumerable:!0})}var a=Object.create(null);a.aalt={friendlyName:"Access All Alternates",onByDefault:null,slSensitivity:[]},a.abvf={friendlyName:"Above-base Forms",onByDefault:!0,slSensitivity:["Khmer script"]},a.abvm={friendlyName:"Above-base Mark Positioning",onByDefault:!0,slSensitivity:["Indic scripts"]},a.abvs={friendlyName:"Above-base Substitutions",onByDefault:!0,slSensitivity:["Indic scripts"]},a.afrc={friendlyName:"Alternative Fractions",onByDefault:!1,slSensitivity:[]},a.akhn={friendlyName:"Akhands",onByDefault:null,slSensitivity:["Indic scripts"]},a.blwf={friendlyName:"Below-base Forms",onByDefault:null,slSensitivity:["Indic scripts"]},a.blwm={friendlyName:"Below-base Mark Positioning",onByDefault:!0,slSensitivity:["Indic scripts"]},a.blws={friendlyName:"Below-base Substitutions",onByDefault:!0,slSensitivity:["Indic scripts"]},a.calt={friendlyName:"Contextual Alternates",onByDefault:!0,slSensitivity:[]},a.case={friendlyName:"Case-Sensitive Forms",onByDefault:!1,slSensitivity:["European scripts","Spanish Language"],exampleText:"¡!(H-{E[L]L}O)"},a.ccmp={friendlyName:"Glyph Composition / Decomposition",onByDefault:!0,slSensitivity:[]},a.cfar={friendlyName:"Conjunct Form After Ro",onByDefault:null,slSensitivity:["Khmer scripts"]},a.cjct={friendlyName:"Conjunct Forms",onByDefault:null,slSensitivity:[" Indic scripts that show similarity to Devanagari"]},a.clig={friendlyName:"Contextual Ligatures",onByDefault:!0,slSensitivity:[]},a.cpct={friendlyName:"Centered CJK Punctuation",onByDefault:!1,slSensitivity:["Chinese"]},a.cpsp={friendlyName:"\tCapital Spacing",onByDefault:!0,slSensitivity:["Should not be used in connecting scripts (e.g. most Arabic)"]},a.cswh={friendlyName:"Contextual Swash",onByDefault:!1,slSensitivity:[]},a.curs={friendlyName:"Cursive Positioning",onByDefault:null,slSensitivity:[]},function(e){var t,n,r;for(t=1;t<100;t++)n=("0"+t).slice(-2),r="cv"+n,e[r]={friendlyName:"Character Variants "+t,onByDefault:!1,slSensitivity:[]}}(a),a.c2pc={friendlyName:"Petite Capitals From Capitals",onByDefault:!1,slSensitivity:["scripts with both upper- and lowercase forms","Latin","Cyrillic","Greek"]},a.c2sc={friendlyName:"Small Capitals From Capitals",onByDefault:!1,slSensitivity:["bicameral scripts","Latin","Greek","Cyrillic","Armenian"],exampleText:"HELLO WORLD"},a.dist={friendlyName:"Distances",onByDefault:null,slSensitivity:["Indic scripts"]},a.dlig={friendlyName:"Discretionary Ligatures",onByDefault:!1,slSensitivity:[],exampleText:"act stand (1) (7)"},a.dnom={friendlyName:"Denominators",onByDefault:null,slSensitivity:[]},a.dtls={friendlyName:"Dotless Forms",onByDefault:null,slSensitivity:["math formula layout"]},a.expt={friendlyName:"Expert Forms",onByDefault:null,slSensitivity:["Japanese"]},a.falt={friendlyName:"Final Glyph on Line Alternates",onByDefault:null,slSensitivity:["any cursive script","Arabic"]},a.fin2={friendlyName:"Terminal Forms #2",onByDefault:!0,slSensitivity:["Syriac"]},a.fin3={friendlyName:"Terminal Forms #3",onByDefault:!0,slSensitivity:["Syriac"]},a.fina={friendlyName:"Terminal Forms",onByDefault:null,slSensitivity:["script with joining behavior","Arabic"]},a.flac={friendlyName:"Flattened accent forms",onByDefault:null,slSensitivity:["math formula layout"]},a.frac={friendlyName:"Fractions",onByDefault:!1,slSensitivity:[],exampleText:"1/2 1/4"},a.fwid={friendlyName:"Full Widths",onByDefault:!1,slSensitivity:["scripts which can use monospaced forms"]},a.half={friendlyName:"Half Forms",onByDefault:null,slSensitivity:[" Indic scripts that show similarity to Devanagari"]},a.haln={friendlyName:"Halant Forms",onByDefault:!0,slSensitivity:["Indic scripts"]},a.halt={friendlyName:"Alternate Half Widths",onByDefault:!1,slSensitivity:["CJKV"]},a.hist={friendlyName:"Historical Forms",onByDefault:!1,slSensitivity:[],exampleText:"basic"},a.hkna={friendlyName:"Horizontal Kana Alternates",onByDefault:!1,slSensitivity:["hiragana","katakana"]},a.hlig={friendlyName:"Historical Ligatures",onByDefault:!1,slSensitivity:[],exampleText:"baſic ſs ſl"},a.hngl={friendlyName:"Hangul",onByDefault:!1,slSensitivity:["Korean"]},a.hojo={friendlyName:"Hojo Kanji Forms (JIS X 0212-1990 Kanji Forms)",onByDefault:!1,slSensitivity:["Kanji"]},a.hwid={friendlyName:"Half Widths",onByDefault:!1,slSensitivity:["CJKV"]
-},a.init={friendlyName:"Initial Forms",onByDefault:null,slSensitivity:["script with joining behavior","Arabic"]},a.isol={friendlyName:"Isolated Forms",onByDefault:null,slSensitivity:["script with joining behavior","Arabic"]},a.ital={friendlyName:"Italics",onByDefault:null,slSensitivity:["mostly Latin"]},a.jalt={friendlyName:"Justification Alternates",onByDefault:null,slSensitivity:["any cursive script"]},a.jp78={friendlyName:"JIS78 Forms",onByDefault:!1,slSensitivity:["Japanese"]},a.jp83={friendlyName:"JIS83 Forms",onByDefault:!1,slSensitivity:["Japanese"]},a.jp90={friendlyName:"JIS90 Forms",onByDefault:!1,slSensitivity:["Japanese"]},a.jp04={friendlyName:"JIS2004 Forms",onByDefault:!1,slSensitivity:["Kanji"]},a.kern={friendlyName:"Kerning",onByDefault:!0,slSensitivity:[]},a.lfbd={friendlyName:"Left Bounds",onByDefault:null,slSensitivity:[]},a.liga={friendlyName:"Standard Ligatures",onByDefault:!0,slSensitivity:[]},a.ljmo={friendlyName:"Leading Jamo Forms",onByDefault:!0,slSensitivity:["Hangul + Ancient Hangul"]},a.lnum={friendlyName:"Lining Figures",onByDefault:!1,slSensitivity:[],exampleText:"31337 H4X0R"},a.locl={friendlyName:"Localized Forms",onByDefault:!0,slSensitivity:[]},a.ltra={friendlyName:"Left-to-right alternates",onByDefault:null,slSensitivity:["Left-to-right runs of text"]},a.ltrm={friendlyName:"Left-to-right mirrored forms",onByDefault:null,slSensitivity:["Left-to-right runs of text"]},a.mark={friendlyName:"Mark Positioning",onByDefault:null,slSensitivity:[]},a.med2={friendlyName:"Medial Forms #2",onByDefault:!0,slSensitivity:["Syriac"]},a.medi={friendlyName:"Medial Forms",onByDefault:null,slSensitivity:["script with joining behavior","Arabic"]},a.mgrk={friendlyName:"Mathematical Greek",onByDefault:!1,slSensitivity:["Greek script"]},a.mkmk={friendlyName:"Mark to Mark Positioning",onByDefault:!0,slSensitivity:[]},a.mset={friendlyName:"Mark Positioning via Substitution",onByDefault:null,slSensitivity:["Arabic"]},a.nalt={friendlyName:"Alternate Annotation Forms",onByDefault:!1,slSensitivity:["CJKV","European scripts"],exampleText:"359264"},a.nlck={friendlyName:"NLC Kanji Forms",onByDefault:!1,slSensitivity:["Kanji"]},a.nukt={friendlyName:"Nukta Forms",onByDefault:null,slSensitivity:[" Indic scripts"]},a.numr={friendlyName:"Numerators",onByDefault:null,slSensitivity:[]},a.onum={friendlyName:"Oldstyle Figures",onByDefault:!1,slSensitivity:[],exampleText:"123678"},a.opbd={friendlyName:"Optical Bounds",onByDefault:!0,slSensitivity:[]},a.ordn={friendlyName:"Ordinals",onByDefault:!1,slSensitivity:["Latin"],exampleText:"1a 9a 2o 7o"},a.ornm={friendlyName:"Ornaments",onByDefault:null,slSensitivity:[]},a.palt={friendlyName:"Proportional Alternate Widths",onByDefault:!1,slSensitivity:["CJKV"]},a.pcap={friendlyName:"Petite Capitals",onByDefault:!1,slSensitivity:["scripts with both upper- and lowercase forms","Latin","Cyrillic","Greek"]},a.pkna={friendlyName:"Proportional Kana",onByDefault:!1,slSensitivity:["Japanese"]},a.pnum={friendlyName:"Proportional Figures",onByDefault:!1,slSensitivity:[],exampleText:"123678"},a.pref={friendlyName:"Pre-Base Forms",onByDefault:null,slSensitivity:["Khmer and Myanmar (Burmese) scripts"]},a.pres={friendlyName:"Pre-base Substitutions",onByDefault:!0,slSensitivity:["Indic scripts"]},a.pstf={friendlyName:"Post-base Forms",onByDefault:null,slSensitivity:["scripts of south and southeast Asia that have post-base forms for consonants","Gurmukhi","Malayalam","Khmer"]},a.psts={friendlyName:"Post-base Substitutions",onByDefault:!0,slSensitivity:["any alphabetic script","Indic scripts"]},a.pwid={friendlyName:"Proportional Widths",onByDefault:null,slSensitivity:["CJKV","European scripts"]},a.qwid={friendlyName:"Quarter Widths",onByDefault:!1,slSensitivity:["CJKV"]},a.rand={friendlyName:"Randomize",onByDefault:!0,slSensitivity:[]},a.rclt={friendlyName:"Required Contextual Alternates",onByDefault:!0,slSensitivity:["any script","important for many styles of Arabic"]},a.rkrf={friendlyName:"Rakar Forms",onByDefault:null,slSensitivity:["Devanagari","Gujarati"]},a.rlig={friendlyName:"Required Ligatures",onByDefault:!0,slSensitivity:["Arabic","Syriac","May apply to some other scripts"]},a.rphf={friendlyName:"Reph Forms",onByDefault:null,slSensitivity:["Indic scripts","Devanagari","Kannada"]},a.rtbd={friendlyName:"Right Bounds",onByDefault:null,slSensitivity:[]},a.rtla={friendlyName:"Right-to-left alternates",onByDefault:null,slSensitivity:["Right-to-left runs of text"]},a.rtlm={friendlyName:"Right-to-left mirrored forms",onByDefault:null,slSensitivity:["Right-to-left runs of text"]},a.ruby={friendlyName:"Ruby Notation Forms",onByDefault:!1,slSensitivity:["Japanese"]},a.rvrn={friendlyName:"Required Variation Alternates",onByDefault:null,slSensitivity:[]},a.salt={friendlyName:"Stylistic Alternates",onByDefault:null,slSensitivity:[]},a.sinf={friendlyName:"Scientific Inferiors",onByDefault:!1,slSensitivity:[],exampleText:"1902835746"},a.size={friendlyName:"Optical size",onByDefault:!0,slSensitivity:[]},a.smcp={friendlyName:"Small Capitals",onByDefault:!1,slSensitivity:[" bicameral scripts","Latin","Greek","Cyrillic","Armenian"],exampleText:"Hello World"},a.smpl={friendlyName:"Simplified Forms",onByDefault:!1,slSensitivity:["Chinese","Japanese"]},function(e){var t,n,r;for(t=1;t<21;t++)n=("0"+t).slice(-2),r="ss"+n,e[r]={friendlyName:"Stylistic Set "+t,onByDefault:!1,slSensitivity:[]}}(a),a.ssty={friendlyName:"Math script style alternates",onByDefault:null,slSensitivity:["math formula layout"]},a.stch={friendlyName:"Stretching Glyph Decomposition",onByDefault:!0,slSensitivity:[]},a.subs={friendlyName:"Subscript",onByDefault:!1,slSensitivity:[],exampleText:"a1 b4 c9"},a.sups={friendlyName:"Superscript",onByDefault:!1,slSensitivity:[],exampleText:"x2 y5 z7"},a.swsh={friendlyName:"Swash",onByDefault:!1,slSensitivity:["Does not apply to ideographic scripts"]},a.titl={friendlyName:"Titling",onByDefault:!1,slSensitivity:[]},a.tjmo={friendlyName:"Trailing Jamo Forms",onByDefault:!0,slSensitivity:["Hangul + Ancient Hangul"]},a.tnam={friendlyName:"Traditional Name Forms",onByDefault:!1,slSensitivity:["Japanese"]},a.tnum={friendlyName:"Tabular Figures",onByDefault:!1,slSensitivity:[],exampleText:"123678"},a.trad={friendlyName:"Traditional Forms",onByDefault:!1,slSensitivity:["Chinese","Japanese"]},a.twid={friendlyName:"Third Widths",onByDefault:!1,slSensitivity:["CJKV"]},a.unic={friendlyName:"Unicase",onByDefault:!1,slSensitivity:["scripts with both upper- and lowercase forms","Latin","Cyrillic","Greek"]},a.valt={friendlyName:"Alternate Vertical Metrics",onByDefault:null,slSensitivity:["scripts with vertical writing modes"]},a.vatu={friendlyName:"Vattu Variants",onByDefault:null,slSensitivity:["Indic scripts","Devanagari"]},a.vert={friendlyName:"Vertical Writing",onByDefault:null,slSensitivity:["scripts with vertical writing capability."]},a.vhal={friendlyName:"Alternate Vertical Half Metrics",onByDefault:!1,slSensitivity:["CJKV"]},a.vjmo={friendlyName:"Vowel Jamo Forms",onByDefault:!0,slSensitivity:["Hangul + Ancient Hangul"]},a.vkna={friendlyName:"Vertical Kana Alternates",onByDefault:!1,slSensitivity:["hiragana","katakana"]},a.vkrn={friendlyName:"Vertical Kerning",onByDefault:!0,slSensitivity:[]},a.vpal={friendlyName:"Proportional Alternate Vertical Metrics",onByDefault:!1,slSensitivity:["CJKV"]},a.vrt2={friendlyName:"Vertical Alternates and Rotation",onByDefault:!0,slSensitivity:["scripts with vertical writing capability"]},a.vrtr={friendlyName:"Vertical Alternates for Rotation",onByDefault:!0,slSensitivity:[]},a.zero={friendlyName:"Slashed Zero",onByDefault:!1,slSensitivity:[],exampleText:"0123"},t(a);var s=n.prototype=Object.create(e.prototype);return s.constructor=n,n.defaultOptions={},r(s,"optional",function(e){return e.onByDefault===!1}),r(s,"default",function(e){return e.onByDefault===!0}),r(s,"unknown",function(e){return null===e.onByDefault}),r(s,"all",!1),s.getSubset=function(e,t){var n,r,a,s=this[e],i=Object.create(null);for(n=0,r=t.length;n<r;n++)a=t[n],a in s&&(i[a]=s[a]);return i},s.getFeature=function(e){return a[e]},new n}),define("specimenTools/widgets/TypeTester",["specimenTools/_BaseWidget","specimenTools/services/OTFeatureInfo"],function(e,t){"use strict";function n(t,n,r,a){e.call(this,a),this._container=t,this._pubSub=n,this._fontsData=r,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this)),this._contentContainers=this._getByClass(this._options.contentContainerClass),this._controls={features:{containers:Object.create(null),active:Object.create(null),buttons:null,tags:null}},this._activeFeatures=Object.create(null),this._values=Object.create(null),this.__sliderInputHandler=this._sliderInputHandler.bind(this),this._initControls(),this._applyValues()}var r=n.prototype=Object.create(e.prototype);return r.constructor=n,n.defaultOptions={slider_default_min:10,slider_default_max:128,slider_default_value:32,slider_default_step:1,slider_default_unit:"px",slider_default_class:"specimen-slider",optionalFeaturesControlsClass:"type-tester__features--optional",defaultFeaturesControlsClass:"type-tester__features--default",sliderControlsClass:"type-tester__slider",contentContainerClass:"type-tester__content",labelControlsClass:"type-tester__label",setCssValueToInput:function(e,t){e.value=t},optionalFeatureButtonClasses:"",defaultFeatureButtonClasses:"",activateFeatureControls:null,featureButtonActiveClass:"active"},r._sliderInputHandler=function(e){for(var t=e.target.parentElement,n=null,r=e.target.value;t!==this._container;){if(void 0!==t.dataset.targetProperty){n=t.dataset.targetProperty;break}t=t.parentElement}null!==n&&(this._setCssValue(n,r),this._applyValues())},r._setSliderOptions=function(e){var t,n,r=["min","max","unit","step","value","class"];for(this._options[e]={},n=0;n<r.length;n++)t=[r[n],e.substr(0,1).toUpperCase(),e.substr(1)].join(""),t in this._container.dataset?this._options[e][r[n]]=this._container.dataset[t]:this._options[e][r[n]]=this._options["slider_default_"+r[n]]},r._initSlider=function(e){var t,n=this._container.ownerDocument.createElement("input"),r=e.dataset.targetProperty,a=this._cssName2jsName(r),s=[a,"_slider"].join(""),i={min:this._options[a].min,max:this._options[a].max,step:this._options[a].step};s in this._controls||(this._controls[s]=[]),this._controls[s].push({input:n,container:e}),this._applyClasses(n,this._options[a].class),n.setAttribute("type","range");for(t in i)n.setAttribute(t,i[t]);e.appendChild(n),n.addEventListener("input",this.__sliderInputHandler)},r._initLabel=function(e){var t=this._cssName2jsName(e.dataset.targetProperty),n=[t,"_label"].join("");n in this._controls||(this._controls[n]=[]),this._controls[n].push(e)},r._initFeaturesControl=function(e,t){t in this._controls.features.containers||(this._controls.features.containers[t]=[]),this._controls.features.containers[t].push(e),e.addEventListener("click",this._switchFeatureTagHandler.bind(this,e))},r._initControls=function(){var e,t,n,r,a,s,i,o,l,u,c=this._getByClass(this._options.sliderControlsClass),h=this._getByClass(this._options.labelControlsClass),f={optionalFeatures:[this._getByClass(this._options.optionalFeaturesControlsClass),["_initFeaturesControl","optional"]],defaultFeatures:[this._getByClass(this._options.defaultFeaturesControlsClass),["_initFeaturesControl","default"]]},p=[];for(l=0;l<c.length;l++)a=c[l].dataset.targetProperty,s=this._cssName2jsName(a),i=[s,"_slider"].join(""),i in f||(this._setSliderOptions(s),f[i]=[[],["_initSlider"]]),f[i][0].push(c[l]);for(l=0;l<h.length;l++)a=h[l].dataset.targetProperty,s=this._cssName2jsName(a),o=[s,"_label"].join(""),o in f||(f[o]=[[],["_initLabel"],this._setCssValue.bind(this,a,this._options[s].value)]),f[o][0].push(h[l]);for(r in f)for(e=f[r][1][0],t=f[r][1].slice(1),f[r][2]&&p.push(f[r][2]),n=f[r][0],l=0,u=n.length;l<u;l++)this[e].apply(this,[n[l]].concat(t));for(l=0,u=p.length;l<u;l++)p[l]()},r._switchFeatureTagHandler=function(e,t){var n,r,a,s=null,i=this._controls.features.active;for(a=t.target;a&&a!==e;){if(a.hasAttribute("data-feature-tag")){s=a.getAttribute("data-feature-tag");break}a=a.parentElement}if(null!==s){if(s in i)delete i[s];else{if(n=this._getFeatureTypeByTag(s),"default"===n)r="0";else{if("optional"!==n)return;r="1"}i[s]=r}this._setFeatureButtonsState(),this._setFeatures(),this._applyValues()}},r._setFeatures=function(){var e,t=this._controls.features.active,n=this._controls.features.buttons,r=[];for(e in t)e in n&&r.push('"'+e+'" '+t[e]);this._values["font-feature-settings"]=r.join(", ")},r._updateFeatureControlContainer=function(e,t,n,r){var a,s,i,o,l,u,c=e.ownerDocument,h=[];for(r||(r=Object.keys(n).sort()),s=e.children.length-1;s>=0;s--)t===e.children[s].getAttribute("data-feature-type")&&e.removeChild(e.children[s]);for(s=0,i=r.length;s<i;s++)a=r[s],o=n[a],l=[a,o.friendlyName].join(": "),u=c.createElement("button"),u.textContent=l,u.setAttribute("data-feature-tag",a),u.setAttribute("data-feature-type",t),this._applyClasses(u,this._options[t+"FeatureButtonClasses"]),e.appendChild(u),h.push(u),a in this._controls.features.buttons||(this._controls.features.buttons[a]=[]),this._controls.features.buttons[a].push(u);return h},r._getFeatureTypeByTag=function(e){var t=this._controls.features.tags;return"default"in t&&e in t.default.features?"default":"optional"in t&&e in t.optional.features?"optional":null},r._updateFeatureControls=function(e){var n,r,a,s,i,o,l,u,c,h=this._fontsData.getFeatures(e),f=Object.keys(h),p=["default","optional"],d=this._controls.features,m=[];for(d.buttons=Object.create(null),d.tags=Object.create(null),r=0,a=p.length;r<a;r++)for(n=p[r],u=t.getSubset(n,f),c=Object.keys(u).sort(),d.tags[n]={features:u,order:c},l=d.containers[n]||[],s=0,i=l.length;s<i;s++)o=this._updateFeatureControlContainer(l[s],n,u,c),Array.prototype.push.apply(m,o);this._options.activateFeatureControls&&this._options.activateFeatureControls.call(this,m),this._setFeatureButtonsState()},r._setFeatureButtonActiveState=function(e,t){this._applyClasses(e,this._options.featureButtonActiveClass,!t)},r._setFeatureButtonsState=function(){var e,t,n,r,a,s,i,o=this._controls.features;for(e in o.buttons){if(n=o.buttons[e],t=e in o.active,a=this._getFeatureTypeByTag(e),"default"===a)r=!t;else{if("optional"!==a)continue;r=t}for(s=0,i=n.length;s<i;s++)this._setFeatureButtonActiveState.call(this,n[s],r)}},r._setCssValue=function(e,t){var n,r,a=this._cssName2jsName(e),s=[t,this._options[a].unit],i=this._controls[a+"_slider"],o=this._controls[a+"_label"];for(n=0,r=i.length;n<r;n++)this._options.setCssValueToInput.call(this,i[n].input,t);for(n=0,r=o.length;n<r;n++)o[n].textContent=s.join(" ");this._values[e]=s.join("")},r._getByClass=function(e){return this._container.getElementsByClassName(e)},r._applyValues=function(){var e,t,n,r;for(e=0,t=this._contentContainers.length;e<t;e++){n=this._contentContainers[e];for(r in this._values)n.style[this._cssName2jsName(r)]=this._values[r]}},r._onActivateFont=function(e){this._updateFeatureControls(e),this._setFeatures(),this._applyValues()},n}),define("specimenTools/services/svgDrawing/lib",["specimenTools/services/dom-tool"],function(e){"use strict";function t(e,t){e.setAttribute("transform","matrix("+t.join(", ")+")")}function n(e,t){var n,r,a;for(e.getPath(),n=0,r=e.path.commands.length;n<r;n++)switch(a=e.path.commands[n],a.type){case"M":t.moveTo([a.x,a.y]);break;case"Z":t.closePath();break;case"Q":t.qCurveTo([a.x1,a.y1],[a.x,a.y]);break;case"C":t.curveTo([a.x1,a.y1],[a.x2,a.y2],[a.x,a.y]);break;case"L":t.lineTo([a.x,a.y]);break;default:console.warn("Unknown path command:",a.type)}}var r="http://www.w3.org/2000/svg";return{svgns:r,setTransform:t,insertElement:e.insertElement,draw:n}}),define("specimenTools/services/svgDrawing/_BaseDrawingElement",[],function(){"use strict";function e(){}var t=e.prototype;return t.setExtends=function(e,t){var n,r,a=[];for(n=0,r=arguments.length;n<r;n++)a.push(arguments[n]);for(n=0,r=this._children.length;n<r;n++)"function"==typeof this._children[n].setExtends&&this._children[n].setExtends.apply(this._children[n],a)},e}),define("specimenTools/services/svgDrawing/Box",["./_BaseDrawingElement","./lib"],function(e,t){"use strict";function n(e,t,n){this.options=n,this.leftSideBearing=null,this.rightSideBearing=null,this.rawWidth=0,this._children=t,this.element=e.createElementNS(r,"g"),this._addChildren(t)}var r=t.svgns,a=t.insertElement,s=t.setTransform,i=n.prototype=Object.create(e.prototype);return i.constructor=n,i._addChildren=function(e){var t,n,r;for(t=0,n=e.length;t<n;t++)r=e[t],a(this.element,r.element,r.options.insert)},i._allignChildren=function(e){var t,n,r,a=this._children.filter(function(e){return!e.noDimensions}).sort(function(e,t){return e.rawWidth-t.rawWidth}),i=a.pop();for(t=0,n=a.length;t<n;t++){switch(e){case"right":r=i.rawWidth-a[t].rawWidth;break;case"center":r=.5*(i.rawWidth-a[t].rawWidth);break;case"left":default:r=0}s(a[t].element,[1,0,0,1,r,0])}},i.initDimensions=function(){var e,t,n,r=[],a=[];for(this.options.minLeftSideBearing&&r.push(this.options.minLeftSideBearing),this.options.minRightSideBearing&&a.push(this.options.minRightSideBearing),e=0,t=this._children.length;e<t;e++)n=this._children[e],n.noDimensions||(n.initDimensions(),r.push(n.leftSideBearing),a.push(n.rightSideBearing),this.rawWidth=0===e?n.rawWidth:Math.max(this.rawWidth,n.rawWidth));this.leftSideBearing=r.length?Math.max.apply(null,r):0,this.rightSideBearing=a.length?Math.max.apply(null,a):0,this._allignChildren(this.options.align)},Object.defineProperty(i,"width",{get:function(){return this.leftSideBearing+this.rawWidth+this.rightSideBearing},enumerable:!0}),n}),define("Atem-Pen-Case/tools/arrayTools",[],function(){"use strict";function e(e){if(!e.length)return[0,0,0,0];var t,n,r=[],a=[];for(t=0,n=e.length;t<n;t++)r.push(e[t][0]),a.push(e[t][1]);return[Math.min.apply(null,r),Math.min.apply(null,a),Math.max.apply(null,r),Math.max.apply(null,a)]}function t(e,t){var n=e[0],r=e[1],a=e[2],s=e[3],i=t[0],o=t[1];return i<n&&(n=i),i>a&&(a=i),o<r&&(r=o),o>s&&(s=o),[n,r,a,s]}function n(e,t){var n=e[0],r=e[1],a=t[0],s=t[1],i=t[2],o=t[3];return a<=n&&n<=i&&s<=r&&r<=o}function r(e,t){var n=Math.min(e[0],t[0]),r=Math.min(e[1],t[1]),a=Math.max(e[2],t[2]),s=Math.max(e[3],t[3]);return[n,r,a,s]}return{calcBounds:e,updateBounds:t,pointInRect:n,unionRect:r}}),define("Atem-Pen-Case/pens/ControlBoundsPen",["./BasePen","Atem-Pen-Case/tools/arrayTools"],function(e,t){"use strict";function n(t){e.call(this,t),this.bounds=void 0,this._start=void 0}var r=t.updateBounds,a=n.prototype=Object.create(e.prototype);return a.constructor=n,a._moveTo=function(e,t){this._start=e},a._addMoveTo=function(){if(void 0!==this._start){if(this.bounds)this.bounds=r(this.bounds,this._start);else{var e=this._start[0],t=this._start[1];this.bounds=[e,t,e,t]}this._start=void 0}},a._lineTo=function(e){this._addMoveTo(),this.bounds=r(this.bounds,e)},a._curveToOne=function(e,t,n){this._addMoveTo(),this.bounds=r(this.bounds,e),this.bounds=r(this.bounds,t),this.bounds=r(this.bounds,n)},a._qCurveToOne=function(e,t){this._addMoveTo(),this.bounds=r(this.bounds,e),this.bounds=r(this.bounds,t)},n}),define("Atem-Pen-Case/tools/bezierTools",["./arrayTools"],function(e){"use strict";function t(e,t,n,r){var a,s,o,l=r||Math.sqrt;return Math.abs(e)<i?a=Math.abs(t)<i?[]:[-n/t]:(s=t*t-4*e*n,s>=0?(o=l(s),a=[(-t+o)/2/e,(-t-o)/2/e]):a=[]),a}function n(e,t,n){var r=t[0],a=t[1],s=n[0],i=n[1],o=e[0],l=e[1],u=2*(r-o),c=2*(a-l),h=s-o-u,f=i-l-c;return[[h,f],[u,c],[o,l]]}function r(e,t,n,r){var a=t[0],s=t[1],i=n[0],o=n[1],l=r[0],u=r[1],c=e[0],h=e[1],f=3*(a-c),p=3*(s-h),d=3*(i-a)-f,m=3*(o-s)-p,g=l-c-f-d,y=u-h-p-m;return[[g,y],[d,m],[f,p],[c,h]]}function a(e,t,r){var a,s=n(e,t,r),i=s[0],l=s[1],u=s[2],c=s[3],h=s[4],f=s[5],p=2*i,d=2*l,m=[],g=[];for(0!==p&&g.push(-u/p),0!==d&&g.push(-c/d);void 0!==(a=g.pop());)0<=a&&a<1&&m.push([i*a*a+u*a+h,l*a*a+c*a+f]);return m.push(e,r),o(m)}function s(e,n,a,s){var i,l,u,c=r(e,n,a,s),h=c[0],f=c[1],p=c[2],d=c[3],m=c[4],g=c[5],y=c[6],v=c[7],b=3*h,S=3*f,_=2*p,C=2*d,x=[],T=[];for(T=[].concat(t(b,_,m),t(S,C,g)),i=0,l=T.length;i<l;i++)u=T[i],0<=u&&u<1&&x.push([h*u*u*u+p*u*u+m*u+y,f*u*u*u+d*u*u+g*u+v]);return x.push(e,s),o(x)}var i=1e-12,o=e.calcBounds;return{calcQuadraticBounds:a,calcCubicBounds:s,solveQuadratic:t}}),define("Atem-Pen-Case/pens/BoundsPen",["./ControlBoundsPen","Atem-Pen-Case/tools/arrayTools","Atem-Pen-Case/tools/bezierTools"],function(e,t,n){"use strict";function r(t){e.call(this,t),this.bounds=void 0,this._start=void 0}var a=t.updateBounds,s=t.pointInRect,i=t.unionRect,o=n.calcCubicBounds,l=n.calcQuadraticBounds,u=r.prototype=Object.create(e.prototype);return u.constructor=r,u._curveToOne=function(e,t,n){this._addMoveTo(),this.bounds=a(this.bounds,n),s(e,this.bounds)&&s(t,this.bounds)||(this.bounds=i(this.bounds,o(this._getCurrentPoint(),e,t,n)))},u._qCurveToOne=function(e,t){this._addMoveTo(),this.bounds=a(this.bounds,t),s(e,this.bounds)||(this.bounds=i(this.bounds,l(this._getCurrentPoint(),e,t)))},u.getBounds=function(){return this.bounds},r}),define("specimenTools/services/svgDrawing/Glyph",["./lib","Atem-Pen-Case/pens/SVGPen","Atem-Pen-Case/pens/BoundsPen","Atem-Pen-Case/pens/TransformPen"],function(e,t,n,r){"use strict";function a(e,a,o){var l,u,c,h;this.options=o,l=new n({}),i(a,l),u=l.getBounds(),this.leftSideBearing=u[0],this.rightSideBearing=a.advanceWidth-u[2],this.rawWidth=u[2]-u[0],this.width=a.advanceWidth,this.element=e.createElementNS(s,"path"),c=new t(this.element,{}),h=new r(c,[1,0,0,1,-this.leftSideBearing,0]),i(a,h)}var s=e.svgns,i=e.draw,o=a.prototype;return o.initDimensions=function(){},a}),define("specimenTools/services/svgDrawing/Layout",["./_BaseDrawingElement","./lib"],function(e,t){"use strict";function n(e,t,n){this.options=n,this.leftSideBearing=0,this.rightSideBearing=0,this._children=t,this.element=e.createElementNS(r,"g"),this._addChildren(t)}var r=t.svgns,a=t.setTransform,s=t.insertElement,i=n.prototype=Object.create(e.prototype);return i.constructor=n,Object.defineProperty(i,"width",{get:function(){var e,t,n=0;for(e=0,t=this._children.length;e<t;e++)this._children[e].noDimensions||(e>0&&this.options.spacing&&(n+=this.options.spacing),n+=this._children[e].width);return n},enumerable:!0}),Object.defineProperty(i,"rawWidth",{get:function(){return this.width-this.leftSideBearing-this.rightSideBearing}}),i.initDimensions=function(){var e,t,n,r=0;for(e=0,t=this._children.length;e<t;e++)n=this._children[e],n.noDimensions||(n.initDimensions(),a(n.element,[1,0,0,1,r,0]),this.options.spacing&&(r+=this.options.spacing),r+=n.width);this.leftSideBearing=this._children[0].leftSideBearing,this.rightSideBearing=this._children[this._children.length-1].rightSideBearing},i._addChildren=function(e){var t,n,r;if(e.length)for(t=0,n=e.length;t<n;t++)r=e[t],s(this.element,r.element,r.options.insert)},n}),define("specimenTools/services/svgDrawing/YLine",["./lib"],function(e){"use strict";function t(e,t,r){this.options=r,this.element=e.createElementNS(n,"line"),this.element.setAttribute("x1",0),this.element.setAttribute("x2",0),this.element.setAttribute("y1",t),this.element.setAttribute("y2",t)}var n=e.svgns,r=t.prototype;return r.noDimensions=!0,r.setExtends=function(e,t){null!==e&&this.element.setAttribute("x1",e),null!==t&&this.element.setAttribute("x2",t)},t}),define("specimenTools/services/svgDrawing/Text",["./lib"],function(e){"use strict";function t(e,t,a){var s=t.fontsData.getFont(t.fontIndex),i=s.unitsPerEm;this.options=a,this.textElement=e.createElementNS(n,"text"),this.textElement.setAttribute("font-size",i),this.textElement.textContent=t.text,t.webFontProvider.setStyleOfElement(t.fontIndex,this.textElement),r(this.textElement,[1,0,0,-1,0,0]),this.element=e.createElementNS(n,"g"),this.element.appendChild(this.textElement)}var n=e.svgns,r=e.setTransform,a=t.prototype;return a.initDimensions=function(){var e=this.element.getBBox();this.leftSideBearing=0,this.rightSideBearing=0,this.rawWidth=this.width=e.width},t}),define("specimenTools/services/svgDrawing/DiagramRenderer",["specimenTools/services/dom-tool","./lib","./Box","./Glyph","./Layout","./YLine","./Text"],function(e,t,n,r,a,s,i){"use strict";function o(e,t,n,r){this._options=r||{},this._doc=e,this._fontsData=t,this._webFontProvider=n}function l(e,t){var n,r,a,s,i,o;return s=e.tables.head.yMax,i=e.tables.head.yMin,a=s+(i>0?0:Math.abs(i)),n="ascent"in t?t.ascent:e.tables.os2.usWinAscent,r="descent"in t?t.descent:e.tables.os2.usWinDescent,o="height"in t?t.height:n+r,{width:a,height:o,ascent:n,descent:r}}function u(e,t,n,r){var a,s,i,o;t.initDimensions(),a=t.width,t.setExtends(-t.leftSideBearing,a-t.leftSideBearing),s=l(n,r),i=s.height,o=s.ascent,e.setAttribute("viewBox",[0,0,a,i].join(" ")),f(t.element,[1,0,0,-1,t.leftSideBearing,o])}var c=e.applyClasses,h=t.svgns,f=t.setTransform,p=o.prototype;return p.constructor=o,p._constructors={glyph:r,layout:a,box:n,yline:s,text:i},p._applyStyles=function(e,t){var n,r=this._options[e+"Class"];t.options.features&&(t.element.style.fontFeatureSettings=t.options.features),r&&(c(t.element,r),t.options.style&&(n=r+"_"+t.options.style,c(t.element,n)))},p._renderElement=function(e,t){var n,r,a,s,i,o=e[0],l=e[2]||{},u=this._constructors[o];switch(o){case"glyph":if(a=this._fontsData.getGlyphByName(t,e[1]),!a)throw new Error("DiagramRenderer: can't find glyph with name \""+e[1]+'"');break;case"yline":a="baseLine"!==e[1]?this._fontsData.getFontValue(t,e[1]):0;break;case"text":a={text:e[1],fontIndex:t,fontsData:this._fontsData,webFontProvider:this._webFontProvider};break;default:for(a=[],n=0,r=e[1].length;n<r;n++)i=this._renderElement(e[1][n],t),a.push(i)}return s=new u(this._doc,a,l),this._applyStyles(o,s),s},p.render=function(e,t,n){var r=this._doc.createElementNS(h,"svg"),a=this._renderElement(e,t),s=this._fontsData.getFont(t);return r.appendChild(a.element),{element:r,onHasDocument:u.bind(null,r,a,s,n)}},o}),define("specimenTools/widgets/FeatureDisplay",["specimenTools/_BaseWidget","specimenTools/services/OTFeatureInfo","specimenTools/services/svgDrawing/DiagramRenderer"],function(e,t,n){"use strict";function r(t,n,r,a,s){e.call(this,s),this._container=t,this._pubSub=n,this._fontsData=r,this._webFontProvider=a,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this)),this._contentElements=[],this._itemParentContainer=null,this._bluePrintNodes=this._getBluePrintNodes(this._options.bluePrintNodeClass,!0),this._feaureItemsSetup=this._options.feaureItemsSetup?this._prepareFeatureItems(this._options.feaureItemsSetup):[],this._defaultFeaureItemsCache=Object.create(null)}function a(e){var t=arguments.length>=2?arguments[1]:void 0;return function(n,r,a){return!e.call(void 0!==t?t:this,n,r,a)}}function s(e){var t,n,r;for(t="string"==typeof e.features?[e.features]:e.features,n=0,r=t.length;n<r;n++)this.add(t[n])}function i(e,t,n,r,a){var s,i,o=[];for(a&&e.classList.contains(t)&&o.push(e),Array.prototype.push.apply(o,e.getElementsByClassName(t)),s=0,i=o.length;s<i;s++)n.call(r||null,o[s],s)}function o(e){var n="string"==typeof e?[e]:e;return n.map(function(e){var n=t.getFeature(e).onByDefault?"0":"1";return'"'+e+'" '+n}).join(", ")}function l(e,t){e.style.fontFeatureSettings=o(t)}function u(e){var t,n,r,a,s=[["webfont!","webfont"],["outline!","outline"],["w!","webfont"],["o!","outline"]];for(t=0,n=s.length;t<n;t++)if(r=s[t][0],0===e.indexOf(r))return a=s[t][1],[a,e.slice(r.length).trim()];return["webfont",e]}function c(e,t,n,r){var a,s,i,o=[],l=[];for(a=0,s=r.length;a<s;a++){if(i=r[a],i===t&&r[a+1]===e)a++,i=r[a];else if(i===e){o.push(l.join("")),l=[];continue}l.push(i)}return l.length&&o.push(l.join("")),n!==!1?o.map(function(e){return e.trim()}):o}function h(e){var t,n,r,a,s,i=Object.create(null),o={before:null,after:null,options:i};if(t=c(",","\\",!0,e),!t.length)throw new Error("StackedOutlineContent: Can't find a content argument in \""+e+'"');if(n=c(":","\\",!0,t[0]),2!==n.length)throw new Error("StackedOutlineContent: content must have two items but has: "+n.length);if(o.before=n[0],o.after=n[1],t[1])for(r=c(":","\\",!0,t[0]),a=0,s=r.length;a<s;a+=2)i[r[a]]=r[a+1];return o}function f(e,t){var n=h(e);return["box",[["glyph",n.after,{style:"highlighted"}],["glyph",n.before,{style:"muted"}]],n.options]}function p(e,t){var n=o(t.features);return["box",[["text",e,{style:"highlighted",features:n}],["text",e,{style:"muted"}]]]}function d(e,t,n){var r,a,s,i=e.trim(),o=n?null:[];for(r=0,a=t.childNodes.length;r<a;r++)if(s=t.childNodes[r],8===s.nodeType&&s.textContent.trim()===i){if(n)return s;o.push(s)}return o}var m=r.prototype=Object.create(e.prototype);return m.constructor=r,r.defaultOptions={bluePrintNodeClass:"feature-display__item-blueprint",itemTagClassPrefix:"feature-display__item-tag_",itemContentContainerClass:"feature-display__item-content-container",itemBeforeClass:"feature-display__item__before",itemChangeIndicatorClass:"feature-display__item__change-indicator",itemAppliedClass:"feature-display__item__applied",itemTagNameClass:"feature-display__item__tag-name",itemContentTextClass:"feature-display__item__content-text",highlightClasses:"feature-display__item_highlight",tabularClasses:"feature-display__item_tabular",itemContentStackedClass:"feature-display__item__content-stacked",itemContentStackedElementClassPrefix:"feature-display__content-stacked__",itemFriendlyNameClass:"feature-display__item__friendly-name",feaureItemsSetup:null,useDefaultFeatureItems:"complement",featureSortfunction:function(e,t){var n,r,a=e.weight||0,s=t.weight||0;return a!==s?a-s:(n=e.features.join(" "),r=t.features.join(" "),n===r?0:n<r?-1:1)}},m._getBluePrintNodes=function(e){var t,n,r,a=this._container.getElementsByClassName(e),s=[];if(a.length)for(t=0,n=a.length;t<n;t++)r=a[t].cloneNode(!0),r.style.display=null,this._applyClasses(r,e,!0),s.push([a[t],r]);return s},m._getAvailableFeatures=function(e){var n,r,a,s=this._fontsData.getFeatures(e),i=t.getSubset("optional",Object.keys(s)),o=Object.keys(i).sort(),l=[];for(r=0,a=o.length;r<a;r++)n=o[r],l.push([n,i[n]]);return l},m._getDefaultFeatureItems=function(e,t){var n,r,a,s,i,o,l=[];for(n=0,r=e.length;n<r;n++)a=e[n][0],s=e[n][1],s.exampleText&&(t&&!t(a)||(i=this._defaultFeaureItemsCache[a],i||(o={contents:[{type:"text",behavior:"show-before",features:a,content:s.exampleText}]},i=this._prepareFeatureItem(o),this._defaultFeaureItemsCache[a]=i),l.push(i)));return l},m._onActivateFont=function(e){function t(e){var t,n;for(t=0,n=e.features.length;t<n;t++)if(!i.has(e.features[t]))return!1;return!0}var n,r,s,i,o,l,u;for(o=this._contentElements.length-1;o>=0;o--)this._contentElements[o].parentNode.removeChild(this._contentElements[o]);if(s=this._getAvailableFeatures(e),i=new Set,s.forEach(function(e){i.add(e[0])}),n=this._feaureItemsSetup.filter(t),this._options.useDefaultFeatureItems){if(u=null,"complement"===this._options.useDefaultFeatureItems){for(r=new Set,o=0,l=n.length;o<l;o++)n[o].features.forEach(r.add,r);u=a(r.has,r)}Array.prototype.push.apply(n,this._getDefaultFeatureItems(s,u))}this._options.featureSortfunction&&n.sort(this._options.featureSortfunction),this._contentElements=this._buildFeatures(n,e)},m._simpleMarkupAddItem=function(e,t,n,r,a){var s,i;switch(s=e.createTextNode(r.join("")),n){case"highlight":i=e.createElement("span"),this._applyClasses(i,this._options.highlightClasses),a.featuresOnHighlights&&l(i,a.features),i.appendChild(s);break;default:i=s}t.appendChild(i)},m._simpleMarkup=function(e,t){var n,r,a=null,s=e.createDocumentFragment(),i=[],o=t.content;for(n=0,r=o.length;n<r;n++)"*"!==o[n]?("\\"===o[n]&&"*"===o[n+1]&&(n+=1),i.push(o[n])):(i.length&&(this._simpleMarkupAddItem(e,s,a,i,t),i=[]),a="highlight"===a?null:"highlight");return i.length&&this._simpleMarkupAddItem(e,s,a,i,t),s},m._textTabularContent=function(e,t){var n,r,a,s=e.createDocumentFragment(),i=t.content;for(n=0,r=i.length;n<r;n++)a=e.createElement("span"),a.textContent=i[n],this._applyClasses(a,this._options.tabularClasses),s.appendChild(a);return s},m._prepareFeatureItem=function(e){
-var t,n=new Set,r={contents:e.contents||[],features:null};for(t in e)t in r||(r[t]=e[t]);return r.contents.forEach(s,n),r.features=Array.from(n).sort(),r},m._prepareFeatureItems=function(e){var t,n,r=[];for(t=0,n=e.length;t<n;t++)r.push(this._prepareFeatureItem(e[t]));return r},m._textTypeFactory=function(e,t,n){function r(t,r){var a="tabular"===e.behavior?this._textTabularContent(this._container.ownerDocument,e):this._simpleMarkup(this._container.ownerDocument,e);t.appendChild(a),this._webFontProvider.setStyleOfElement(n,t)}function a(e){e.parentNode&&e.parentNode.removeChild(e)}var s,o={element:null,onHasDocument:!1};return s=t.cloneNode(!0),"show-before"!==e.behavior?(i(s,this._options.itemBeforeClass,a,this),i(s,this._options.itemChangeIndicatorClass,a,this)):i(s,this._options.itemBeforeClass,r,this,!0),i(s,this._options.itemAppliedClass,r,this,!0),e.featuresOnHighlights||i(s,this._options.itemAppliedClass,function(t,n){l(t,e.features)},this,!0),o.element=s,o},m._renderSVG=function(e,t){var r,a,s={glyphClass:"glyph",ylineClass:"yline",boxClass:"box",layoutClass:"layout",textClass:"text"},i=this._options.itemContentStackedElementClassPrefix,o={};for(r in s)s[r]=i+s[r];return a=new n(this._container.ownerDocument,this._fontsData,this._webFontProvider,s),a.render(e,t,o)},m._stackedTypeFactory=function(e,t,n){var r,a,s,i,o,l,c="string"==typeof e.content?[e.content]:e.content,h=[],d=["layout",h];if(i=e.behavior||"mixed",!(i in{mixed:!0,webfont:!0,outline:!0}))throw new Error('Unknown "stacked" content behavior "'+o+'"');for(a=0,s=c.length;a<s;a++){switch("mixed"===i?(o=u(c[a]),r=o[1],o=o[0]):(r=c[a],o=i),o){case"outline":l=f(r,e);break;case"webfont":default:l=p(r,e)}h.push(l)}return this._renderSVG(d,n)},m._contentFactories={stacked:"_stackedTypeFactory",text:"_textTypeFactory"},m._getContentFactory=function(e){var t=this._contentFactories[e.type];if("string"==typeof t&&(t=this[t]),!t)throw new Error('FeatureDisplay: Factory for "'+e.type+'" is not implemented.');return t},m._runContentFactory=function(e,t,n){var r=this._getContentFactory(e);return r.call(this,e,t,n)},m._makeElementFromBluePrint=function(e){var t,n,r,a,s,i=e.cloneNode(!0),o=Object.create(null),l={text:this._options.itemContentTextClass,stacked:this._options.itemContentStackedClass},u=[];for(n in l)t=i.getElementsByClassName(l[n]),t.length&&(o[n]=t[t.length-1]),Array.prototype.push.apply(u,t);for(r=0,a=u.length;r<a;r++)u[r].parentNode&&u[r].parentNode.removeChild(u[r]);return this._options.itemContentContainerClass&&(s=i.getElementsByClassName(this._options.itemContentContainerClass)[0]),s=s||i,{element:i,contentTemplates:o,insertionMarker:d("contents",s,!0)}},m._buildFeatureItem=function(e,n,r){var a,s,o,l,u,c=this._makeElementFromBluePrint(n),h=c.element,f=[],p={element:h,contents:f},d=this._container.ownerDocument.createDocumentFragment();"removeClasses"in e&&this._applyClasses(h,e.removeClasses,!0),"addClasses"in e&&this._applyClasses(h,e.addClasses),i(h,this._options.itemTagNameClass,function(t,n){t.textContent=e.features.join(", ")},this,!0),i(h,this._options.itemFriendlyNameClass,function(n,r){n.textContent="friendlyName"in e?e.friendlyName:e.features.map(function(e){return t.getFeature(e).friendlyName}).join("/")},this,!0);for(a=0,s=e.contents.length;a<s;a++)o=e.contents[a],l=c.contentTemplates[o.type],l&&(u=this._runContentFactory(o,l,r),d.appendChild(u.element),f.push(u));return f.length&&(c.insertionMarker?c.insertionMarker.parentNode.insertBefore(d,c.insertionMarker):h.appendChild(d)),p},m._buildFeatureItems=function(e,t){var n,r,a,s,i,o=[];for(n=0,r=this._bluePrintNodes.length;n<r;n++)if(a=this._bluePrintNodes[n][0],s=this._bluePrintNodes[n][1],i=this._buildFeatureItem(e,s,t),i.contents.length){for(a.parentNode.insertBefore(i.element,a),n=0,r=i.contents.length;n<r;n++)i.contents[n].onHasDocument&&i.contents[n].onHasDocument();o.push(i.element)}return o},m._buildFeatures=function(e,t){var n,r,a,s=[];for(n=0,r=e.length;n<r;n++)a=e[n],Array.prototype.push.apply(s,this._buildFeatureItems(a,t));return s},r}),define("specimenTools/widgets/FilesDrop",[],function(){"use strict";function e(e,t,n){this._container=e,this._pubSub=t,this._makeFileInput(n.needsPubSub?n.bind(null,this._pubSub):n,e)}var t=e.prototype;return t._makeFileInput=function(e,t){function n(t){e(this.files)}function r(e){i.click()}function a(e){e.stopPropagation(),e.preventDefault()}function s(t){t.stopPropagation(),t.preventDefault(),e(t.dataTransfer.files)}var i=t.ownerDocument.createElement("input");i.setAttribute("type","file"),i.setAttribute("multiple","multiple"),i.style.display="none",i.addEventListener("change",n),t.addEventListener("click",r),t.addEventListener("dragenter",a),t.addEventListener("dragover",a),t.addEventListener("drop",s)},e}),define("specimenTools/widgets/LoadProgressIndicator",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r){e.call(this,r),this._container=t,this._pubSub=n,this._pubSub.subscribe("prepareFont",this._onPrepareFont.bind(this)),this._pubSub.subscribe("loadFont",this._onLoadFont.bind(this)),this._pubSub.subscribe("allFontsLoaded",this._onAllFontsLoaded.bind(this)),this._numAllFonts=null,this._fontsLoaded=0,this._elements={progressBar:this._container.getElementsByClassName(this._options.progressBarClass),percentIndicator:this._container.getElementsByClassName(this._options.percentIndicatorClass),taskIndicator:this._container.getElementsByClassName(this._options.taskIndicatorClass)}}var n=t.prototype=Object.create(e.prototype);return t.defaultOptions={loadedClass:"load-progress_loaded",loadingClass:"load-progress_loading",progressBarClass:"load-progress__progress-bar",setProgressBar:function(e,t){e.style.width=t+"%"},percentIndicatorClass:"load-progress__percent",taskIndicatorClass:"load-progress__task"},n._updateProgress=function(e,t,n){var r,a,s;for(r=Math.round(this._fontsLoaded/this._numAllFonts*1e4)/100,a=0,s=this._elements.taskIndicator.length;a<s;a++)this._elements.taskIndicator[a].innerHTML=["<em>",e,"</em> ",n.lastIndexOf("/")===-1?n:"…"+n.slice(n.lastIndexOf("/"))].join("");for(a=0,s=this._elements.percentIndicator.length;a<s;a++)this._elements.percentIndicator[a].textContent=r+" %";for(a=0,s=this._elements.progressBar.length;a<s;a++)this._options.setProgressBar.call(this,this._elements.progressBar[a],r)},n._onPrepareFont=function(e,t,n){null===this._numAllFonts&&(this._applyClasses(this._container,this._options.loadingClass),this._applyClasses(this._container,this._options.loadedClass,!0),this._numAllFonts=n,this._numAllFonts=n),this._updateProgress("Requesting:",e,t)},n._onLoadFont=function(e,t,n){this._fontsLoaded+=1,this._updateProgress("Loaded:",e,t)},n._onAllFontsLoaded=function(e){this._applyClasses(this._container,this._options.loadedClass),this._applyClasses(this._container,this._options.loadingClass,!0)},t}),define("specimenTools/widgets/PerFont",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a,s){e.call(this,s),this._container=t,this._pubSub=n,this._fontsData=r,this._webFontProvider=a,this._pubSub.subscribe("allFontsLoaded",this._onAllFontsLoaded.bind(this)),this._contentElements=[],this._bluePrintNodes=this._getBluePrintNodes()}function n(e,t,n,r){var a,s,i=[];for(e.classList.contains(t)&&i.push(e),Array.prototype.push.apply(i,e.getElementsByClassName(t)),a=0,s=i.length;a<s;a++)n.call(r||null,i[a],a)}var r=t.prototype=Object.create(e.prototype);return r.constructor=t,t.defaultOptions={bluePrintNodeClass:"per-font__item-blueprint",itemClass:"per-font__item",fontDataClass:"per-font__data",currentFontClass:"per-font__current-font"},r._getBluePrintNodes=function(){var e,t,n,r=this._container.getElementsByClassName(this._options.bluePrintNodeClass),a=[];for(e=0,t=r.length;e<t;e++)n=r[e].cloneNode(!0),a.push([r[e],r[e].parentNode,n]),n.style.display=null,this._applyClasses(n,this._options.bluePrintNodeClass,!0),this._applyClasses(n,this._options.itemClass);return a},r._defaultGetValue=function(e,t){var n,r;if(r=n=e.getAttribute("data-getter"),0!==r.indexOf("get")&&(r=["get",r[0].toUpperCase(),r.slice(1)].join("")),!(r in this._fontsData)||"function"!=typeof this._fontsData[r])throw new Error('Unknown getter "'+n+'"'+(r!==n?'(as "'+r+'")':"")+".");return this._fontsData[r](t)},r._makeRotationItem=function(e,t){var n,r,a,s,i=e.cloneNode(!1),o=[],l=[o];for(r=0,a=e.childNodes.length;r<a;r++)n=e.childNodes[r],8!==n.nodeType||"rotate"!==n.textContent.trim()?o.push(n):(o=[],l.push(o));for(s=t%l.length,o=l[s],r=0,a=o.length;r<a;r++)i.appendChild(o[r].cloneNode(!0));return i},r._createItem=function(e,t,r){var a=t.hasAttribute("data-per-font-rotate")?this._makeRotationItem(t,e):t.cloneNode(!0);return n(a,this._options.currentFontClass,function(e,t){this._webFontProvider.setStyleOfElement(r,e)},this),n(a,this._options.fontDataClass,function(e,t){e.textContent=this._defaultGetValue(e,r)},this),a},r._createItems=function(e,t){var n,r,a,s,i,o,l,u=[];for(n=0,r=this._bluePrintNodes.length;n<r;n++)a=this._bluePrintNodes[n][0],s=this._bluePrintNodes[n][1],i=this._bluePrintNodes[n][2],l=i.hasAttribute("data-reverse-font-order")?t[t.length-1-e]:t[e],o=this._createItem(e,i,l),null!==a?s.insertBefore(o,a):s.appendChild(o),u.push(o);return u},r._onAllFontsLoaded=function(e){var t,n,r,a=this._fontsData.getFontIndexesInFamilyOrder();for(n=this._contentElements.length-1;n>=0;n--)this._contentElements[n].parentNode.removeChild(this._contentElements[n]);for(n=0,r=a.length;n<r;n++)t=this._createItems(n,a),Array.prototype.push.apply(this._contentElements,t)},t}),define("specimenTools/widgets/Diagram",["specimenTools/_BaseWidget","specimenTools/services/svgDrawing/DiagramRenderer"],function(e,t){"use strict";function n(t,n,r,a,s){e.call(this,s),this._container=t,this._pubSub=n,this._fontsData=r,this._webFontProvider=a,this._svg=null,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this))}var r=n.prototype=Object.create(e.prototype);r.constructor=n,n.defaultOptions={glyphClass:"diagram__glyph",ylineClass:"diagram__yline",boxClass:"diagram__box",layoutClass:"diagram__layout",textClass:"diagram__text"};var a={xHeight:["box",[["layout",[["glyph","x",{style:"highlighted"}],["glyph","X",{style:"normal"}]],{spacing:40}],["yline","baseLine",{style:"normal",insert:0}],["yline","xHeight",{style:"highlighted",insert:0}]],{minLeftSideBearing:50,minRightSideBearing:50}],stylisticSets:["layout",[["box",[["glyph","G.ss04",{style:"highlighted"}],["glyph","G",{style:"muted"}]],{align:"left"}],["box",[["glyph","g.ss01",{style:"highlighted"}],["glyph","g",{style:"muted"}]],{align:"right"}],["box",[["glyph","R.ss03",{style:"highlighted"}],["glyph","R",{style:"muted"}]],{align:"left"}],["box",[["glyph","l.ss02",{style:"highlighted"}],["glyph","l",{style:"muted"}]],{align:"left"}]]],basicLines:function(){var e=this._container.hasAttribute("data-text-content")?this._container.getAttribute("data-text-content"):"Hamburger";return["box",[["text",e,{align:"center",style:"normal"}],["yline","baseLine",{style:"normal",insert:0}],["yline","xHeight",{style:"normal",insert:0}],["yline","capHeight",{style:"normal",insert:0}],["yline","descender",{style:"normal",insert:0}]],{minLeftSideBearing:350,minRightSideBearing:350}]}};return r._onActivateFont=function(e){var n,r,s,i=this._container.getAttribute("data-diagram-name"),o=a[i],l={ascent:"data-diagram-ascent",descent:"data-diagram-descent",height:"data-diagram-height"},u=Object.create(null);if(this._svg&&this._container.removeChild(this._svg),"function"==typeof o&&(o=o.call(this)),o){s=new t(this._container.ownerDocument,this._fontsData,this._webFontProvider,this._options);for(r in l)this._container.hasAttribute(l[r])&&(u[r]=parseFloat(this._container.getAttribute(l[r])));n=s.render(o,e,u),this._svg=n.element,this._container.appendChild(this._svg),n.onHasDocument()}},n}),define("specimenTools/widgets/CurrencySymbols",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._container=t,this._pubSub=n,this._fontsData=r,this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this))}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={symbols:[[36,"DOLLAR SIGN","$18.9"],[162,"CENT SIGN","$99"],[163,"POUND SIGN","$68"],[164,"CURRENCY SIGN","1$"],[165,"YEN SIGN","$998,000.15"],[1423,"ARMENIAN DRAM SIGN"],[1547,"AFGHANI SIGN"],[2546,"BENGALI RUPEE MARK"],[2547,"BENGALI RUPEE SIGN"],[2555,"BENGALI GANDA MARK"],[2801,"GUJARATI RUPEE SIGN"],[3065,"TAMIL RUPEE SIGN"],[3647,"THAI CURRENCY SYMBOL BAHT"],[6107,"KHMER CURRENCY SYMBOL RIEL"],[8352,"EURO-CURRENCY SIGN"],[8353,"COLON SIGN"],[8354,"CRUZEIRO SIGN"],[8355,"FRENCH FRANC SIGN"],[8356,"LIRA SIGN"],[8357,"MILL SIGN"],[8358,"NAIRA SIGN"],[8359,"PESETA SIGN"],[8360,"RUPEE SIGN"],[8361,"WON SIGN"],[8362,"NEW SHEQEL SIGN"],[8363,"DONG SIGN"],[8364,"EURO SIGN","$75"],[8365,"KIP SIGN"],[8366,"TUGRIK SIGN"],[8367,"DRACHMA SIGN"],[8368,"GERMAN PENNY SIGN"],[8369,"PESO SIGN"],[8370,"GUARANI SIGN"],[8371,"AUSTRAL SIGN"],[8372,"HRYVNIA SIGN"],[8373,"CEDI SIGN"],[8374,"LIVRE TOURNOIS SIGN"],[8375,"SPESMILO SIGN"],[8376,"TENGE SIGN"],[8377,"INDIAN RUPEE SIGN"],[8378,"TURKISH LIRA SIGN"],[8379,"NORDIC MARK SIGN"],[8380,"MANAT SIGN"],[8381,"RUBLE SIGN"],[8382,"LARI SIGN"],[43064,"NORTH INDIC RUPEE MARK"],[65020,"RIAL SIGN"],[65129,"SMALL DOLLAR SIGN"],[65284,"FULLWIDTH DOLLAR SIGN"],[65504,"FULLWIDTH CENT SIGN"],[65505,"FULLWIDTH POUND SIGN"],[65509,"FULLWIDTH YEN SIGN"],[65510,"FULLWIDTH WON SIGN"],[402,"FLORIN SIGN","$32"]],symbolTexts:{},sampleClass:"currency-symbols__sample",symbolClass:"currency-symbols__sample-symbol",textClass:"currency-symbols__sample-text",fallbackSymbolText:"$13.99"},n._makeSample=function(e,t,n){var r,a,s,i,o,l=n[1],u=this._container.ownerDocument.createElement("span"),c=e in this._options.symbolTexts?this._options.symbolTexts[e]:n[2]||this._options.fallbackSymbolText;for(c=c.split("$"),u.setAttribute("title",[l," (u",e.toString("16"),")"].join("")),this._applyClasses(u,this._options.sampleClass),a=c.length,s=a-1,r=0;r<a;r++)""!==c[r]&&(i=this._container.ownerDocument.createElement("span"),i.textContent=c[r],this._applyClasses(i,this._options.textClass),u.appendChild(i)),r>=s||(o=this._container.ownerDocument.createElement("span"),o.textContent=t,this._applyClasses(o,this._options.symbolClass),u.appendChild(o));return u},n._onActivateFont=function(e){for(var t,n,r,a,s,i,o=this._fontsData.getFont(e);this._container.childNodes.length;)this._container.removeChild(this._container.lastChild);for(t=0,n=this._options.symbols.length;t<n;t++)r=this._options.symbols[t],a=r[0],s=String.fromCodePoint(a),o.charToGlyphIndex(s)&&(i=this._makeSample(a,s,r),this._container.appendChild(i),this._container.appendChild(this._container.ownerDocument.createTextNode(" ")))},t}),define("specimenTools/widgets/FontLister",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r,a){e.call(this,a),this._container=t,this._pubSub=n,this._fontsData=r,this._elements=[],this._selectContainer=this._container.ownerDocument.createElement("select"),this._selectContainer.addEventListener("change",this._selectFont.bind(this)),this._selectContainer.enabled=!1,this._container.appendChild(this._selectContainer),this._pubSub.subscribe("allFontsLoaded",this._onAllFontsLoaded.bind(this)),this._pubSub.subscribe("activateFont",this._onActivateFont.bind(this))}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={order:"load"},n._onActivateFont=function(e){var t,n,r,a=this._selectContainer.children;for(t=0,n=a.length;t<n;t++)r=a[t],r.selected=r.value==e},n._onAllFontsLoaded=function(){var e,t,n,r,a;switch(this._options.order){case"family":e=this._fontsData.getFontIndexesInFamilyOrder();case"load":default:e=this._fontsData.getFontIndexes()}for(t=0,n=e.length;t<n;t++)a=e[t],r=this._selectContainer.ownerDocument.createElement("option"),r.textContent=[this._fontsData.getFamilyName(a),this._fontsData.getStyleName(a)].join(" "),r.value=a,this._elements.push(r),this._selectContainer.appendChild(r);this._selectContainer.enabled=!0},n._selectFont=function(e){this._pubSub.publish("activateFont",e.target.value)},t}),define("specimenTools/widgets/DragScroll",["specimenTools/_BaseWidget"],function(e){"use strict";function t(t,n,r){e.call(this,r),this._container=t,this._pubSub=n,this._container.addEventListener("mousedown",this._initDrag.bind(this)),this._container.addEventListener("touchstart",this._initDrag.bind(this)),this.__endDrag=this._endDrag.bind(this),this.__performMove=this._performMove.bind(this),this.__move=this._move.bind(this),this._startPos=null,this._lastPos=null,this._requestID=null}var n=t.prototype=Object.create(e.prototype);return n.constructor=t,t.defaultOptions={},n._initDrag=function(e){"touches"in e&&(e=e.touches[0]),this._startPos={x:e.screenX,y:e.screenY},this._container.ownerDocument.addEventListener("mouseup",this.__endDrag),this._container.ownerDocument.addEventListener("touchend",this.__endDrag),this._container.ownerDocument.addEventListener("mousemove",this.__move),this._container.ownerDocument.addEventListener("touchmove",this.__move)},n._endDrag=function(){this._container.ownerDocument.removeEventListener("mouseup",this.__endDrag),this._container.ownerDocument.removeEventListener("touchend",this.__endDrag),this._container.ownerDocument.removeEventListener("mousemove",this.__move),this._container.ownerDocument.removeEventListener("touchmove",this.__move),this._startPos=null,this._lastPos=null,null!==this._requestID&&(window.cancelAnimationFrame(this._requestID),this._requestID=null)},n._performMove=function(){this._container.scrollLeft=this._container.scrollLeft+this._startPos.x-this._lastPos.x,this._container.scrollTop=this._container.scrollTop+this._startPos.y-this._lastPos.y,this._requestID=null},n._move=function(e){"touches"in e&&(e=e.touches[0]),null!==this._lastPos&&(this._startPos=this._lastPos),this._lastPos={x:e.screenX,y:e.screenY},null===this._requestID&&(this._requestID=window.requestAnimationFrame(this.__performMove))},t}),define("main",["specimenTools/loadFonts","specimenTools/initDocumentWidgets","specimenTools/services/PubSub","specimenTools/services/FontsData","specimenTools/services/WebfontProvider","specimenTools/widgets/GlyphTables","specimenTools/widgets/FamilyChooser","specimenTools/widgets/GenericFontData","specimenTools/widgets/CurrentWebFont","specimenTools/widgets/TypeTester","specimenTools/widgets/FeatureDisplay","specimenTools/widgets/FilesDrop","specimenTools/widgets/LoadProgressIndicator","specimenTools/widgets/PerFont","specimenTools/widgets/Diagram","specimenTools/widgets/CurrencySymbols","specimenTools/widgets/FontLister","specimenTools/widgets/DragScroll"],function(e,t,n,r,a,s,i,o,l,u,c,h,f,p,d,m,g,y){"use strict";function v(){var v,b,S=window.fontSpecimenConfig,_=window.componentHandler,C={glyphTables:{glyphTable:{glyphClass:"mdlfs-glyph-table__glyph",glyphActiveClass:"mdlfs-glyph-table__glyph_active"}},familyChooser:{italicSwitchContainerClasses:["mdl-switch","mdl-js-switch","mdl-js-ripple-effect","mdlfs-family-switcher__italic-switch"],italicSwitchCheckboxClasses:["mdl-switch__input"],italicSwitchLabelClasses:["mdl-switch__label"],setItalicSwitch:function(e,t,n){var r;return e.container.MaterialSwitch?(e.container.MaterialSwitch[t?"enable":"disable"](),void e.container.MaterialSwitch[n?"on":"off"]()):(r=this.constructor.defaultOptions.setItalicSwitch,void r.call(this,e,t,n))},weightButtonClasses:"mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-family-switcher__button",weightButtonActiveClass:"mdl-button--colored"},typeTester:{slider_default_min:10,slider_default_max:128,slider_default_value:32,slider_default_step:1,slider_default_unit:"px",slider_default_class:"mdl-slider mdl-js-slider",sliderControlsClass:"mdlfs-type-tester__slider",labelControlsClass:"mdlfs-type-tester__label",optionalFeaturesControlsClass:"mdlfs-type-tester__features--optional",defaultFeaturesControlsClass:"mdlfs-type-tester__features--default",contentContainerClass:"mdlfs-type-tester__content",setCssValueToInput:function(e,t){"MaterialSlider"in e?e.MaterialSlider.change(t):e.value=t},optionalFeatureButtonClasses:"mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-type-tester__feature-button",defaultFeatureButtonClasses:"mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-type-tester__feature-button",featureButtonActiveClass:"mdl-button--colored",activateFeatureControls:function(e){_.upgradeElements(e)}},fontData:{},featureDisplay:{itemTagClassPrefix:"mdlfs-feature-display__item-tag_",bluePrintNodeClass:"mdlfs-feature-display__item-blueprint",itemBeforeClass:"mdlfs-feature-display__item__before",itemChangeIndicatorClass:"mdlfs-feature-display__item__change-indicator",itemContentContainerClass:"mdlfs-feature-display__item-content-container",itemAppliedClass:"mdlfs-feature-display__item__applied",itemTagNameClass:"mdlfs-feature-display__item__tag-name",itemFriendlyNameClass:"mdlfs-feature-display__item__friendly-name",highlightClasses:"mdlfs-feature-display__item_highlight",tabularClasses:"mdlfs-feature-display__item_tabular",itemContentTextClass:"mdlfs-feature-display__item__content-text",itemContentStackedClass:"mdlfs-feature-display__item__content-stacked",itemContentStackedElementClassPrefix:"mdlfs-feature-display__content-stacked__",feaureItemsSetup:[{friendlyName:"Stylistic Alternates",weight:"-10",removeClasses:["mdl-cell--4-col","mdl-cell--order-3","mdl-cell--4-col-tablet"],addClasses:["mdl-cell--6-col","mdl-cell--order-1","mdl-cell--12-col-tablet"],contents:[{type:"stacked",features:["ss01","ss02","ss03","ss04"],content:["G","g","R","outline! l:l.ss02, align:left"],behavior:"mixed"}]},{weight:"-9.99",contents:[{type:"text",features:"smcp",content:"F*ashion* W*eek*"}]},{weight:"-9.98",contents:[{type:"text",features:"tnum",behavior:"tabular",content:"35.92604187"}]},{weight:"-9.97",contents:[{type:"text",features:"swsh",content:"*A*f*t*e*r* *M*us*ty*"}]},{weight:"-9.96",contents:[{type:"text",features:"pnum",content:"35.92604187"}]},{weight:"-9.96",addClasses:"mdlfs-feature-display__item__content_inline",contents:[{type:"text",features:"titl",behavior:"show-before",content:"*Ä*"},{type:"text",features:"titl",behavior:"show-before",content:"*Ö*"},{type:"text",features:"titl",behavior:"show-before",content:"*Ü*"}]},{weight:"-9.95",addClasses:["mdlfs-feature-display__item__content_inline","mdlfs-feature-display__item__content_inline-no-gap"],contents:[{type:"text",features:"sups",content:"H*2*O ",featuresOnHighlights:!0},{type:"text",features:"subs",content:"(Z*9*",featuresOnHighlights:!0},{type:"text",features:"sups",content:"X*6*",featuresOnHighlights:!0},{type:"text",features:"subs",content:"W*3*)",featuresOnHighlights:!0}]},{weight:"-9.94",addClasses:"mdlfs-feature-display__item__content_inline",contents:[{type:"text",features:"frac",behavior:"show-before",content:"*1/2*"},{type:"text",features:"frac",behavior:"show-before",content:"*4/5*"}]},{contents:[{type:"text",features:"ordn",behavior:"show-before",content:"*1a* vez; *5o* ano"}]}]},loadProgressIndicator:{loadedClass:"mdlfs-load-progress_loaded",loadingClass:"mdlfs-load-progress_loading",progressBarClass:"mdlfs-load-progress__progress-bar",setProgressBar:function(e,t){e.MaterialProgress&&e.MaterialProgress.setProgress(t)},percentIndicatorClass:"mdlfs-load-progress__percent",taskIndicatorClass:"mdlfs-load-progress__task"},perFont:{itemClass:"mdlfs-per-font__item",bluePrintNodeClass:"mdlfs-per-font__item-blueprint",fontDataClass:"mdlfs-per-font__data",currentFontClass:"mdlfs-per-font__current-font"},diagram:{glyphClass:"mdlfs-diagram__glyph",ylineClass:"mdlfs-diagram__yline",boxClass:"mdlfs-diagram__box",layoutClass:"mdlfs-diagram__layout",textClass:"mdlfs-diagram__text"},currencySymbols:{sampleClass:"mdlfs-currency-symbols__sample",symbolClass:"mdlfs-currency-symbols__sample-symbol",textClass:"mdlfs-currency-symbols__sample-text"},fontLister:{}},x=new n,T=new r(x,{useLaxDetection:!0}),w=new a(window,x,T);v=[["mdlfs-family-switcher",i,T,C.familyChooser],["mdlfs-glyph-table",s,C.glyphTables],["mdlfs-font-data",o,T,C.fontData],["mdlfs-current-font",l,w],["mdlfs-type-tester",u,T,C.typeTester],["mdlfs-feature-display",c,T,w,C.featureDisplay],["mdlfs-fonts-drop",h,e.fromFileInput],["mdlfs-load-progress",f,C.loadProgressIndicator],["mdlfs-per-font",p,T,w,C.perFont],["mdlfs-diagram",d,T,w,C.diagram],["mdlfs-currency-symbols",m,T,C.currencySymbols],["mdlfs-font-select",g,T,C.fontLister],["mdlfs-drag-scroll",y]],b=t(window.document,v,x),x.subscribe("allFontsLoaded",function(){_.upgradeElements(b),x.publish("activateFont",0)}),S.fontFiles?e.fromUrl(x,S.fontFiles):S.loadFromFileInput}return v}),define("init",["main"],function(e){e()}),require(["init"]);
+define('Atem-Pen-Case/pens/SVGPen',[
+    './BasePen'
+], function(
+    Parent
+) {
+    "use strict";
+
+    /*constructor*/
+    function SVGPen(path, glyphSet) {
+        Parent.call(this, glyphSet);
+        this.path = path;
+    }
+
+    /*inheritance*/
+    var _p = SVGPen.prototype = Object.create(Parent.prototype);
+    _p.constructor = SVGPen;
+
+    /*definition*/
+        _p._addSegment = function(segment)
+        {
+            var d = this.path.getAttribute('d');
+            this.path.setAttribute('d', (d ? d + ' ' : '') + segment);
+        };
+
+        _p._moveTo = function(pt)
+        {
+            this._addSegment(['M',pt[0],pt[1]].join(' '));
+        };
+
+        _p._lineTo = function(pt)
+        {
+            this._addSegment(['L',pt[0],pt[1]].join(' '));
+        };
+
+        _p._curveToOne = function(pt1, pt2, pt3)
+        {
+            this._addSegment(['C', pt1[0], pt1[1], pt2[0], pt2[1]
+                                            , pt3[0], pt3[1],].join(' '));
+        };
+
+        _p._closePath = function()
+        {
+            this._addSegment('z');
+        };
+        /**
+         * Delete all segments from path
+         */
+        _p.clear = function()
+        {
+            this.path.setAttribute('d', '');
+        };
+
+    return SVGPen;
+});
+
+define('specimenTools/widgets/GlyphTable',[
+    'specimenTools/_BaseWidget'
+  , 'Atem-Pen-Case/pens/SVGPen'
+], function(
+    Parent
+  , SVGPen
+){
+    "use strict";
+    /*globals window, console*/
+
+    /**
+     * GlyphTable renders a all Glyphs of a opentype.js font as SVG elements.
+     * It is not initialized as a widget directly, but via the GlyphsTables
+     * widget.
+     *
+     * Rendering all glyphs of a font takes a moment. To prevent the user
+     * interface from being blocked GlyphTable renders the glyphs in batches
+     * and in between interrupts using the window.requestAnimationFrame
+     * interface. This behavior can be controlled by options:
+     *
+     * `loadAtOnce`: The number of glyphs to render per iteration, default 50
+     * `loadSerial`: render all glyphs at once, default false
+     */
+
+    var svgns = 'http://www.w3.org/2000/svg';
+
+    function GlyphTable(doc, font, options) {
+        Parent.call(this, options);
+        this._element = doc.createElement('div');
+        this._font = font;
+        this._setDimensions = null;
+        this._loadProgress = [0, null];
+        this.__initCells = this._initCells.bind(this);
+
+        this._element.addEventListener('click', this._glyphClickHandler.bind(this));
+    }
+
+    var _p = GlyphTable.prototype = Object.create(Parent.prototype);
+    _p.constructor = GlyphTable;
+
+    GlyphTable.defaultOptions = {
+        glyphClass: 'glyph'
+      , loadAtOnce: 50
+      , loadSerial: false
+      , glyphActiveClass: 'active'
+    };
+
+    Object.defineProperty(_p, 'element', {
+        get: function() {
+            this.activate();
+            return this._element;
+        }
+    });
+
+    function draw(glyph, pen) {
+        var i, l, cmd;
+        for(i=0,l=glyph.path.commands.length;i<l;i++){
+            cmd = glyph.path.commands[i];
+            switch (cmd.type) {
+                case 'M':
+                    pen.moveTo([cmd.x, cmd.y]);
+                    break;
+                case 'Z':
+                    pen.closePath();
+                    break;
+                case 'Q':
+                    pen.qCurveTo([cmd.x1, cmd.y1], [cmd.x, cmd.y]);
+                    break;
+                case 'C':
+                    pen.curveTo([cmd.x1, cmd.y1], [cmd.x2, cmd.y2],[cmd.x, cmd.y]);
+                    break;
+                case 'L':
+                    pen.lineTo([cmd.x, cmd.y]);
+                    break;
+                default:
+                    console.warn('Unknown path command:', cmd.type);
+            }
+        }
+    }
+
+    _p.setDimensions = function(width, ascent, descent) {
+        this._setDimensions = {
+            width: width
+          , ascent: ascent
+          , descent: descent
+        };
+    };
+
+    _p.getDimensions = function(forceOwnDimensions) {
+        var ascent, descent, width, yMax, yMin;
+        if(!forceOwnDimensions && this._setDimensions) {
+            width = this._setDimensions.width;
+            ascent = this._setDimensions.ascent;
+            descent = this._setDimensions.descent;
+        }
+        else {
+            yMax = this._font.tables.head.yMax;
+            yMin = this._font.tables.head.yMin;
+            width =  yMax + (yMin > 0 ? 0 : Math.abs(yMin));
+            //usWinAscent and usWinDescent should be the maximum values for
+            // all glyphs over the complete family.
+            // So,if it ain't broken, styles of the same family should
+            // all render with the same size.
+            ascent =  this._font.tables.os2.usWinAscent;
+            descent = this._font.tables.os2.usWinDescent;
+
+        }
+        return {
+              width: width
+            , height: ascent + descent
+            , ascent: ascent
+            , descent: descent
+        };
+    };
+
+    _p._glyphClickHandler = function(evt) {
+        var active = this._element.getElementsByClassName(this._options.glyphActiveClass)
+          , i, l
+          , element
+          , glyph = null
+          ;
+
+        element = evt.target;
+        while(element && element !== this._element) {
+            if(element.classList.contains(this._options.glyphClass)) {
+                glyph = element;
+                break;
+            }
+            else
+                element = element.parentElement;
+        }
+
+        for(i=0,l=active.length;i<l;i++) {
+            if (active[i] === glyph)
+                // the clicked element was active, so we just deactivate it
+                glyph = null;
+            active[i].classList.remove(this._options.glyphActiveClass);
+        }
+
+        if(glyph)
+            glyph.classList.add(this._options.glyphActiveClass);
+    };
+
+
+    _p._initCell = function(glyphName, glyphIndex) {
+        var element = this._element.ownerDocument.createElement('div')
+          , svg = this._element.ownerDocument.createElementNS(svgns, 'svg')
+          , path = this._element.ownerDocument.createElementNS(svgns, 'path')
+          , glyphSet = {}
+          , pen = new SVGPen(path, glyphSet)
+          , glyph = this._font.glyphs.get(glyphIndex)
+          , dimensions = this.getDimensions()
+          , width = dimensions.width
+          , height = dimensions.height
+          , ascent = dimensions.ascent
+          , glyphWidth = (glyph.xMax || 0) - (glyph.xMin || 0)
+            // move it `-glyph.xMin` horizontally to have it start at x=0
+            // move it `width * 0.5` horizontally to have it start in the center
+            // move it `-glyphWidth * 0.5` horizontally to center the glyph
+          , centered = - (glyph.xMin || 0) + (width * 0.5) - (glyphWidth * 0.5)
+          , transformation = [1, 0, 0, -1, centered, ascent]
+          ;
+        element.classList.add(this._options.glyphClass);
+        svg.setAttribute('viewBox', [0, 0, width, height].join(' '));
+        path.setAttribute('transform', 'matrix(' +  transformation.join(', ') + ')');
+
+        svg.appendChild(path);
+        draw(glyph, pen);
+        element.appendChild(svg);
+        element.setAttribute('title', glyph.name);
+        this._element.appendChild(element);
+    };
+
+    _p._initCells = function() {
+        var i = this._loadProgress[0]
+          , l = this._font.glyphNames.names.length
+          , loadAtOnce = this._options.loadAtOnce
+          ;
+        for(;i<l && loadAtOnce>0;i++,loadAtOnce--)
+            this._initCell(this._font.glyphNames[i], i);
+
+        this._loadProgress[0] = i;
+        this._loadProgress[1] = null;
+        if(i<l)
+            this._loadProgress[1] = window.requestAnimationFrame(this.__initCells);
+    };
+
+    _p._initCellsSerial = function() {
+        var i=0
+          , l= this._font.glyphNames.names.length
+          ;
+        for(;i<l;i++)
+            this._initCell(this._font.glyphNames[i], i);
+        this._loadProgress[0] = l;
+    };
+
+    _p.activate = function() {
+        if(this._loadProgress[1] !== null
+                || this._loadProgress[0] >= (this._font.glyphNames.names.length))
+            return;
+        if(this._options.loadSerial)
+            this._initCellsSerial();
+        else
+            this._initCells();
+    };
+
+    _p.deactivate = function() {
+        if(this._loadProgress[1] === null)
+            return;
+        window.cancelAnimationFrame(this._loadProgress[1]);
+        this._loadProgress[1] = null;
+
+    };
+
+    return GlyphTable;
+});
+
+define('specimenTools/widgets/GlyphTables',[
+    'specimenTools/_BaseWidget'
+  , './GlyphTable'
+], function(
+    Parent
+  , GlyphTable
+) {
+    "use strict";
+
+    /**
+     * GlyphTables manages the rendering of the GlyphTable for the current
+     * font.
+     *
+     * The main task is switching to the GlyphTable for the active font.
+     *
+     * Another task is to determine a common glyph element size for all
+     * fonts/GlyphTable-children:
+     * When rendering a font, the size of the glyphs svg element is
+     * determined by GlyphTable. But, when multiple fonts are displayed
+     * this is resulting in different glyph element sizes. Thus, when all
+     * fonts are available (see `_p._onAllFontsLoaded`) GlyphTable will
+     * use the `setDimensions` method of its children to set a common glyph
+     * element size.
+     *
+     * Options:
+     *
+     * `glyphTable`: Object, configuration passed to the children
+     * `GlyphTable` constructor.
+     */
+    function GlyphTables(container, pubsub, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubsub;
+
+        this._activeTable  = null;
+
+        this._options = this._makeOptions(options);
+
+        this._tables = [];
+        this._tablesContainer = this._container.ownerDocument.createElement('div');
+        this._container.appendChild(this._tablesContainer);
+
+        this._pubSub.subscribe('loadFont', this._onLoadFont.bind(this));
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+        this._pubSub.subscribe('allFontsLoaded', this._onAllFontsLoaded.bind(this));
+    }
+
+    var _p = GlyphTables.prototype = Object.create(Parent.prototype);
+    _p.constructor = GlyphTables;
+
+    GlyphTables.defaultOptions = {
+        glyphTable: {}
+    };
+
+    _p._onLoadFont = function (i, fontFileName, font) {
+        var gt = new GlyphTable(this._tablesContainer.ownerDocument, font, this._options.glyphTable);
+        this._tables[i] = gt;
+    };
+
+    _p._onAllFontsLoaded = function(countAll) {
+        /*jshint unused:vars*/
+        var i, l, dimensions, ascent = null, descent = null, width = null;
+        for(i=0,l=this._tables.length;i<l;i++) {
+            dimensions = this._tables[i].getDimensions(true);
+            ascent = Math.max(ascent || 0, dimensions.ascent);
+            descent = Math.max(descent || 0, dimensions.descent);
+            width = Math.max(width || 0, dimensions.width);
+        }
+        for(i=0,l=this._tables.length;i<l;i++)
+            this._tables[i].setDimensions(width, ascent, descent);
+    };
+
+    _p._onActivateFont = function(i) {
+        if(this._activeTable === i)
+            return;
+        while(this._tablesContainer.children.length)
+            this._tablesContainer.removeChild(this._tablesContainer.lastChild);
+        if(this._activeTable !== null)
+            this._tables[this._activeTable].deactivate();
+        this._tables[i].activate();
+        this._tablesContainer.appendChild(this._tables[i].element);
+        this._activeTable = i;
+    };
+
+    return GlyphTables;
+});
+
+define('specimenTools/widgets/FamilyChooser',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+
+    /**
+     * FamilyChooser provides an interface to switch between all
+     * loaded fonts. Therefore, it analyzes the available fonts, groups
+     * them by family and orders them by weight. If italic styles are
+     * present a switch to change to the italics is included per family.
+     */
+
+    var cssWeight2weightNames = {
+            100: 'Thin'
+          , 200: 'ExtraLight'
+          , 300: 'Light'
+          , 400: 'Regular'
+          , 500: 'Medium'
+          , 600: 'SemiBold'
+          , 700: 'Bold'
+          , 800: 'ExtraBold'
+          , 900: 'Black'
+          // bad values (found first in WorkSans)
+          , 260: 'Thin'
+          , 280: 'ExtraLight'
+        };
+
+    function FamilyChooser(container, pubSub, fontsData, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsDataObject = fontsData;
+
+        this._switches = [];
+        this._switchesContainer = this._container.ownerDocument.createElement('div');
+        this._container.appendChild(this._switchesContainer);
+
+        this._pubSub.subscribe('loadFont', this._onLoadFont.bind(this));
+        this._pubSub.subscribe('allFontsLoaded', this._onAllFontsLoaded.bind(this));
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+
+        this._fonts = [];
+        this._activeFont = null;
+        this._familiesData = null;
+        this._fontData = null;
+        this._familyElements = null;
+    }
+
+    var _p = FamilyChooser.prototype = Object.create(Parent.prototype);
+    _p.constructor = FamilyChooser;
+
+    FamilyChooser.defaultOptions = {
+            italicSwitchContainerClasses: []
+          , italicSwitchCheckboxClasses: []
+          , italicSwitchLabelClasses: []
+          , setItalicSwitch: function setItalicSwitch(italicSwitch, enabled, checked) {
+                italicSwitch.checkbox.disabled = !enabled;
+                italicSwitch.checkbox.checked = checked;
+            }
+          , weightButtonClasses: []
+          , weightButtonActiveClass: 'active'
+    };
+
+    _p._otherStyle = function otherStyle(style) {
+        return style === 'normal' ? 'italic' : 'normal';
+    };
+
+    _p._onLoadFont = function (fontIndex, fontFileName, font) {
+        this._fonts[fontIndex] = font;
+    };
+
+    _p._switchItalic = function(checkbox) {
+        var fontData = this._fontData[this._activeFont]
+         , fontId
+         ;
+        // did not change anything
+        if(checkbox.checked && fontData.style === 'italic')
+            return;
+
+        if(!fontData || fontData.otherStyle === null)
+            // the second case shouldn't really happen, because the
+            // italic switch should be inactive or not available.
+            return;
+        fontId = fontData.otherStyle;
+        this._pubSub.publish('activateFont', fontId);
+    };
+
+    _p._switchFont = function(familyIndex, weight) {
+        // get Font Id ...
+        var currentStyle = this._activeFont !== null
+                ? this._fontData[this._activeFont].style
+                : 'normal'
+          , styleDict = this._familiesData[familyIndex][1][weight]
+          , fontId = currentStyle in styleDict
+                // if the family is well organized, this is the expected case
+                ? styleDict[currentStyle]
+                // fringe again, family has not all styles for all fonts
+                : styleDict[this._otherStyle(currentStyle)]
+          ;
+        this._pubSub.publish('activateFont', fontId);
+    };
+
+    _p._makeItalicSwitch = function() {
+        var doc = this._container.ownerDocument
+          , italicSwitch = {}
+          ;
+        italicSwitch.container = doc.createElement('label');
+        this._applyClasses(italicSwitch.container, this._options.italicSwitchContainerClasses);
+
+        italicSwitch.checkbox = doc.createElement('input');
+        italicSwitch.checkbox.setAttribute('type', 'checkbox');
+        this._applyClasses(italicSwitch.checkbox, this._options.italicSwitchCheckboxClasses);
+        italicSwitch.checkbox.addEventListener('change', this._switchItalic.bind(this, italicSwitch.checkbox));
+
+        italicSwitch.label = doc.createElement('span');
+        italicSwitch.label.textContent = 'italic';
+        italicSwitch.label.classList.add('mdl-switch__label');
+        this._applyClasses(italicSwitch.label, this._options.italicSwitchLabelClasses);
+
+        italicSwitch.container.appendChild(italicSwitch.checkbox);
+        italicSwitch.container.appendChild(italicSwitch.label);
+
+        return italicSwitch;
+    };
+
+    _p._makeWeightButton = function(familyIndex, weight) {
+        var doc = this._container.ownerDocument
+          , weightButton = doc.createElement('button')
+          , label = weight + ' ' + cssWeight2weightNames[weight]
+          ;
+        weightButton.textContent = label;
+        this._applyClasses(weightButton, this._options.weightButtonClasses);
+        weightButton.addEventListener('click', this._switchFont.bind(this, familyIndex, weight));
+        return weightButton;
+    };
+
+    // TODO!!
+    _p._makeFamilyElement = function(familyIndex, familyName, weightDict) {
+            // default text-sort should suffice here
+        var weights = Object.keys(weightDict).sort()
+          , familyHasTwoStyles = false
+          , result = Object.create(null)
+          , doc = this._container.ownerDocument
+          , titleElement, weightsElement, weightButton
+          , i, l, weight
+          ;
+
+        result.weights = Object.create(null);
+        result.element = doc.createElement('div');
+        titleElement = doc.createElement('h4');
+        titleElement.textContent = familyName;
+        result.element.appendChild(titleElement);
+
+
+        for(i=0,l=weights.length;i<l;i++) {
+            weight = weightDict[weights[i]];
+            if('normal' in weight && 'italic' in weight) {
+                familyHasTwoStyles = true;
+                break;
+            }
+        }
+
+        if(familyHasTwoStyles) {
+            // make italic checkbox/control
+            result.italicSwitch = this._makeItalicSwitch();
+            result.element.appendChild(result.italicSwitch.container);
+        }
+
+        weightsElement = doc.createElement('div');
+        for(i=0,l=weights.length;i<l;i++) {
+            weight = weights[i];
+            // add weight selection button
+            weightButton = this._makeWeightButton(familyIndex, weight);
+            weightsElement.appendChild(weightButton);
+            result.weights[weight] = weightButton;
+        }
+        result.element.appendChild(weightsElement);
+
+        return result;
+    };
+
+    _p._getFontData = function(familiesData) {
+        var fontData = []
+          , familyIndex, fontIndex, l, familyName, weightDict, weight
+          , styleDict, style, otherStyle
+          ;
+
+        for(familyIndex=0,l=familiesData.length;familyIndex<l;familyIndex++) {
+            familyName = familiesData[familyIndex][0];
+            weightDict = familiesData[familyIndex][1];
+            for(weight in weightDict) {
+                styleDict = weightDict[weight];
+                for(style in styleDict) {
+                    fontIndex = styleDict[style];
+                    otherStyle = styleDict[this._otherStyle(style)];
+                    otherStyle = otherStyle !== undefined ? otherStyle : null;
+
+                    fontData[fontIndex] = {
+                        familyIndex: familyIndex
+                      , weight: weight
+                      , style: style
+                        // basically the style link:
+                      , otherStyle: otherStyle
+                    };
+                }
+            }
+        }
+        return fontData;
+    };
+
+    _p._onAllFontsLoaded = function(countAll) {
+        /*jshint unused:vars*/
+        var familiesData = this._fontsDataObject.getFamiliesData()
+          , familyElements = []
+          , doc = this._container.ownerDocument
+          , i, l
+          ;
+        for(i=0,l=familiesData.length;i<l;i++) {
+            if(i > 0)
+                this._container.appendChild(doc.createElement('hr'));
+
+            familyElements[i] = this._makeFamilyElement(i, familiesData[i][0]
+                                                         , familiesData[i][1]);
+
+            // put all family elements into the FamilyController block
+            this._container.appendChild(familyElements[i].element);
+
+        }
+        this._familiesData = familiesData;
+        this._fontData = this._getFontData(familiesData);
+        this._familyElements = familyElements;
+    };
+
+    _p._activateFont = function(i) {
+        // this will call this._onActivateFont
+        this._pubSub.publish('activateFont', i);
+    };
+
+    _p._setWeightButton = function(weightButton, isActive) {
+        this._applyClasses(weightButton, this._options.weightButtonActiveClass, !isActive);
+    };
+
+    _p._setItalicSwitch = function(italicSwitch, enabled, checked) {
+        /*jshint unused:vars*/
+        var args = [], i, l;
+        for(i=0,l=arguments.length;i<l;i++) args.push(arguments[i]);
+        this._options.setItalicSwitch.apply(this, args);
+    };
+
+    _p._setFamilyElement = function(familyElement, isActive) {
+        familyElement.classList[isActive ? 'add' : 'remove']('active');
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        // this should only change the view, not emit signals
+        // make the button(s) enabled/disabled and active/inactive etc.
+        var fontData = this._fontData[fontIndex]
+          , familyIndex = fontData.familyIndex, familyIdx, l
+            // all families: check/uncheck italic switches
+          , italicChecked = fontData.style === 'italic'
+          , italicSwitch, italicEnabled
+          , weights, weight, weightActive, familyActive
+          ;
+        for(familyIdx=0,l=this._familyElements.length;familyIdx<l;familyIdx++) {
+            familyActive = familyIdx === familyIndex;
+            this._setFamilyElement(this._familyElements[familyIdx].element, familyActive);
+
+            // set the state to all italic switches
+            italicSwitch = this._familyElements[familyIdx].italicSwitch;
+            if(italicSwitch) {
+                // can only be enabled when its family is active.
+                // AND there must be another style to switch to
+                italicEnabled = familyIdx === familyIndex && fontData.otherStyle !== null;
+                this._setItalicSwitch(italicSwitch, italicEnabled, italicChecked);
+            }
+
+            // set the active weight button active and all others inactive
+            weights = this._familyElements[familyIdx].weights;
+            for(weight in weights) {
+                weightActive = familyIdx === familyIndex && weight === fontData.weight;
+                this._setWeightButton(weights[weight], weightActive);
+            }
+        }
+        this._activeFont = fontIndex;
+    };
+
+    return FamilyChooser;
+});
+
+define('specimenTools/widgets/GenericFontData',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+    /*jshint esnext:true*/
+
+    /**
+     * GenericFontData looks at the "data-getter" attribute of the host
+     * element and queries FontData for that getter description and the
+     * current font. Then it sets hostElement.textContent to the result
+     * of the query.
+     *
+     * The "data-getter" attribute value should be the name of a getter function
+     * in FontData without the preceding `get` e.g. for `data-getter="NumberSupportedLanguages"`
+     * `fontData.getNumberSupportedLanguages(currentFontIndex)` will be called.
+     *
+     * The result of the call to FontData.get{...} is not specially formatted.
+     * arrays are joined with ", " but everything else will just be used
+     * as it.
+     *
+     * The option `getValue` can be used to adhoc enhance the getter and
+     * string formatting. If more is needed GenericFontData should be subclassed.
+     *
+     */
+    function GenericFontData(container, pubSub, fontData, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontData = fontData;
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+    }
+
+    var _p = GenericFontData.prototype = Object.create(Parent.prototype);
+    _p.constructor = GenericFontData;
+
+    GenericFontData.defaultOptions = {
+        // this can be a method called instead of the native getValue
+        // function. The single argument is (int) fontIndex.
+        // The this-value is the instance of GenericFontData.
+        getValue: null
+    };
+
+    _p._defaultGetValue  = function(fontIndex) {
+        var _getter, getter;
+        getter = _getter = this._container.getAttribute('data-getter');
+        if(getter.indexOf('get') !== 0)
+            getter = ['get', getter[0].toUpperCase(), getter.slice(1)].join('');
+
+        if(!(getter in this._fontData) || typeof this._fontData[getter] !== 'function')
+            throw new Error('Unknown getter "' + _getter + '"'
+                        + (getter !== _getter
+                                    ? '(as "' + getter + '")'
+                                    : '')
+                        +'.');
+        return this._fontData[getter](fontIndex);
+    };
+
+    _p._getValue = function(fontIndex) {
+        var value;
+        if(this._options.getValue !== null)
+            // This is a rude way to enhance this
+            return this._options.getValue.call(this, fontIndex);
+        value = this._defaultGetValue(fontIndex);
+        if(typeof value.length === 'number' && typeof value !== 'string')
+            value = Array.prototype.join.call(value, ', ');
+        return value;
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        this._container.textContent = this._getValue(fontIndex);
+    };
+
+    return GenericFontData;
+});
+
+define('specimenTools/widgets/CurrentWebFont',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+    /*jshint esnext:true*/
+
+    /**
+     * Wigets that sets the `element.style` for the currently selected
+     * font.
+     *
+     * Note that in conjunction with the DOM attribute `contenteditable="true"`
+     * or a `<textarea>` element a simple tool for typing the current font
+     * is created.
+     */
+
+    function CurrentWebFont(container, pubSub, webFontProvider, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._webFontProvider = webFontProvider;
+        this._pubSub = pubSub;
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+    }
+
+    var _p = CurrentWebFont.prototype = Object.create(Parent.prototype);
+    _p.constructor = CurrentWebFont;
+
+    CurrentWebFont.defaultOptions = {
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        this._webFontProvider.setStyleOfElement(fontIndex, this._container);
+    };
+
+    return CurrentWebFont;
+});
+
+define('specimenTools/services/OTFeatureInfo',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+    /*jshint esnext:true*/
+
+    // feature data collected from
+    // https://www.microsoft.com/typography/otspec/featuretags.htm ff.
+    // Why is there no machine readable version? -- Probably because
+    // everything is very vague over there.
+    //
+    // How to interprete this data:
+    //
+    // The purpose of this data is to provide a user interface for a font
+    // for turning features available in the font on and off.
+    // `friendlyName` used to name the feature  probably like this: "{tag} {friendlyName}"
+    // `onByDefault`: Taken from "UI suggestion", can have three values:
+    //                                `false`, `true`, `null`
+    //              `false`: This feature is optional and must be turned on
+    //                       by the user. We'll primarily focus on making these
+    //                       features available
+    //              `true`: This feature is on by default. Usually because
+    //                      it is needed to display the font/script/language
+    //                      correctly.
+    //                      We could allow the user to turn these off, however
+    //                      for the specimen use case this is probably overkill.
+    //                      For a QA/font testing/inspection tool, this
+    //                      could be more interesting!
+    //                      Most prominent are examples like `kern` or `liga`
+    //                      For the specimen, maybe as a hidden/expandable menu
+    //                      option.
+    //              `null`: These features are in one or the other way special
+    //                      It's not easy to determine from the spec if they are
+    //                      on or off. They are sometimes "sub-features" that
+    //                      enable other user-selectable features to function
+    //                      or similar. We are going to ignore these in the first
+    //                      round, until good use cases emerge.
+    // `slSensitivity`: array, Taken from "Script/language sensitivity" This is
+    //                  basically none-data at the moment. It's here to give an
+    //                  idea of the lingusitic context where th e feature is used.
+    //                  An empty array usually means all scripts and languages.
+    //                  This may become useful in the future, if there is an idea
+    //                  how to use and represent the data properly
+    //
+    // For more information, look at the spec link above and consider adding
+    // it here, if it can be useful, including a little description above.
+    //
+    // Some fetures, like `salt` are non boolean. In css we can give these
+    // integer settings. For the moment, only boolean features should
+    // be supported. Thus, the others should be set to onByDefault = null
+    var featureData = Object.create(null);
+
+    featureData.aalt = {
+        friendlyName: 'Access All Alternates'
+      , onByDefault: null
+      , slSensitivity: []
+    // special, not really useful for running text
+    };
+    featureData.abvf = {
+        friendlyName: 'Above-base Forms'
+      , onByDefault: true
+      , slSensitivity: ['Khmer script']
+    };
+    featureData.abvm = {
+        friendlyName: 'Above-base Mark Positioning'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.abvs = {
+        friendlyName: 'Above-base Substitutions'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.afrc = {
+        friendlyName: 'Alternative Fractions'
+      , onByDefault: false
+      , slSensitivity: []
+    };
+    featureData.akhn = {
+        friendlyName: 'Akhands'
+        // Control of the feature should not generally be exposed to the user
+      , onByDefault: null
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.blwf = {
+        friendlyName: 'Below-base Forms'
+        //  Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.blwm = {
+        friendlyName: 'Below-base Mark Positioning'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.blws = {
+        friendlyName: 'Below-base Substitutions'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.calt = {
+        friendlyName: 'Contextual Alternates'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData['case'] = {
+        friendlyName: 'Case-Sensitive Forms'
+        // "
+        // It would be good to apply this feature (or turn it off) by
+        // default when the user changes case on a sequence of more than
+        // one character. Applications could also detect words consisting
+        // only of capitals, and apply this feature based on user preference
+        // settings.
+        // "
+      , onByDefault: false
+      , slSensitivity: ['European scripts', 'Spanish Language']
+      , exampleText: '¡!(H-{E[L]L}O)'
+    };
+    featureData.ccmp = {
+        friendlyName: 'Glyph Composition / Decomposition'
+       , onByDefault: true
+       , slSensitivity: []
+    };
+    featureData.cfar = {
+        friendlyName: 'Conjunct Form After Ro'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Khmer scripts']
+    };
+    featureData.cjct = {
+        friendlyName: 'Conjunct Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: [' Indic scripts that show similarity to Devanagari']
+    };
+    featureData.clig = {
+        friendlyName: 'Contextual Ligatures'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.cpct = {
+        friendlyName: 'Centered CJK Punctuation'
+      , onByDefault: false
+      , slSensitivity: ['Chinese']
+    };
+    featureData.cpsp = {
+        friendlyName: '	Capital Spacing'
+        // This feature should be on by default.
+        // Applications may want to allow the user to respecify the percentage to fit individual tastes and functions.
+      , onByDefault: true
+      , slSensitivity: ['Should not be used in connecting scripts (e.g. most Arabic)']
+    };
+    featureData.cswh = {
+        friendlyName: 'Contextual Swash'
+      , onByDefault: false
+      , slSensitivity: []
+    };
+    featureData.curs = {
+        friendlyName: 'Cursive Positioning'
+        // This feature could be made active or inactive by default, at the user's preference.
+        // (I don't know how this is handled, for Arabic I'd expect it to be
+        // necessary to render the font properly if it is present. Actually
+        // every font that contains this feature implies that it is needed
+        // to make the font work fine ...)
+      , onByDefault: null
+      , slSensitivity: []
+    };
+
+    // cv01-cv99 	 Character Variants
+    (function(featureData){
+        var i, num, tag;
+        for(i=1;i<100;i++) {
+            num = ('0' + i).slice(-2);
+            tag = 'cv' + num;
+            featureData[tag] = {
+                friendlyName: 'Character Variants ' + i
+              // hmm: The Microsoft spec says these features have
+              // a user-interface string: "featUiLabelNameId".
+              // It would be nice to extract these  from the font if present.
+              , onByDefault: false
+              , slSensitivity: []
+            };
+        }
+    })(featureData);
+
+    featureData.c2pc = {
+        friendlyName: 'Petite Capitals From Capitals'
+      , onByDefault: false
+      , slSensitivity: ['scripts with both upper- and lowercase forms', 'Latin', 'Cyrillic', 'Greek']
+    };
+    featureData.c2sc = {
+        friendlyName: 'Small Capitals From Capitals'
+      , onByDefault: false
+      , slSensitivity: ['bicameral scripts', 'Latin', 'Greek', 'Cyrillic', 'Armenian']
+      , exampleText: 'HELLO WORLD'
+    };
+    featureData.dist = {
+        friendlyName: 'Distances'
+        //  This feature could be made active or inactive by default, at the user's preference.
+      , onByDefault: null
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.dlig = {
+        friendlyName: 'Discretionary Ligatures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: 'act stand (1) (7)'
+    };
+    featureData.dnom = {
+        friendlyName: 'Denominators'
+        // This feature should normally be called by an application when the user applies the frac feature
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.dtls = {
+        friendlyName: 'Dotless Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['math formula layout']
+    };
+    featureData.expt = {
+        friendlyName: 'Expert Forms'
+        // UI suggestion: Applications may choose to have this feature
+        // active or inactive by default, depending on their target markets.
+        // (I'd expect browsers to have it off by default. But actually:
+        // "depending on their target markets" is not very helpful.
+        // Maybe it is on when the script is Japanese?)
+      , onByDefault: null
+      , slSensitivity: ['Japanese']
+    };
+    featureData.falt = {
+        friendlyName: 'Final Glyph on Line Alternates'
+        // This feature could be made active or inactive by default, at the user's preference.
+      , onByDefault: null
+      , slSensitivity: ['any cursive script', 'Arabic']
+    };
+    featureData.fin2 = {
+        friendlyName: 'Terminal Forms #2'
+      , onByDefault: true
+      , slSensitivity: ['Syriac']
+    };
+    featureData.fin3 = {
+        friendlyName: 'Terminal Forms #3'
+      , onByDefault: true
+      , slSensitivity: ['Syriac']
+    };
+    featureData.fina = {
+        friendlyName: 'Terminal Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['script with joining behavior', 'Arabic']
+    };
+    featureData.flac = {
+        friendlyName: 'Flattened accent forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['math formula layout']
+    };
+    featureData.frac = {
+        friendlyName: 'Fractions'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '1/2 1/4'
+    };
+    featureData.fwid = {
+        friendlyName: 'Full Widths'
+      , onByDefault: false
+      , slSensitivity: ['scripts which can use monospaced forms']
+    };
+    featureData.half = {
+        friendlyName: 'Half Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: [' Indic scripts that show similarity to Devanagari']
+    };
+    featureData.haln = {
+        friendlyName: 'Halant Forms'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.halt = {
+        friendlyName: 'Alternate Half Widths'
+        // In general, this feature should be off by default.
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.hist = {
+        friendlyName: 'Historical Forms'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: 'basic'
+    };
+    featureData.hkna = {
+        friendlyName: 'Horizontal Kana Alternates'
+      , onByDefault: false
+      , slSensitivity: ['hiragana', 'katakana']
+    };
+    featureData.hlig = {
+        friendlyName: 'Historical Ligatures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: 'ba\u017fic \u017fs \u017fl'
+    };
+    featureData.hngl = {
+        // DEPRECATED in 2016
+        friendlyName: 'Hangul'
+      , onByDefault: false
+      , slSensitivity: ['Korean']
+    };
+    featureData.hojo = {
+        friendlyName: 'Hojo Kanji Forms (JIS X 0212-1990 Kanji Forms)'
+      , onByDefault: false
+      , slSensitivity: ['Kanji']
+    };
+    featureData.hwid = {
+        friendlyName: 'Half Widths'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.init = {
+        friendlyName: 'Initial Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['script with joining behavior', 'Arabic']
+    };
+    featureData.isol = {
+        friendlyName: 'Isolated Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['script with joining behavior', 'Arabic']
+    };
+    featureData.ital = {
+        friendlyName: 'Italics'
+        // When a user selects text and applies an Italic style,
+        // an application should check for this feature and use it if present.
+      , onByDefault: null
+      , slSensitivity: ['mostly Latin']
+    };
+    featureData.jalt = {
+        friendlyName: 'Justification Alternates'
+        //  This feature could be made active or inactive by default, at the user's preference.
+      , onByDefault: null
+      , slSensitivity: ['any cursive script']
+    };
+    featureData.jp78 = {
+        friendlyName: 'JIS78 Forms'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.jp83 = {
+        friendlyName: 'JIS83 Forms'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.jp90 = {
+        friendlyName: 'JIS90 Forms'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.jp04 = {
+        friendlyName: 'JIS2004 Forms'
+      , onByDefault: false
+      , slSensitivity: ['Kanji']
+    };
+    featureData.kern = {
+        friendlyName: 'Kerning'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.lfbd = {
+        friendlyName: 'Left Bounds'
+        // This feature is called by an application when the user invokes the opbd feature.
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.liga = {
+        friendlyName: 'Standard Ligatures'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.ljmo = {
+        friendlyName: 'Leading Jamo Forms'
+      , onByDefault: true
+      , slSensitivity: ['Hangul + Ancient Hangul']
+    };
+    featureData.lnum = {
+        friendlyName: 'Lining Figures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '31337 H4X0R'
+    };
+    featureData.locl = {
+        friendlyName: 'Localized Forms'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.ltra = {
+        friendlyName: 'Left-to-right alternates'
+      , onByDefault: null
+      , slSensitivity: ['Left-to-right runs of text']
+    };
+    featureData.ltrm = {
+        friendlyName: 'Left-to-right mirrored forms'
+      , onByDefault: null
+      , slSensitivity: ['Left-to-right runs of text']
+    };
+    featureData.mark = {
+        friendlyName: 'Mark Positioning'
+      , onByDefault: null
+       , slSensitivity: []
+    };
+    featureData.med2 = {
+        friendlyName: 'Medial Forms #2'
+      , onByDefault: true
+      , slSensitivity: ['Syriac']
+    };
+    featureData.medi = {
+        friendlyName: 'Medial Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['script with joining behavior', 'Arabic']
+    };
+    featureData.mgrk = {
+        friendlyName: 'Mathematical Greek'
+      , onByDefault: false
+      , slSensitivity: ['Greek script']
+    };
+    featureData.mkmk = {
+        friendlyName: 'Mark to Mark Positioning'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.mset = {
+        friendlyName: 'Mark Positioning via Substitution'
+        // Positions Arabic combining marks in fonts for Windows 95 using glyph substitution
+      , onByDefault: null
+      , slSensitivity: ['Arabic']
+    };
+    featureData.nalt = {
+        friendlyName: 'Alternate Annotation Forms'
+      , onByDefault: false
+      , slSensitivity: ['CJKV', 'European scripts']
+      , exampleText: '359264'
+    };
+    featureData.nlck = {
+        // The National Language Council (NLC) of Japan has defined new
+        // glyph shapes for a number of JIS characters in 2000.
+        friendlyName: 'NLC Kanji Forms'
+      , onByDefault: false
+      , slSensitivity: ['Kanji']
+    };
+    featureData.nukt = {
+        friendlyName: 'Nukta Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: [' Indic scripts']
+    };
+    featureData.numr = {
+        friendlyName: 'Numerators'
+        // This feature should normally be called by an application when
+        // the user applies the frac feature.
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.onum = {
+        friendlyName: 'Oldstyle Figures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '123678'
+    };
+    featureData.opbd = {
+        friendlyName: 'Optical Bounds'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.ordn = {
+        friendlyName: 'Ordinals'
+      , onByDefault: false
+      , slSensitivity: ['Latin']
+      , exampleText: '1a 9a 2o 7o'
+    };
+    featureData.ornm = {
+        friendlyName: 'Ornaments'
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.palt = {
+        friendlyName: 'Proportional Alternate Widths'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.pcap = {
+        friendlyName: 'Petite Capitals'
+      , onByDefault: false
+      , slSensitivity: ['scripts with both upper- and lowercase forms', 'Latin', 'Cyrillic', 'Greek']
+    };
+    featureData.pkna = {
+        friendlyName: 'Proportional Kana'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.pnum = {
+        friendlyName: 'Proportional Figures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '123678'
+    };
+    featureData.pref = {
+        friendlyName: 'Pre-Base Forms'
+        //  Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Khmer and Myanmar (Burmese) scripts']
+    };
+    featureData.pres = {
+        friendlyName: 'Pre-base Substitutions'
+      , onByDefault: true
+      , slSensitivity: ['Indic scripts']
+    };
+    featureData.pstf = {
+        friendlyName: 'Post-base Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['scripts of south and southeast Asia that have post-base forms for consonants', 'Gurmukhi', 'Malayalam', 'Khmer']
+    };
+    featureData.psts = {
+        friendlyName: 'Post-base Substitutions'
+      , onByDefault: true
+      , slSensitivity: ['any alphabetic script', 'Indic scripts']
+    };
+    featureData.pwid = {
+        friendlyName: 'Proportional Widths'
+        // Applications may want to have this feature active or inactive by default depending on their markets.
+      , onByDefault: null
+      , slSensitivity: ['CJKV', 'European scripts']
+    };
+    featureData.qwid = {
+        friendlyName: 'Quarter Widths'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.rand = {
+        friendlyName: 'Randomize'
+        // This feature should be enabled/disabled via a preference setting; “enabled” is the recommended default.
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.rclt = {
+        friendlyName: 'Required Contextual Alternates'
+      , onByDefault: true
+      , slSensitivity: ['any script', 'important for many styles of Arabic']
+    };
+    featureData.rkrf = {
+        friendlyName: 'Rakar Forms'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Devanagari', 'Gujarati']
+    };
+    featureData.rlig = {
+        friendlyName: 'Required Ligatures'
+      , onByDefault: true
+      , slSensitivity: ['Arabic', 'Syriac', 'May apply to some other scripts']
+    };
+    featureData.rphf = {
+        friendlyName: 'Reph Forms'
+        //  Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Indic scripts', 'Devanagari', 'Kannada']
+    };
+    featureData.rtbd = {
+        friendlyName: 'Right Bounds'
+        // This feature is called by an application when the user invokes the opbd feature.
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.rtla = {
+        friendlyName: 'Right-to-left alternates'
+      , onByDefault: null
+      , slSensitivity: ['Right-to-left runs of text']
+    };
+    featureData.rtlm = {
+        friendlyName: 'Right-to-left mirrored forms'
+      , onByDefault: null
+      , slSensitivity: ['Right-to-left runs of text']
+    };
+    featureData.ruby = {
+        friendlyName: 'Ruby Notation Forms'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.rvrn = {
+        friendlyName: 'Required Variation Alternates'
+        // The 'rvrn' feature is mandatory: it should be active by default and not directly exposed to user control.
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.salt = {
+        friendlyName: 'Stylistic Alternates'
+      , onByDefault: null
+      , slSensitivity: []
+    };
+    featureData.sinf = {
+        friendlyName: 'Scientific Inferiors'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '1902835746'
+    };
+    featureData.size = {
+        friendlyName: 'Optical size'
+        // This feature should be active by default. Applications may want
+        // to present the tracking curve to the user for adjustments via a GUI
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.smcp = {
+        friendlyName: 'Small Capitals'
+      , onByDefault: false
+      , slSensitivity: [' bicameral scripts', 'Latin', 'Greek', 'Cyrillic', 'Armenian']
+      , exampleText: "Hello World"
+    };
+    featureData.smpl = {
+        friendlyName: 'Simplified Forms'
+      , onByDefault: false
+      , slSensitivity: ['Chinese', 'Japanese']
+    };
+    // ss01-ss20 Stylistic Sets
+    (function(featureData) {
+        var i, num, tag;
+        for(i=1;i<21;i++) {
+            num = ('0' + i).slice(-2);
+            tag = 'ss' + num;
+            featureData[tag] = {
+                // It seems these features can reference a custom name
+                // in the name table
+                friendlyName: 'Stylistic Set ' + i
+              , onByDefault: false
+              , slSensitivity: []
+            };
+        }
+    })(featureData);
+    featureData.ssty = {
+        friendlyName: 'Math script style alternates'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['math formula layout']
+    };
+    featureData.stch = {
+        friendlyName: 'Stretching Glyph Decomposition'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.subs = {
+        friendlyName: 'Subscript'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: 'a1 b4 c9'
+    };
+    featureData.sups = {
+        friendlyName: 'Superscript'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: 'x2 y5 z7'
+    };
+    featureData.swsh = {
+        friendlyName: 'Swash'
+      , onByDefault: false
+      , slSensitivity: ['Does not apply to ideographic scripts']
+    };
+    featureData.titl = {
+        friendlyName: 'Titling'
+      , onByDefault: false
+      , slSensitivity: []
+    };
+    featureData.tjmo = {
+        friendlyName: 'Trailing Jamo Forms'
+      , onByDefault: true
+      , slSensitivity: ['Hangul + Ancient Hangul']
+    };
+    featureData.tnam = {
+        friendlyName: 'Traditional Name Forms'
+      , onByDefault: false
+      , slSensitivity: ['Japanese']
+    };
+    featureData.tnum = {
+        friendlyName: 'Tabular Figures'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '123678'
+    };
+    featureData.trad = {
+        friendlyName: 'Traditional Forms'
+      , onByDefault: false
+      , slSensitivity: ['Chinese', 'Japanese']
+    };
+    featureData.twid = {
+        friendlyName: 'Third Widths'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.unic = {
+        friendlyName: 'Unicase'
+      , onByDefault: false
+      , slSensitivity: ['scripts with both upper- and lowercase forms', 'Latin', 'Cyrillic', 'Greek']
+    };
+    featureData.valt = {
+        friendlyName: 'Alternate Vertical Metrics'
+        // This feature should be active by default in vertical-setting contexts.
+      , onByDefault: null
+      , slSensitivity: ['scripts with vertical writing modes']
+    };
+    featureData.vatu = {
+        friendlyName: 'Vattu Variants'
+        // Control of the feature should not generally be exposed to the user.
+      , onByDefault: null
+      , slSensitivity: ['Indic scripts', 'Devanagari']
+    };
+    featureData.vert = {
+        friendlyName: 'Vertical Writing'
+        // This feature should be active by default in vertical writing mode.
+      , onByDefault: null
+      , slSensitivity: ['scripts with vertical writing capability.']
+    };
+    featureData.vhal = {
+        friendlyName: 'Alternate Vertical Half Metrics'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.vjmo = {
+        friendlyName: 'Vowel Jamo Forms'
+      , onByDefault: true
+      , slSensitivity: ['Hangul + Ancient Hangul']
+    };
+    featureData.vkna = {
+        friendlyName: 'Vertical Kana Alternates'
+      , onByDefault: false
+      , slSensitivity: ['hiragana', 'katakana']
+    };
+    featureData.vkrn = {
+        friendlyName: 'Vertical Kerning'
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.vpal = {
+        friendlyName: 'Proportional Alternate Vertical Metrics'
+      , onByDefault: false
+      , slSensitivity: ['CJKV']
+    };
+    featureData.vrt2 = {
+        friendlyName: 'Vertical Alternates and Rotation'
+        // This feature should be active by default when vertical writing mode is on,
+        // although the user must be able to override it.
+        // (don't know if I can determine if "vertical writing mode").
+      , onByDefault: true
+      , slSensitivity: ['scripts with vertical writing capability']
+    };
+    featureData.vrtr = {
+        friendlyName: 'Vertical Alternates for Rotation'
+        // This feature should always be active by default for sideways runs in vertical writing mode
+      , onByDefault: true
+      , slSensitivity: []
+    };
+    featureData.zero = {
+        friendlyName: 'Slashed Zero'
+      , onByDefault: false
+      , slSensitivity: []
+      , exampleText: '0123'
+    };
+
+    function deepFreeze(obj) {
+        var k;
+        if(typeof obj !== 'object') return;
+        for(k in obj)
+            deepFreeze(obj[k]);
+        Object.freeze(obj);
+    }
+
+    // Don't want returned sub objects to be changeable by a client:
+    deepFreeze(featureData);
+
+    function OTFeatureInfo(pubsub, options) {
+        Parent.call(this, options);
+        this._pubsub = pubsub;
+        this._caches = {
+            optional: null
+          , default: null
+          , unknown: null
+          , all: null
+        };
+    }
+
+    var _p = OTFeatureInfo.prototype = Object.create(Parent.prototype);
+    _p.constructor = OTFeatureInfo;
+
+    OTFeatureInfo.defaultOptions = {};
+
+    function _makeGetter(target, key, filter) {
+        function getter() {
+            /* jshint validthis: true*/
+            var data = this._caches[key]
+              , tag
+              ;
+            if(data === null) {
+                this._caches[key] = data = Object.create(null);
+                for(tag in featureData) {
+                    if(filter && !filter(featureData[tag]))
+                        continue;
+                    data[tag] = featureData[tag];
+                }
+                Object.freeze(data);
+            }
+            return data;
+        }
+        Object.defineProperty(target, key, {
+            get: getter
+          , enumerable: true
+        });
+    }
+
+    _makeGetter(_p, 'optional', function(item) {
+                        return item.onByDefault === false;});
+
+    _makeGetter(_p, 'default', function(item) {
+                        return item.onByDefault === true;});
+
+    _makeGetter(_p, 'unknown', function(item) {
+                        return item.onByDefault === null;});
+
+    _makeGetter(_p, 'all', false);
+
+    _p.getSubset = function(key, tags) {
+        var data = this[key]
+          , result = Object.create(null)
+          , i, l, tag
+          ;
+        for(i=0,l=tags.length;i<l;i++) {
+            tag = tags[i];
+            if(tag in data)
+                result[tag] = data[tag];
+        }
+        return result;
+    };
+
+    _p.getFeature = function(tag) {
+        return featureData[tag];
+    }
+
+    // singleton style (good idea??)
+    return new OTFeatureInfo();
+});
+
+define('specimenTools/widgets/TypeTester',[
+    'specimenTools/_BaseWidget'
+  , 'specimenTools/services/OTFeatureInfo'
+], function(
+    Parent
+  , OTFeatureInfo
+) {
+    "use strict";
+
+    /**
+     * TypeTester provides interfaces that help to test the current webfont.
+     * See the CurrentWebFont widget.
+     *
+     * The interfaces provided are:
+     *
+     * - Dynamic slider inputs for controlling linear css attributes of the
+     *      TypeTester
+     *      Use the CSS-class configured at `sliderControlsClass` on a host
+     *      element for the range input element.
+     *      Provide a data-target-property on the input to specify the css
+     *      attribute it should affect; Further, the following data attributes
+     *      can be set on the container for customizing the slider, each including
+     *      the css attribute the slider controls, e.g. to customize a slider
+     *      for font-size:
+     *              `data-min-font-size`
+     *              `data-max-font-size`
+     *              `data-value-font-size`
+     *              `data-unit-font-size`
+     *              `data-step-font-size`
+     * - Dynamic element displaying the current font size:
+     *      Use the CSS-class configured at `tester__label` as well as a
+     *      data-target-property with the value of the css value this label
+     *      corresponds to. The `element.textContent` of elements matching this
+     *      class will be set to the current value of the TypeTester widget.
+     * - Switches to deactivate OpenType-Features that are activated by default.
+     *      Use the CSS-class configured at `defaultFeaturesControlsClass`
+     *      to have a de-/activating button appended to the host element
+     *      for each OpenType Feature that is active by default.
+     *      Initial button state is active.
+     * - Switches to activate OpenType-Features that are optional.
+     *      Use the CSS-class configured at `optionalFeaturesControlsClass`
+     *      to have a de-/activating button appended to the host element
+     *      for each OpenType Feature that is optional.
+     *      Initial button state is inactive.
+     * - An element that receives the settings made by the elements described above.
+     *      Use the CSS-class configured at `contentContainerClass` to have
+     *      the element.style set to the fontSize and fontFeatureSettings
+     *      made by the control elements of this widget.
+     *
+     *      To use the current font on this element, see the CurrentWebFont
+     *      widget.
+     *      To enable the users typing text themselves use either the DOM
+     *      attribute `contenteditable=True` or use a `<textarea>` element.
+     *
+     */
+    function TypeTester(container, pubSub, fontsData, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontsData;
+
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+
+        this._contentContainers = this._getByClass(this._options.contentContainerClass);
+
+        this._controls = {
+            features: {
+                containers: Object.create(null)
+              , active: Object.create(null)
+              , buttons: null
+              , tags: null
+            }
+        };
+
+        this._activeFeatures = Object.create(null);
+        this._values = Object.create(null);
+        this.__sliderInputHandler = this._sliderInputHandler.bind(this);
+        this._initControls();
+        this._applyValues();
+    }
+
+    var _p = TypeTester.prototype = Object.create(Parent.prototype);
+    _p.constructor = TypeTester;
+
+    TypeTester.defaultOptions = {
+        slider_default_min: 10
+      , slider_default_max: 128
+      , slider_default_value: 32
+      , slider_default_step: 1
+      , slider_default_unit: 'px'
+      , slider_default_class: 'specimen-slider'
+      , optionalFeaturesControlsClass: 'type-tester__features--optional'
+      , defaultFeaturesControlsClass: 'type-tester__features--default'
+      , sliderControlsClass: 'type-tester__slider'
+      , contentContainerClass: 'type-tester__content'
+      , labelControlsClass: 'type-tester__label'
+      , setCssValueToInput: function(input, value) {
+            input.value = value;
+        }
+      , optionalFeatureButtonClasses: ''
+      , defaultFeatureButtonClasses: ''
+      , activateFeatureControls: null
+      , featureButtonActiveClass: 'active'
+    };
+
+    /**
+     * Generic listener that reacts to a slider being moved
+     * The css property being manipulates is extracted from the wrapping DOM node's
+     * data-target-property value
+     */
+    _p._sliderInputHandler = function(evt) {
+        var parentElement = evt.target.parentElement
+          , cssProperty = null
+          , value = evt.target.value
+          ;
+        while(parentElement !== this._container) {
+            if(parentElement.dataset.targetProperty === undefined) {
+                parentElement = parentElement.parentElement;
+                continue;
+            }
+            cssProperty = parentElement.dataset.targetProperty;
+            break;
+        }
+        if(cssProperty === null)
+            return;
+        this._setCssValue(cssProperty, value);
+        this._applyValues();
+    };
+
+    /**
+     * Retrieve the data-xxx attributes for a slider, where the data
+     * attributes are in the form of "data-min-font-size"
+     * @param sliderName: camelCase version of the css attribute this
+     *    slider controls, i.e. "fontSize"
+     */
+    _p._setSliderOptions = function (sliderName) {
+        var dataOption
+          , sliderDataOptions = ['min', 'max', 'unit', 'step', 'value', 'class']
+          , i
+          ;
+
+        this._options[sliderName] = {};
+
+        for(i=0;i<sliderDataOptions.length;i++) {
+            // for each slider like "font-size" iterate over all of
+            // "minFontSize", "maxFontSize", etc
+            dataOption = [sliderDataOptions[i]
+                    , sliderName.substr(0,1).toUpperCase()
+                    , sliderName.substr(1)
+                ].join('');
+
+            // fill options from data values and fallback to defaults
+            if(dataOption in this._container.dataset)
+                this._options[sliderName][sliderDataOptions[i]] =
+                  this._container.dataset[dataOption];
+            else
+                this._options[sliderName][sliderDataOptions[i]] =
+                  this._options['slider_default_' + sliderDataOptions[i]];
+        }
+    };
+
+    _p._initSlider = function(element) {
+        var input = this._container.ownerDocument.createElement('input')
+          , sliderPropertyName = element.dataset.targetProperty
+          , sliderName = this._cssName2jsName(sliderPropertyName)
+          , controlsIndex = [sliderName, '_slider'].join('')
+          , attributes = {
+              min:  this._options[sliderName].min
+            , max:  this._options[sliderName].max
+            , step: this._options[sliderName].step
+            }
+          , k
+          ;
+
+        if(!(controlsIndex in this._controls))
+            this._controls[controlsIndex] = [];
+        this._controls[controlsIndex].push({input: input, container: element});
+        this._applyClasses(input, this._options[sliderName].class);
+
+        input.setAttribute('type', 'range');
+        for(k in attributes)
+            input.setAttribute(k, attributes[k]);
+        element.appendChild(input);
+        input.addEventListener('input', this.__sliderInputHandler);
+    };
+
+    _p._initLabel = function(element) {
+        var cssName = this._cssName2jsName(element.dataset.targetProperty)
+          ,  labelPropertyName = [cssName, '_label'].join('')
+          ;
+
+        if(!(labelPropertyName in this._controls))
+            this._controls[labelPropertyName] = [];
+        this._controls[labelPropertyName].push(element);
+    };
+
+    _p._initFeaturesControl = function(element, type) {
+        if(!(type in this._controls.features.containers))
+            this._controls.features.containers[type] = [];
+        this._controls.features.containers[type].push(element);
+        element.addEventListener('click',
+            this._switchFeatureTagHandler.bind(this, element));
+    };
+
+    /**
+     * Setup function that in turn initates different types of nested control elements
+     */
+    _p._initControls = function() {
+        var sliders = this._getByClass(this._options['sliderControlsClass'])
+          , labels = this._getByClass(this._options['labelControlsClass'])
+          , setup = {
+              optionalFeatures: [
+                  this._getByClass(this._options['optionalFeaturesControlsClass'])
+                , ['_initFeaturesControl', 'optional']]
+              , defaultFeatures: [
+                  this._getByClass(this._options['defaultFeaturesControlsClass'])
+                , ['_initFeaturesControl', 'default']]
+            }
+          , afterInit = []
+          , initFunc, initFuncArgs, containers, key
+          , cssProperty, cssName, sliderPropertyName, labelPropertyName
+          , i, l
+          ;
+
+
+        // iterate all property sliders and add them to the setup object
+        for(i=0;i<sliders.length;i++) {
+            cssProperty = sliders[i].dataset.targetProperty;
+            cssName = this._cssName2jsName(cssProperty);
+            sliderPropertyName = [cssName, '_slider'].join('');
+            if (!(sliderPropertyName in setup)) {
+                this._setSliderOptions(cssName);
+                setup[sliderPropertyName] = [[], ['_initSlider']];
+            }
+            setup[sliderPropertyName][0].push(sliders[i]);
+        }
+
+        // iterate through all slider labels
+        for(i=0;i<labels.length;i++) {
+            cssProperty = labels[i].dataset.targetProperty;
+            cssName = this._cssName2jsName(cssProperty);
+            labelPropertyName = [cssName, '_label'].join('');
+            if (!(labelPropertyName in setup)) {
+                setup[labelPropertyName] = [[], ['_initLabel']
+                  , this._setCssValue.bind(this, cssProperty, this._options[cssName].value)];
+            }
+            setup[labelPropertyName][0].push(labels[i]);
+        }
+
+        // iterate over all of the setup object and initiate based on
+        // passed in initFunc's
+        for(key in setup) {
+            initFunc = setup[key][1][0];
+            initFuncArgs = setup[key][1].slice(1);
+            if(setup[key][2])
+                afterInit.push(setup[key][2]);
+            containers = setup[key][0];
+            for(i=0,l=containers.length;i<l;i++) {
+                this[initFunc].apply(this, [containers[i]].concat(initFuncArgs));
+            }
+        }
+
+        // running these after all initializations, so `fontSizeIndicator`
+        // gets initialized by the call to `_setFontSize` of `fontsize`
+        for(i=0,l=afterInit.length;i<l;i++)
+            afterInit[i]();
+    };
+
+    _p._switchFeatureTagHandler = function(container, evt) {
+        var tag = null
+          , active = this._controls.features.active
+          , type, cssFeatureValue, button
+          ;
+        // first find the feature tag
+        button = evt.target;
+        while(button && button !== container) {
+            if(button.hasAttribute('data-feature-tag')) {
+                tag = button.getAttribute('data-feature-tag');
+                break;
+            }
+            button = button.parentElement;
+        }
+        if(tag === null)
+            return;
+
+        if(tag in active)
+            delete active[tag];
+        else {
+            type = this._getFeatureTypeByTag(tag);
+            if(type === 'default')
+                cssFeatureValue = '0';
+            else if(type === 'optional')
+                cssFeatureValue = '1';
+            else
+                return;
+            active[tag] = cssFeatureValue;
+        }
+        this._setFeatureButtonsState();
+        this._setFeatures();
+        this._applyValues();
+    };
+
+    _p._setFeatures = function() {
+        var active = this._controls.features.active
+          , buttons = this._controls.features.buttons
+          , values = []
+          , tag
+          ;
+        for (tag in active) {
+            // if there is a button for the tag, we currently control it
+            if(tag in buttons)
+                values.push('"' + tag + '" ' + active[tag]);
+        }
+        this._values['font-feature-settings'] = values.join(', ');
+    };
+
+    /**
+     *
+     * @param container
+     * @param type: "optional" | "default"
+     * @param features
+     * @param order
+     * @returns {Array}
+     * @private
+     */
+    _p._updateFeatureControlContainer = function(container, type, features, order) {
+        var doc = container.ownerDocument
+          , tag, i, l, feature, label, button
+          , uiElementsToActivate = []
+          ;
+
+        if(!order) order = Object.keys(features).sort();
+
+        // delete old ...
+        for(i=container.children.length-1;i>=0;i--) {
+            if(type === container.children[i].getAttribute('data-feature-type'))
+                container.removeChild(container.children[i]);
+        }
+        for(i=0,l=order.length;i<l;i++) {
+            tag = order[i];
+            feature = features[tag];
+            label = [tag, feature.friendlyName].join(': ');
+            button = doc.createElement('button');
+            button.textContent = label;
+            button.setAttribute('data-feature-tag', tag);
+            button.setAttribute('data-feature-type', type);
+            this._applyClasses(button, this._options[type + 'FeatureButtonClasses']);
+            container.appendChild(button);
+            uiElementsToActivate.push(button);
+            if(!(tag in this._controls.features.buttons))
+                this._controls.features.buttons[tag] = [];
+            this._controls.features.buttons[tag].push(button);
+            // TODO: set this button to it's active state
+            // maybe a general function after all buttons have been created
+        }
+        return uiElementsToActivate;
+    };
+
+    _p._getFeatureTypeByTag = function(tag) {
+        var tags = this._controls.features.tags;
+        if('default' in tags && tag in tags.default.features)
+            return 'default';
+        else if('optional' in tags && tag in tags.optional.features)
+            return 'optional';
+        else
+            return null;
+    };
+
+    _p._updateFeatureControls = function(fontIndex) {
+        // updata feature control ...
+        var fontFeatures = this._fontsData.getFeatures(fontIndex)
+          , availableFeatureTags = Object.keys(fontFeatures)
+          , type
+          , typesOrder = ['default', 'optional']
+          , i, l, j, ll
+          , featureData = this._controls.features
+          , uiElements, uiElementsToActivate = []
+          , featureContainers
+          , features, order
+          ;
+
+        // delete old tag => buttons registry
+        featureData.buttons = Object.create(null);
+        // these are all the features we care about
+        featureData.tags = Object.create(null);
+
+
+        // collect the features available for each category (type)
+        for(i=0,l=typesOrder.length;i<l;i++) {
+            type = typesOrder[i];
+            features = OTFeatureInfo.getSubset(type, availableFeatureTags);
+            order = Object.keys(features).sort();
+            featureData.tags[type] = {
+                features: features
+              , order: order
+            };
+
+            featureContainers = featureData.containers[type] || [];
+            for(j=0,ll=featureContainers.length;j<ll;j++) {
+                uiElements = this._updateFeatureControlContainer(
+                                                  featureContainers[j]
+                                                , type, features
+                                                , order);
+                // Could also just push all buttons?
+                // This is used, at the moment, to let mdlFontSpecimen activate
+                // these items via this._options.activateFeatureControls
+                // OK would be if _updateFeatureControlContainer would return
+                // the a list of relevant elements. BUT: it is hard to determine
+                // which level is relevant. For MDL just the
+                // plain buttons would be fine, so maybe I should stick with this.
+                Array.prototype.push.apply(uiElementsToActivate, uiElements);
+            }
+
+        }
+        if(this._options.activateFeatureControls)
+            this._options.activateFeatureControls.call(this, uiElementsToActivate);
+        // We could reset active features that are no longer available:
+        // But for now we don't, remembering old settings between font
+        // switching.
+        //for(k in this._activeFeatures)
+        //    if(!(k in features))
+        //        delete this._activeFeatures[k]
+        this._setFeatureButtonsState();
+    };
+
+    _p._setFeatureButtonActiveState = function(element, isActive) {
+        this._applyClasses(element, this._options.featureButtonActiveClass, !isActive);
+    };
+
+    _p._setFeatureButtonsState = function() {
+        var tag, active, buttons, buttonIsActive
+          , featureData = this._controls.features
+          , type, i, l
+          ;
+
+        for(tag in featureData.buttons) {
+            buttons = featureData.buttons[tag];
+            active = tag in featureData.active;
+            type = this._getFeatureTypeByTag(tag);
+            if(type === "default")
+                // The button state should be "inactive" if this is a
+                // default feature. Because, the default state is activated
+                buttonIsActive = !active;
+            else if(type === "optional")
+                // button state and tag active state correlate
+                buttonIsActive = active;
+            else
+                // don't know what to do (shouldn't happen unless we implment more tags)
+                continue;
+            for(i=0,l=buttons.length;i<l;i++)
+                this._setFeatureButtonActiveState.call(this, buttons[i], buttonIsActive);
+        }
+    };
+
+    /**
+     * Function that updates any slider controlled css value centrally, so that
+     * any effect is mirrored on slider and label for that property
+     */
+    _p._setCssValue = function(property, value) {
+        var i, l
+          , propertyJsName = this._cssName2jsName(property)
+          , valueUnit = [
+                value
+              , this._options[propertyJsName].unit
+            ]
+          , sliders = this._controls[propertyJsName + '_slider']
+          , labels = this._controls[propertyJsName + '_label']
+          ;
+
+        // loop over all sliders and update their input's values
+        for(i=0,l=sliders.length;i<l;i++) {
+            this._options
+              .setCssValueToInput.call( this, sliders[i].input, value);
+        }
+
+        // loop over all labels and update their text content
+        for(i=0,l=labels.length;i<l;i++) {
+          labels[i].textContent = valueUnit.join(' ');
+        }
+
+        this._values[property] = valueUnit.join('');
+    };
+
+    _p._getByClass = function(className) {
+        return this._container.getElementsByClassName(className);
+    };
+
+    _p._applyValues = function() {
+        var i, l, container, k;
+        for(i=0,l=this._contentContainers.length;i<l;i++) {
+            container = this._contentContainers[i];
+            for(k in this._values)
+                container.style[this._cssName2jsName(k)] = this._values[k];
+        }
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        this._updateFeatureControls(fontIndex);
+        this._setFeatures();
+        this._applyValues();
+    };
+
+    return TypeTester;
+});
+
+define('specimenTools/services/svgDrawing/lib',[
+    'specimenTools/services/dom-tool'
+], function(
+    domTool
+) {
+    "use strict";
+
+    var svgns = 'http://www.w3.org/2000/svg';
+
+    function setTransform(element, transformation) {
+        element.setAttribute('transform', 'matrix('
+                                    +  transformation.join(', ') + ')');
+    }
+
+    /**
+     * draw an opentype.js glyph to a segment protocol pen
+     */
+    function draw(glyph, pen) {
+        var i, l, cmd;
+        glyph.getPath();
+        for(i=0,l=glyph.path.commands.length;i<l;i++){
+            cmd = glyph.path.commands[i];
+            switch (cmd.type) {
+                case 'M':
+                    pen.moveTo([cmd.x, cmd.y]);
+                    break;
+                case 'Z':
+                    pen.closePath();
+                    break;
+                case 'Q':
+                    pen.qCurveTo([cmd.x1, cmd.y1], [cmd.x, cmd.y]);
+                    break;
+                case 'C':
+                    pen.curveTo([cmd.x1, cmd.y1], [cmd.x2, cmd.y2],[cmd.x, cmd.y]);
+                    break;
+                case 'L':
+                    pen.lineTo([cmd.x, cmd.y]);
+                    break;
+                default:
+                    console.warn('Unknown path command:', cmd.type);
+            }
+        }
+    }
+
+    return {
+        svgns: svgns
+      , setTransform: setTransform
+      , insertElement: domTool.insertElement
+      , draw: draw
+    };
+});
+
+define('specimenTools/services/svgDrawing/_BaseDrawingElement',[
+], function(
+) {
+    "use strict";
+    function _BaseDrawingElement(){}
+
+    var _p = _BaseDrawingElement.prototype;
+
+    _p.setExtends = function(x1, x2) {
+        //jshint unused:vars
+        var i,l, args=[];
+        for(i=0,l=arguments.length;i<l;i++)
+            args.push(arguments[i]);
+        for(i=0,l=this._children.length;i<l;i++) {
+            if(typeof this._children[i].setExtends !== 'function')
+                continue;
+            this._children[i].setExtends.apply(this._children[i], args);
+        }
+    };
+
+    return _BaseDrawingElement;
+});
+
+define('specimenTools/services/svgDrawing/Box',[
+    './_BaseDrawingElement'
+  , './lib'
+], function(
+    Parent
+  , lib
+) {
+    "use strict";
+
+    var svgns = lib.svgns
+      , insertElement = lib.insertElement
+      , setTransform = lib.setTransform
+      ;
+
+    /**
+     * options:
+     *   minLeftSideBearing
+     *   minRightSideBearing
+     *   align left|centert|right
+     */
+    function Box(doc, children, options) {
+        this.options = options;
+        this.leftSideBearing = null;
+        this.rightSideBearing = null;
+        this.rawWidth = 0;
+        this._children = children;
+        this.element = doc.createElementNS(svgns, 'g');
+        this._addChildren(children);
+    }
+    var _p = Box.prototype = Object.create(Parent.prototype);
+    _p.constructor = Box;
+
+    _p._addChildren = function(children) {
+        var i, l, child;
+        for(i=0,l=children.length;i<l;i++) {
+            child = children[i];
+            insertElement(this.element, child.element, child.options.insert);
+        }
+    };
+
+    _p._allignChildren = function(xpos) {
+        var sorted = this._children
+                            .filter(function(child){ return !child.noDimensions;})
+                            .sort(function(childA, childB) {
+                // narrowest item first
+                return childA.rawWidth - childB.rawWidth;
+            })
+          , widest = sorted.pop()
+          , i, l, x
+          ;
+        for(i=0,l=sorted.length;i<l;i++) {
+            switch(xpos) {
+                case('right'):
+                    x = widest.rawWidth - sorted[i].rawWidth;
+                    break;
+                case('center'):
+                    x = (widest.rawWidth - sorted[i].rawWidth) * 0.5;
+                    break;
+                case('left'):
+                    /* falls through */
+                default:
+                    x=0;
+                    break;
+            }
+            setTransform(sorted[i].element, [1, 0, 0, 1, x, 0]);
+        }
+    };
+
+    _p.initDimensions = function() {
+        var i, l, child, lsb = [], rsb = [];
+        if(this.options.minLeftSideBearing)
+            lsb.push(this.options.minLeftSideBearing);
+        if(this.options.minRightSideBearing)
+             rsb.push(this.options.minRightSideBearing);
+
+        for(i=0,l=this._children.length;i<l;i++) {
+            child = this._children[i];
+            if(child.noDimensions)
+                // don't consider these
+                continue;
+            child.initDimensions();
+            lsb.push(child.leftSideBearing);
+            rsb.push(child.rightSideBearing);
+            this.rawWidth = i === 0
+                        ? child.rawWidth
+                        : Math.max(this.rawWidth, child.rawWidth);
+        }
+        this.leftSideBearing = lsb.length
+                    ? Math.max.apply(null, lsb)
+                    : 0
+                    ;
+        this.rightSideBearing = rsb.length
+                    ? Math.max.apply(null, rsb)
+                    : 0
+                    ;
+        this._allignChildren(this.options.align);
+    };
+
+    Object.defineProperty(_p, 'width', {
+        get: function() {
+            return this.leftSideBearing + this.rawWidth + this.rightSideBearing;
+        }
+      , enumerable: true
+    });
+
+    return Box;
+});
+
+define('Atem-Pen-Case/tools/arrayTools',[],
+function() {
+    "use strict";
+    /**
+     * javascript port based on the original python sources from:
+     * https://github.com/behdad/fonttools/blob/b30e12ae00b30a701b6829951c254d7e44c34057/Lib/fontTools/misc/arrayTools.py
+     *
+     * The following methods are not ported, though:
+     * - calcIntBounds(array)
+     * - pointsInRect(array, rect)
+     * - vectorLength(vector)
+     * - asInt16(array)
+     * - normRect(rect)
+     * - scaleRect(rect, x, y)
+     * - offsetRect(rect, dx, dy)
+     * - insetRect(rect, dx, dy)
+     * - sectRect(rect1, rect2)
+     * - rectCenter(rect0)
+     * - intRect(rect1)
+     *
+     */
+
+    function calcBounds(points){
+        /* Returns the recangular area that contains
+         * all points in the list 'points'.
+         */
+        if(!points.length)
+            return [0, 0, 0, 0];
+        var xs = []
+          , ys = []
+          , i, l
+          ;
+        for(i=0, l=points.length; i<l; i++){
+            xs.push(points[i][0]);
+            ys.push(points[i][1]);
+        }
+        return [Math.min.apply(null, xs), Math.min.apply(null, ys)
+              , Math.max.apply(null, xs), Math.max.apply(null, ys)];
+    }
+
+    function updateBounds(bounds, pt){
+        /* Returns the recangular area that contains
+         * both the rectangle 'bounds' and point 'pt'.
+         */
+        var xMin = bounds[0]
+          , yMin = bounds[1]
+          , xMax = bounds[2]
+          , yMax = bounds[3]
+          , x = pt[0]
+          , y = pt[1]
+          ;
+        if (x < xMin) xMin = x;
+        if (x > xMax) xMax = x;
+        if (y < yMin) yMin = y;
+        if (y > yMax) yMax = y;
+        return [xMin, yMin, xMax, yMax];
+    }
+
+    function pointInRect(pt, rect){
+        /* Returns True when point 'pt' is inside rectangle 'rect'.
+         */
+        var x = pt[0]
+          , y = pt[1]
+          , xMin = rect[0]
+          , yMin = rect[1]
+          , xMax = rect[2]
+          , yMax = rect[3]
+          ;
+        return xMin <= x && x <= xMax && yMin <= y && y <= yMax;
+    }
+
+    function unionRect(r1, r2){
+        /* Returns the recangular area that contains
+         * both the rectangles 'r1' and 'r2'.
+         */
+        var xMin = Math.min( r1[0], r2[0] )
+          , yMin = Math.min( r1[1], r2[1] )
+          , xMax = Math.max( r1[2], r2[2] )
+          , yMax = Math.max( r1[3], r2[3] )
+          ;
+        return [xMin, yMin, xMax, yMax];
+    }
+
+    return {
+        calcBounds: calcBounds
+      , updateBounds: updateBounds
+      , pointInRect: pointInRect
+      , unionRect: unionRect
+    };
+});
+
+define(
+    'Atem-Pen-Case/pens/ControlBoundsPen',[
+        './BasePen'
+      , 'Atem-Pen-Case/tools/arrayTools'
+    ],
+    function(
+        Parent
+      , arrayTools
+) {
+    "use strict";
+    var updateBounds = arrayTools.updateBounds;
+
+    /**
+     * javascript port based on the original python sources from:
+     * https://github.com/robofab-developers/robofab/blob/445e45d75567efccd51574c4aa2a14d15eb1d4db/Lib/robofab/pens/boundsPen.py
+     *
+     * but also check the boundsPen.py file in the master branch:
+     * https://github.com/robofab-developers/robofab/blob/master/Lib/robofab/pens/boundsPen.py
+     * as it seems more actively mantained even though the code in their ufo3k branch is the primary source for ufoJS.
+     *
+     * Pen to calculate the 'control bounds' of a shape. This is the
+     * bounding box of all control points __on closed paths__, so may
+     * be larger than the actual bounding box if there are curves that
+     * don't have points on their extremes.
+     *
+     * Single points, or anchors, are ignored.
+     *
+     * When the shape has been drawn, the bounds are available as the
+     * 'bounds' attribute of the pen object. It's a 4-tuple:
+     *
+     * (xMin, yMin, xMax, yMax)
+     *
+     * This replaces fontTools/pens/boundsPen (temporarily?)
+     * The fontTools bounds pen takes lose anchor points into account,
+     * this one doesn't.
+     */
+
+    /* constructor */
+    function ControlBoundsPen (glyphSet) {
+        Parent.call(this, glyphSet);
+        this.bounds = undefined;
+        this._start = undefined;
+    }
+
+    /* inheritance */
+    var _p = ControlBoundsPen.prototype = Object.create(Parent.prototype);
+    _p.constructor = ControlBoundsPen;
+
+    _p._moveTo = function (pt, kwargs/* optional, object contour attributes*/){
+        this._start = pt;
+    };
+
+    _p._addMoveTo = function (){
+        if (this._start === undefined)
+            return;
+        if (this.bounds){
+            this.bounds = updateBounds(this.bounds, this._start);
+        }
+        else {
+            var x = this._start[0]
+              , y = this._start[1]
+              ;
+            this.bounds = [x, y, x, y];
+        }
+        this._start = undefined;
+    };
+
+    _p._lineTo = function (pt){
+        this._addMoveTo();
+        this.bounds = updateBounds(this.bounds, pt);
+    };
+
+    _p._curveToOne = function (bcp1, bcp2, pt){
+        this._addMoveTo();
+        this.bounds = updateBounds(this.bounds, bcp1);
+        this.bounds = updateBounds(this.bounds, bcp2);
+        this.bounds = updateBounds(this.bounds, pt);
+    };
+
+    _p._qCurveToOne = function (bcp, pt){
+        this._addMoveTo();
+        this.bounds = updateBounds(this.bounds, bcp);
+        this.bounds = updateBounds(this.bounds, pt);
+    };
+
+    return ControlBoundsPen;
+});
+
+define('Atem-Pen-Case/tools/bezierTools',[
+    './arrayTools'
+],
+function(
+    arrayTools
+){
+    "use strict";
+    /**
+     * javascript port based on the original python sources from:
+     * https://github.com/behdad/fonttools/blob/b30e12ae00b30a701b6829951c254d7e44c34057/Lib/fontTools/misc/bezierTools.py
+     *
+     * The following methods are not ported, though:
+     * - splitLine(pt1, pt2, where, isHorizontal)
+     * - splitQuadratic(pt1, pt2, pt3, where, isHorizontal)
+     * - splitCubic(pt1, pt2, pt3, pt4, where, isHorizontal)
+     * - splitQuadraticAtT(pt1, pt2, pt3, *ts)
+     * - splitCubicAtT(pt1, pt2, pt3, pt4, *ts)
+     * - _splitQuadraticAtT(a, b, c, *ts)
+     * - _splitCubicAtT(a, b, c, d, *ts)
+     * - solveCubic(a, b, c, d)
+     * - calcQuadraticPoints(a, b, c)
+     * - calcCubicPoints(a, b, c, d)
+     *
+     */
+    var epsilon = 1e-12
+      , calcBounds = arrayTools.calcBounds
+      ;
+    function solveQuadratic(a, b, c, sqroot_){
+        /* Solve a quadratic equation where a, b and c are real.
+         *
+         * a*x*x + b*x + c = 0
+         *
+         * This function returns a list of roots. Note that the
+         * returned list is neither guaranteed to be sorted nor
+         * to contain unique values!
+         */
+        var sqroot = sqroot_ || Math.sqrt
+          , roots
+          , D2
+          , rD2
+          ;
+        if (Math.abs(a) < epsilon){
+            if (Math.abs(b) < epsilon){
+                // We have a non-equation;
+                // therefore, we have no valid solution
+                roots = [];
+            }
+            else {
+                // We have a linear equation with 1 root.
+                roots = [-c/b];
+            }
+        }
+        else {
+            // We have a true quadratic equation.
+            // Apply the quadratic formula to find two roots.
+            D2 = b*b - 4.0*a*c;
+            if (D2 >= 0.0){
+                rD2 = sqroot(D2);
+                roots = [(-b+rD2)/2.0/a, (-b-rD2)/2.0/a];
+            }
+            else {
+                // complex roots, ignore
+                roots = [];
+            }
+        }
+        return roots;
+    }
+
+    function calcQuadraticParameters(pt1, pt2, pt3){
+        var x2 = pt2[0]
+          , y2 = pt2[1]
+          , x3 = pt3[0]
+          , y3 = pt3[1]
+          , cx = pt1[0]
+          , cy = pt1[1]
+          , bx = (x2 - cx) * 2.0
+          , by = (y2 - cy) * 2.0
+          , ax = x3 - cx - bx
+          , ay = y3 - cy - by
+          ;
+        return [[ax, ay], [bx, by], [cx, cy]];
+    }
+
+    function calcCubicParameters(pt1, pt2, pt3, pt4){
+        var x2 = pt2[0]
+          , y2 = pt2[1]
+          , x3 = pt3[0]
+          , y3 = pt3[1]
+          , x4 = pt4[0]
+          , y4 = pt4[1]
+          , dx = pt1[0]
+          , dy = pt1[1]
+          , cx = (x2 - dx) * 3.0
+          , cy = (y2 - dy) * 3.0
+          , bx = (x3 - x2) * 3.0 - cx
+          , by = (y3 - y2) * 3.0 - cy
+          , ax = x4 - dx - cx - bx
+          , ay = y4 - dy - cy - by
+          ;
+        return [[ax, ay], [bx, by], [cx, cy], [dx, dy]];
+    }
+
+    function calcQuadraticBounds(pt1, pt2, pt3){
+        /* Return the bounding box for a qudratic bezier segment.
+         *
+         * pt1 and pt3 are the "anchor" points, pt2 is the "handle".
+         *
+         * >>> calcQuadraticBounds((0, 0), (50, 100), (100, 0))
+         * (0, 0, 100, 50.0)
+         * >>> calcQuadraticBounds((0, 0), (100, 0), (100, 100))
+         * (0.0, 0.0, 100, 100)
+         */
+        var params = calcQuadraticParameters(pt1, pt2, pt3)
+          , ax = params[0]
+          , ay = params[1]
+          , bx = params[2]
+          , by = params[3]
+          , cx = params[4]
+          , cy = params[5]
+          , ax2 = ax*2.0
+          , ay2 = ay*2.0
+          , points = []
+          , roots = []
+          , t
+          ;
+        if (ax2 !== 0) {
+            roots.push(-bx/ax2);
+        }
+        if (ay2 !== 0) {
+            roots.push(-by/ay2);
+        }
+
+        while((t = roots.pop()) !== undefined) {
+            if (0 <= t && t < 1) {
+                points.push([ax*t*t + bx*t + cx, ay*t*t + by*t + cy]);
+            }
+        }
+        points.push(pt1, pt3);
+
+        return calcBounds(points);
+    }
+
+    function calcCubicBounds(pt1, pt2, pt3, pt4){
+        /* Return the bounding rectangle for a cubic bezier segment.
+         * pt1 and pt4 are the "anchor" points, pt2 and pt3 are the "handles".
+         *
+         * >>> calcCubicBounds((0, 0), (25, 100), (75, 100), (100, 0))
+         * (0, 0, 100, 75.0)
+         * >>> calcCubicBounds((0, 0), (50, 0), (100, 50), (100, 100))
+         * (0.0, 0.0, 100, 100)
+         * >>> calcCubicBounds((50, 0), (0, 100), (100, 100), (50, 0))
+         * (35.566243270259356, 0, 64.43375672974068, 75.0)
+         */
+        var params = calcCubicParameters(pt1, pt2, pt3, pt4)
+          , ax = params[0]
+          , ay = params[1]
+          , bx = params[2]
+          , by = params[3]
+          , cx = params[4]
+          , cy = params[5]
+          , dx = params[6]
+          , dy = params[7]
+          , ax3 = ax * 3.0
+          , ay3 = ay * 3.0
+          , bx2 = bx * 2.0
+          , by2 = by * 2.0
+          , points = []
+          , roots = [] , i, l, t
+          ;
+        roots = [].concat(solveQuadratic(ax3, bx2, cx), solveQuadratic(ay3, by2, cy));
+        for (i=0, l=roots.length; i<l; i++){
+            t = roots[i];
+            if (0 <= t && t < 1)
+                points.push([ax*t*t*t + bx*t*t + cx * t + dx, ay*t*t*t + by*t*t + cy * t + dy]);
+        }
+        points.push(pt1, pt4);
+        return calcBounds(points);
+    }
+
+    return {
+        calcQuadraticBounds: calcQuadraticBounds
+      , calcCubicBounds: calcCubicBounds
+      , solveQuadratic: solveQuadratic
+    };
+});
+
+define(
+    'Atem-Pen-Case/pens/BoundsPen',[
+        './ControlBoundsPen'
+      , 'Atem-Pen-Case/tools/arrayTools'
+      , 'Atem-Pen-Case/tools/bezierTools'
+    ],
+    function(
+        Parent
+      , arrayTools
+      , bezierTools
+) {
+    "use strict";
+    var updateBounds = arrayTools.updateBounds
+      , pointInRect = arrayTools.pointInRect
+      , unionRect = arrayTools.unionRect
+      , calcCubicBounds = bezierTools.calcCubicBounds
+      , calcQuadraticBounds = bezierTools.calcQuadraticBounds
+      ;
+    /**
+     * javascript port based on the original python sources from:
+     * https://github.com/robofab-developers/robofab/blob/445e45d75567efccd51574c4aa2a14d15eb1d4db/Lib/robofab/pens/boundsPen.py
+     *
+     * but also check the boundsPen.py file in the master branch:
+     * https://github.com/robofab-developers/robofab/blob/master/Lib/robofab/pens/boundsPen.py
+     * as it seems more actively mantained even though the code in their ufo3k branch is the primary source for ufoJS.
+     *
+     * Pen to calculate the bounds of a shape. It calculates the
+     * correct bounds even when the shape contains curves that don't
+     * have points on their extremes. This is somewhat slower to compute
+     * than the "control bounds".
+     *
+     * When the shape has been drawn, the bounds are available as the
+     * 'bounds' attribute of the pen object. It's a 4-tuple:
+     *
+     * (xMin, yMin, xMax, yMax)
+     */
+
+    /* constructor */
+    function BoundsPen (glyphSet) {
+        Parent.call(this, glyphSet);
+        this.bounds = undefined;
+        this._start = undefined;
+    }
+
+    /* inheritance */
+    var _p = BoundsPen.prototype = Object.create(Parent.prototype);
+    _p.constructor = BoundsPen;
+
+    _p._curveToOne = function (bcp1, bcp2, pt){
+        this._addMoveTo();
+        this.bounds = updateBounds(this.bounds, pt);
+        if (!pointInRect(bcp1, this.bounds) ||
+            !pointInRect(bcp2, this.bounds)){
+            this.bounds = unionRect(this.bounds,
+                calcCubicBounds(
+                this._getCurrentPoint()
+                  , bcp1
+                  , bcp2
+                  , pt
+                )
+            );
+        }
+    };
+
+    _p._qCurveToOne = function (bcp, pt){
+        this._addMoveTo();
+        this.bounds = updateBounds(this.bounds, pt);
+        if (! pointInRect(bcp, this.bounds)){
+            this.bounds = unionRect(
+                this.bounds
+              , calcQuadraticBounds(
+                    this._getCurrentPoint()
+                  , bcp
+                  , pt
+                )
+            );
+        }
+    };
+
+    _p.getBounds = function (){
+        return this.bounds;
+    };
+
+    return BoundsPen;
+});
+
+define('specimenTools/services/svgDrawing/Glyph',[
+    './lib'
+  , 'Atem-Pen-Case/pens/SVGPen'
+  , 'Atem-Pen-Case/pens/BoundsPen'
+  , 'Atem-Pen-Case/pens/TransformPen'
+], function(
+    lib
+  , SVGPen
+  , BoundsPen
+  , TransformPen
+) {
+    "use strict";
+
+    var svgns = lib.svgns
+      , draw = lib.draw
+      ;
+
+    function Glyph(doc, glyph, options) {
+        var boundsPen, bounds, svgPen, pen;
+        this.options = options;
+        boundsPen = new BoundsPen({});
+        draw(glyph, boundsPen);
+        // [xMin, yMin, xMax, yMax]
+        bounds = boundsPen.getBounds();
+
+        this.leftSideBearing = bounds[0];
+        this.rightSideBearing = glyph.advanceWidth - bounds[2];
+        this.rawWidth = bounds[2] - bounds[0];
+        this.width = glyph.advanceWidth;
+
+        this.element = doc.createElementNS(svgns, 'path');
+        svgPen = new SVGPen(this.element, {});
+        // so, in path is now the glyph without it's left side bearing!
+        pen = new TransformPen(svgPen, [1, 0, 0, 1, -this.leftSideBearing, 0]);
+        draw(glyph, pen);
+    }
+
+    var _p = Glyph.prototype;
+
+    // not needed
+    _p.initDimensions = function() {};
+
+    return Glyph;
+});
+
+define('specimenTools/services/svgDrawing/Layout',[
+    './_BaseDrawingElement'
+  , './lib'
+], function(
+    Parent
+  , lib
+) {
+    "use strict";
+
+    var svgns = lib.svgns
+      , setTransform = lib.setTransform
+      , insertElement = lib.insertElement
+      ;
+
+    function Layout(doc, children, options) {
+        this.options = options;
+        this.leftSideBearing = 0;
+        this.rightSideBearing = 0;
+        this._children = children;
+        this.element = doc.createElementNS(svgns, 'g');
+        this._addChildren(children);
+    }
+    var _p = Layout.prototype = Object.create(Parent.prototype);
+   _p.constructor = Layout;
+
+    Object.defineProperty(_p, 'width', {
+        get: function() {
+            var i, l, width=0;
+            for(i=0,l=this._children.length;i<l;i++) {
+                if(this._children[i].noDimensions)
+                    // don't consider these
+                    continue;
+                if(i > 0 && this.options.spacing)
+                    width += this.options.spacing;
+                width += this._children[i].width;
+            }
+            return width;
+        }
+      , enumerable: true
+    });
+
+    Object.defineProperty(_p, 'rawWidth', {
+        get: function() {
+            return this.width - this.leftSideBearing - this.rightSideBearing;
+        }
+    });
+
+    _p.initDimensions = function() {
+         var i, l, child, xadvance = 0;
+         for(i=0,l=this._children.length;i<l;i++) {
+            child = this._children[i];
+            if(child.noDimensions)
+                // don't consider these
+                continue;
+            child.initDimensions();
+            setTransform(child.element, [1, 0, 0, 1, xadvance, 0]);
+            if(this.options.spacing)
+                xadvance += this.options.spacing;
+            xadvance += child.width;
+        }
+        this.leftSideBearing = this._children[0].leftSideBearing;
+        this.rightSideBearing = this._children[this._children.length-1].rightSideBearing;
+    };
+
+    _p._addChildren = function(children) {
+        var i, l, child;
+        if(!children.length) return;
+        for(i=0,l=children.length;i<l;i++) {
+            child = children[i];
+            insertElement(this.element, child.element, child.options.insert);
+        }
+    };
+
+    return Layout;
+});
+
+define('specimenTools/services/svgDrawing/YLine',[
+    './lib'
+], function(
+    lib
+) {
+    "use strict";
+
+    var svgns = lib.svgns;
+
+    function YLine(doc, val, options) {
+        this.options = options;
+        this.element = doc.createElementNS(svgns, 'line');
+        this.element.setAttribute('x1', 0);
+        this.element.setAttribute('x2', 0);
+        this.element.setAttribute('y1', val);
+        this.element.setAttribute('y2', val);
+    }
+
+    var _p  = YLine.prototype;
+
+    _p.noDimensions = true;
+    _p.setExtends = function(x1, x2/*, height*/) {
+        if(x1 !== null)
+            this.element.setAttribute('x1', x1);
+        if(x2 !== null)
+            this.element.setAttribute('x2', x2);
+        //if(height !== null)
+        //    this.element.setAttribute('y2', height);
+    };
+
+    return YLine;
+});
+
+define('specimenTools/services/svgDrawing/Text',[
+    './lib'
+], function(
+    lib
+) {
+    "use strict";
+
+    var svgns = lib.svgns
+      , setTransform = lib.setTransform
+      ;
+
+    function Text(doc, val, options) {
+        var font = val.fontsData.getFont(val.fontIndex)
+          , unitsPerEm = font.unitsPerEm
+          ;
+        this.options = options;
+
+        this.textElement = doc.createElementNS(svgns, 'text');
+        this.textElement.setAttribute('font-size', unitsPerEm);
+        this.textElement.textContent = val.text;
+
+        // This may help with alignment of separate layers,
+        // but it needs adjustments in initDimensions.
+        // e.g: this.textElement.getBBox() usually returns a negative
+        // value for x when using "end"
+        // "start|middle|end"
+        // this.textElement.setAttribute('text-anchor', 'end');
+
+        val.webFontProvider.setStyleOfElement(val.fontIndex, this.textElement);
+        setTransform(this.textElement, [1, 0, 0, -1, 0, 0]);
+        this.element = doc.createElementNS(svgns, 'g');
+        this.element.appendChild(this.textElement);
+    }
+
+    var _p = Text.prototype;
+
+    _p.initDimensions = function() {
+        var bbox = this.element.getBBox();
+        // don't know how to figure these out, if there's a way in
+        // SVG at all
+        this.leftSideBearing = 0;
+        this.rightSideBearing = 0;
+        // without side bearingd width and raw width are the same
+        this.rawWidth = this.width = bbox.width;
+    };
+
+    return Text;
+});
+
+define('specimenTools/services/svgDrawing/DiagramRenderer',[
+    'specimenTools/services/dom-tool'
+  , './lib'
+  , './Box'
+  , './Glyph'
+  , './Layout'
+  , './YLine'
+  , './Text'
+], function(
+    domTool
+  , lib
+  , Box
+  , Glyph
+  , Layout
+  , YLine
+  , Text
+) {
+    "use strict";
+
+    var applyClasses = domTool.applyClasses
+      , svgns = lib.svgns
+      , setTransform = lib.setTransform
+      ;
+
+    /**
+     * options: {constructorname} + 'Class': 'a_class_name_for_constructor'
+     *      see the _constructors properties for constructor names
+     *      e.g.:
+     *      glyphClass: 'diagram__glyph'
+     *      ylineClass: 'diagram__yline'
+     *      boxClass: 'diagram__box'
+     *      layoutClass: 'diagram__layout'
+     *      textClass: 'diagram__text'
+     *
+     *
+     */
+    function DiagramRenderer(doc, fontsData, webFontProvider, options) {
+        this._options = options || {};
+        this._doc = doc;
+        this._fontsData = fontsData;
+        this._webFontProvider = webFontProvider;
+    }
+
+    var _p = DiagramRenderer.prototype;
+    _p.constructor = DiagramRenderer;
+
+    _p._constructors = {
+        glyph: Glyph
+      , layout: Layout
+      , box: Box
+      , yline: YLine
+      , text: Text
+    };
+
+    _p._applyStyles = function(type, item) {
+        var cssClass = this._options[type + 'Class']
+          , cssBehaviorClass
+          ;
+
+        if(item.options.features)
+            item.element.style.fontFeatureSettings = item.options.features;
+
+        if(!cssClass)
+            return;
+        applyClasses(item.element, cssClass);
+        if(item.options.style) {
+            cssBehaviorClass = cssClass + '_' + item.options.style;
+            applyClasses(item.element, cssBehaviorClass);
+        }
+    };
+
+    _p._renderElement = function(instructions, fontIndex) {
+        var type = instructions[0]
+          , options = instructions[2] || {}
+          , i, l
+          , Type = this._constructors[type]
+          , content, item, child
+          ;
+        switch(type) {
+            case('glyph'):
+                content = this._fontsData.getGlyphByName(fontIndex, instructions[1]);
+                if(!content)
+                    throw new Error('DiagramRenderer: can\'t find glyph '
+                                    + 'with name "'+instructions[1]+'"');
+                break;
+            case('yline'):
+                content = instructions[1] !== 'baseLine'
+                        ? this._fontsData.getFontValue(fontIndex, instructions[1])
+                        : 0
+                        ;
+                break;
+            case('text'):
+                content = {
+                    text: instructions[1]
+                  , fontIndex: fontIndex
+                  , fontsData: this._fontsData
+                  , webFontProvider: this._webFontProvider
+                };
+                break;
+            default:
+                content = [];
+                for(i=0,l=instructions[1].length;i<l;i++) {
+                    // recursion
+                    child = this._renderElement(instructions[1][i], fontIndex);
+                    content.push(child);
+                }
+        }
+        item = new Type(this._doc, content, options);
+        this._applyStyles(type, item);
+        return item;
+    };
+
+    function getFontDimensions(font, options) {
+        var ascent, descent, width, yMax, yMin, height;
+        yMax = font.tables.head.yMax;
+        yMin = font.tables.head.yMin;
+        width =  yMax + (yMin > 0 ? 0 : Math.abs(yMin));
+        //usWinAscent and usWinDescent should be the maximum values for
+        // all glyphs over the complete family.
+        // So,if it ain't broken, styles of the same family should
+        // all render with the same size.
+        ascent = 'ascent' in options
+                ? options.ascent
+                : font.tables.os2.usWinAscent
+                ;
+        descent = 'descent' in options
+                ? options.descent
+                : font.tables.os2.usWinDescent
+                ;
+        height = 'height' in options
+                ? options.height
+                : ascent + descent
+                ;
+        return {
+              width: width
+            , height: height
+            , ascent: ascent
+            , descent: descent
+        };
+    }
+
+    function onHasDocument(svg, contentObject, font, options) {
+        // From here on I can use getBBox()
+        var width, dimensions, height, ascent;
+        contentObject.initDimensions();
+        width = contentObject.width;
+        contentObject.setExtends(
+                -contentObject.leftSideBearing
+              , width-contentObject.leftSideBearing
+        );
+
+        dimensions = getFontDimensions(font, options);
+        height = dimensions.height;
+        ascent = dimensions.ascent;
+        svg.setAttribute('viewBox', [0, 0, width, height].join(' '));
+        setTransform(contentObject.element
+            , [1, 0, 0, -1, contentObject.leftSideBearing, ascent]);
+    }
+
+    _p.render = function(instructions, fontIndex, options) {
+        var svg = this._doc.createElementNS(svgns, 'svg')
+          , contentObject = this._renderElement(instructions, fontIndex)
+          , font = this._fontsData.getFont(fontIndex)
+          ;
+
+        svg.appendChild(contentObject.element);
+
+        return {
+              element: svg
+            , onHasDocument: onHasDocument.bind(null, svg, contentObject
+                                                        , font, options)
+        };
+    };
+
+    return DiagramRenderer;
+});
+
+define('specimenTools/widgets/FeatureDisplay',[
+    'specimenTools/_BaseWidget'
+  , 'specimenTools/services/dom-tool'
+  , 'specimenTools/services/OTFeatureInfo'
+  , 'specimenTools/services/svgDrawing/DiagramRenderer'
+], function(
+    Parent
+  , domTool
+  , OTFeatureInfo
+  , DiagramRenderer
+) {
+    "use strict";
+
+    /**
+     * FeatureDisplay creates small cards demoing OpenType-Features found
+     * in the font.
+     *
+     * Because of our very diverse needs to show different features, the
+     * setup of this widget has become a bit more complex than I like it
+     * to be. Thus this may be a good candidate for a complete rewrite.
+     *
+     *
+     *
+     * FeatureDisplay searches its host element for elements that have the CSS-class
+     * `{bluePrintNodeClass}`. These blueprint nodes will be cloned and
+     * augmented for each feature that is feasible to demo.
+     * The cloned and augmented feature-cards will be inserted at the place
+     * where the bluprint-node is located.
+     * Since the bluprint-node is never removed, it should be set to
+     * `style="display:none"`.
+     * If more than one blueprint nodes are found, all are treated as described above.
+     * If no blueprint node is found, a basic blueprint-node is generated
+     * and appended to the host container.
+     *
+     * TODO: more specific docs!
+     *
+     * A blueprint node should contain nodes for different kinds of content,
+     * currently: {itemContentTextClass}, {itemContentStackedClass}
+     *
+     * Each of these content nodes can be use zero or more times and will
+     * be appended as a child to {itemContentContainerClass} or inserted
+     * into {itemContentContainerClass} where a specially crafted
+     * HTML-Comment "<!-- content -->" is located.
+     *
+     * The amount and content of content nodes is configurable via {feaureItemsSetup}
+     * at the moment, the best would be to check out real world examples
+     * of this configuration.
+     *
+     * TODO: more documentation is needed here.
+     *
+     * If the option {useDefaultFeatureItems} is set to true, features with
+     * a default demo content will be displayed. If it is set to "complement"
+     * the default demo content will only be displayed if the feature is not
+     * used in any of the {feaureItemsSetup} configuration.
+     */
+    function FeatureDisplay(container, pubSub, fontsData, webFontProvider, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontsData;
+        this._webFontProvider = webFontProvider;
+        this._pubSub.subscribe('activateFont'
+                                     , this._onActivateFont.bind(this));
+        this._contentElements = [];
+        this._itemParentContainer = null;
+        this._bluePrintNodes = this._getBluePrintNodes(
+                                this._options.bluePrintNodeClass, true);
+
+        this._feaureItemsSetup = this._options.feaureItemsSetup
+                    ? this._prepareFeatureItems(this._options.feaureItemsSetup)
+                    : []
+                    ;
+        this._defaultFeaureItemsCache = Object.create(null);
+    }
+
+    var _p = FeatureDisplay.prototype = Object.create(Parent.prototype);
+    _p.constructor = FeatureDisplay;
+
+    FeatureDisplay.defaultOptions = {
+        bluePrintNodeClass: 'feature-display__item-blueprint'
+      , itemTagClassPrefix: 'feature-display__item-tag_'
+      , itemContentContainerClass: 'feature-display__item-content-container'
+      , itemBeforeClass: 'feature-display__item__before'
+      , itemChangeIndicatorClass: 'feature-display__item__change-indicator'
+        // used to be: itemAfterClass: 'feature-display__item__after'
+      , itemAppliedClass: 'feature-display__item__applied'
+      , itemTagNameClass: 'feature-display__item__tag-name'
+      , itemContentTextClass: 'feature-display__item__content-text'
+      , highlightClasses: 'feature-display__item_highlight'
+      , tabularClasses: 'feature-display__item_tabular'
+      , itemContentStackedClass: 'feature-display__item__content-stacked'
+      , itemContentStackedElementClassPrefix: 'feature-display__content-stacked__'
+      , itemFriendlyNameClass: 'feature-display__item__friendly-name'
+        // an array or null
+      , feaureItemsSetup: null
+        // "complement" (default): use default feature items if
+        //        no item for a feature is in feaureItemsSetup
+        // true/truish: use all default feature items
+        // false/falsy: don't use any default feature items
+        // Todo: could also be a list of feature-tags for which default
+        // items should be added, if available
+      , useDefaultFeatureItems: 'complement'
+        // the default should be by weight -> name, where the default weight is 0
+        // and the name is alphabetically first of all features per item
+      , featureSortfunction: function(itemA, itemB) {
+            var weightA = itemA.weight || 0
+              , weightB = itemB.weight || 0
+              , featuresA, featuresB
+              ;
+            if(weightA !== weightB)
+                return weightA - weightB;
+
+            featuresA = itemA.features.join(' ');
+            featuresB = itemB.features.join(' ');
+            if(featuresA === featuresB)
+                return 0;
+            return featuresA < featuresB ? -1 : 1;
+        }
+    };
+
+    _p._getBluePrintNodes = function(className) {
+        var nodes = this._container.getElementsByClassName(className)
+          , i, l, node
+          , result = []
+          ;
+
+        if(nodes.length) {
+            for(i=0,l=nodes.length;i<l;i++) {
+                // I expect the blueprint class to be "display: none"
+                node = nodes[i].cloneNode(true);
+                node.style.display = null;
+                this._applyClasses(node, className, true);
+                result.push([nodes[i], node]);
+            }
+        }
+        return result;
+    };
+
+    /**
+     *  Available Features:
+     *        -> optional features
+     *        -> present in the font
+     */
+    _p._getAvailableFeatures = function(fontIndex) {
+        var fontFeatures = this._fontsData.getFeatures(fontIndex)
+          , availableFeatures = OTFeatureInfo.getSubset('optional', Object.keys(fontFeatures))
+          , order =  Object.keys(availableFeatures).sort()
+          , tag, i, l
+          , result = []
+          ;
+        for(i=0,l=order.length;i<l;i++) {
+            tag = order[i];
+            result.push([tag, availableFeatures[tag]]);
+        }
+        return result;
+    };
+
+    _p._getDefaultFeatureItems = function(availableFeatures, filterFunc) {
+        var i, l, result = [], tag, data, item, setup;
+        for(i=0,l=availableFeatures.length;i<l;i++) {
+            tag = availableFeatures[i][0];
+            data = availableFeatures[i][1];
+            if(!data.exampleText)
+                continue;
+            if(filterFunc && !filterFunc(tag))
+                continue;
+            item = this._defaultFeaureItemsCache[tag];
+            if(!item) {
+                // this should be enough to recreate the original display items
+                setup = {
+                    contents: [
+                        {
+                            type: 'text'
+                          , behavior: 'show-before'
+                          , features: tag
+                          , content: data.exampleText
+                        }
+                    ]
+                };
+                item = this._prepareFeatureItem(setup);
+                this._defaultFeaureItemsCache[tag] = item;
+            }
+            result.push(item);
+        }
+        return result;
+    };
+
+    /**
+     * Decorator to inverse a filter function.
+     *
+     * ```
+     * inputItems = ['a', 'b', 'c', 'd', 'e', 'f']
+     * s = new Set(['a', 'b', 'c'])
+     * inputItems.filter(s.has, s)
+     * > [ 'a', 'b', 'c' ]
+     * inputItems.filter(inverseFilter(s.has, s))
+     * > [ 'd', 'e', 'f' ]
+     * // also:
+     * inputItems.filter(inverseFilter(s.has), s)
+     * ```
+     */
+    function inverseFilter(filterFunc/*, thisArg*/) {
+        var thisArg = arguments.length >= 2 ? arguments[1] : void 0;
+        return function(element, index, array) {
+            return !filterFunc.call(thisArg !== void 0 ? thisArg : this
+                                                , element, index, array);
+        };
+    }
+
+    _p._onActivateFont = function(fontIndex) {
+        var featureItems
+          , usedFeatures
+          , availableFeatures
+          , availableFeaturesTags
+          , i, l
+          , filterFunc
+          ;
+        for(i=this._contentElements.length-1;i>=0;i--)
+            this._contentElements[i].parentNode.removeChild(this._contentElements[i]);
+
+        availableFeatures = this._getAvailableFeatures(fontIndex);
+        availableFeaturesTags = new Set();
+        availableFeatures.forEach(function(item) {
+                                availableFeaturesTags.add(item[0]); });
+        // all features used by the featureItems must be available in the font
+        function filterAvailableFeatureItems(featureItem) {
+            var i,l;
+            for(i=0,l=featureItem.features.length;i<l;i++)
+                if(!availableFeaturesTags.has(featureItem.features[i]))
+                    return false;
+            return true;
+        }
+
+        featureItems = this._feaureItemsSetup
+                           // filter also copies this._feaureItemsSetup
+                           // this is important! We will change the
+                           // featureItems array later.
+                           .filter(filterAvailableFeatureItems);
+
+        if(this._options.useDefaultFeatureItems) {
+            // add default
+            filterFunc = null;
+            if(this._options.useDefaultFeatureItems === 'complement') {
+                // all available features that are not yet in featureItems
+                usedFeatures = new Set();
+                for(i=0,l=featureItems.length;i<l;i++)
+                    featureItems[i].features.forEach(usedFeatures.add, usedFeatures);
+                             // `inverseFilter` takes care of the "not yet
+                             // in featureItems" part; as if there was
+                             // a `usedFeatures.hasNot` method.
+                filterFunc = inverseFilter(usedFeatures.has, usedFeatures);
+            }
+            Array.prototype.push.apply(featureItems
+                , this._getDefaultFeatureItems(availableFeatures, filterFunc));
+        }
+        if(this._options.featureSortfunction)
+            featureItems.sort(this._options.featureSortfunction);
+        this._contentElements = this._buildFeatures(featureItems, fontIndex);
+    };
+
+    _p._simpleMarkupAddItem = function (doc, element, type, text, contentSetup) {
+        var textNode, node;
+        textNode = doc.createTextNode(text.join(''));
+        switch(type){
+            case('highlight'):
+                node = doc.createElement('span');
+                this._applyClasses(node, this._options.highlightClasses);
+
+                if(contentSetup.featuresOnHighlights)
+                    _setFeaturesToElementStyle(node, contentSetup.features);
+
+                node.appendChild(textNode);
+                break;
+            default:
+                node = textNode;
+                break;
+        }
+        element.appendChild(node);
+    };
+
+    _p._simpleMarkup = function (doc, contentSetup) {
+        var i, l, type = null
+          , parent = doc.createDocumentFragment()
+          , currentText = []
+          , text = contentSetup.content
+          ;
+
+        for(i=0,l=text.length;i<l;i++) {
+            if(text[i] === '*') {
+                if(currentText.length) {
+                    this._simpleMarkupAddItem(doc, parent, type, currentText, contentSetup);
+                    currentText = [];
+                }
+                // switch type
+                type = type === 'highlight' ? null : 'highlight';
+                continue;
+            }
+            // a backslash escapes the asterix
+            if(text[i] === '\\' && text[i + 1] === '*')
+                i += 1;
+            currentText.push(text[i]);
+        }
+        if(currentText.length)
+            this._simpleMarkupAddItem(doc, parent, type, currentText, contentSetup);
+
+        return parent;
+    };
+
+    _p._textTabularContent = function(doc, setup) {
+        var i, l, node
+          , parent = doc.createDocumentFragment()
+          , text = setup.content
+          ;
+        for(i=0,l=text.length;i<l;i++) {
+            node = doc.createElement('span');
+            node.textContent = text[i];
+            this._applyClasses(node, this._options.tabularClasses);
+            parent.appendChild(node);
+        }
+        return parent;
+    };
+
+    function __collectFeatures(item) {
+        //jshint validthis: true
+        // this is a Set
+        var features, i, l;
+        features = typeof item.features === 'string'
+                    ? [item.features]
+                    : item.features
+                    ;
+        for(i=0,l=features.length;i<l;i++)
+            this.add(features[i]);
+    }
+
+    _p._prepareFeatureItem = function(setup) {
+        var features = new Set()
+          , item = {
+                contents: setup.contents || []
+              , features: null
+           }
+          , k
+          ;
+        for(k in setup) {
+            if(k in item) continue;
+            item[k] = setup[k];
+        }
+        item.contents.forEach(__collectFeatures, features);
+        item.features = Array.from(features).sort();
+        return item;
+    };
+
+    _p._prepareFeatureItems = function(setup) {
+        var i, l, featureItems = [];
+        for(i=0,l=setup.length;i<l;i++)
+            featureItems.push(this._prepareFeatureItem(setup[i]));
+        return featureItems;
+    };
+
+    function _getFontFeatureSettings(features) {
+        var _features = typeof features === 'string'
+                    ? [features]
+                    : features
+                    ;
+        return _features.map(function(tag) {
+                var onVal = OTFeatureInfo.getFeature(tag).onByDefault
+                            ? '0' : '1' ;
+                return '"' + tag + '" ' + onVal;
+            }).join(', ');
+    }
+
+    function _setFeaturesToElementStyle(item, features) {
+        item.style.fontFeatureSettings = _getFontFeatureSettings(features);
+    }
+
+    /**
+     * contentSetup = {
+     *      type: "text"
+     *    , features: "tag" || ["tag", "tag", ...]
+     *    , content: "sample text"
+     *    , behavior: "show-before" || "tabular" ||  falsy
+     * }
+     *
+     * behavior: 'tabular' and `falsy` are both removing the "before" elements from the blueprint
+     *
+     * <div class="mdlfs-feature-display__item__content_text">
+     *     <!-- removed if not in `show-before` mode-->
+     *     <div class="mdlfs-feature-display__item__before"></div>
+     *     <div class="material-icons mdlfs-feature-display__item__change-indicator">arrow_downward</div>
+     *     <!-- end removed -->
+     *     <div class="mdlfs-feature-display__item__applied"></div>
+     * </div>
+     */
+    _p._textTypeFactory = function(contentSetup, contentTemplate, fontIndex) {
+        var element
+          , item = {
+                element: null
+              , onHasDocument: false
+            }
+          ;
+
+        function setContent(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            var content = contentSetup.behavior === 'tabular'
+                ? this._textTabularContent(this._container.ownerDocument, contentSetup)
+                : this._simpleMarkup(this._container.ownerDocument, contentSetup)
+                ;
+            item.appendChild(content);
+            this._webFontProvider.setStyleOfElement(fontIndex, item);
+        }
+
+        function del (item) {
+            if (item.parentNode) item.parentNode.removeChild(item);
+        }
+
+        // create and fill the contentTemplates for this contentSetup
+        element = contentTemplate.cloneNode(true);
+
+        if(contentSetup.behavior !== 'show-before') {
+            domTool.mapToClass(element, this._options.itemBeforeClass, del, this);
+            domTool.mapToClass(element, this._options.itemChangeIndicatorClass, del, this);
+        }
+        else
+            domTool.mapToClass(element, this._options.itemBeforeClass, setContent, this, true);
+
+        domTool.mapToClass(element, this._options.itemAppliedClass, setContent, this, true);
+
+        if(!contentSetup.featuresOnHighlights)
+            domTool.mapToClass(element, this._options.itemAppliedClass, function(item, i) {
+                /*jshint unused:vars*/
+                _setFeaturesToElementStyle(item, contentSetup.features);
+            }, this, true);
+
+        item.element = element;
+        return item;
+    };
+
+    _p._renderSVG = function(instructions, fontIndex) {
+        var contructorOptions = {
+                glyphClass: 'glyph'
+              , ylineClass: 'yline'
+              , boxClass: 'box'
+              , layoutClass: 'layout'
+              , textClass: 'text'
+          }
+          , classPrefix = this._options.itemContentStackedElementClassPrefix
+          , k
+          , renderOptions = {}
+          , renderer
+          ;
+        for(k in contructorOptions)
+            contructorOptions[k] = classPrefix + contructorOptions[k];
+
+        renderer = new DiagramRenderer(
+              this._container.ownerDocument
+            , this._fontsData
+            , this._webFontProvider
+            , contructorOptions
+        );
+
+        return renderer.render(instructions, fontIndex, renderOptions);
+    };
+
+    function _getStackedBehavior(text) {
+         var behaviorKeywords = [
+                // keep sorted by longest keyword first!
+                ['webfont!', 'webfont']
+              , ['outline!', 'outline']
+              , ['w!', 'webfont']
+              , ['o!', 'outline']
+            ]
+           , i, l, kw, behavior
+           ;
+         for(i=0,l=behaviorKeywords.length;i<l;i++) {
+             kw = behaviorKeywords[i][0];
+             if(text.indexOf(kw) !== 0)
+                 continue;
+             behavior = behaviorKeywords[i][1];
+             return [behavior, text.slice(kw.length).trim()];
+         }
+         // default
+         return ['webfont', text];
+    }
+
+    function _parseSeparatedList(separatorCharacter, escapeCharacter, trim, text) {
+        var i, l, char, items = [], accumulated = [];
+        for(i=0,l=text.length;i<l;i++) {
+            char = text[i];
+            if(char === escapeCharacter && text[i+1] === separatorCharacter) {
+                // escaped
+                i++;
+                char = text[i];
+            }
+            else if(char === separatorCharacter) {
+                // argument separator
+                items.push(accumulated.join(''));
+                accumulated = [];
+                continue;
+            }
+            // just a part of the argument
+            accumulated.push(char);
+        }
+        if(accumulated.length)
+            // left overs
+            items.push(accumulated.join(''));
+        return (trim !== false
+                    ? items.map(function(item){return item.trim();})
+                    : items
+                );
+    }
+
+    function _parseStackedOutlineContent(text) {
+        // text = "l:l.ss02, align:left"
+        var args, content, optionsList, i, l, options = Object.create(null)
+          , result = {
+                before: null
+              , after: null
+              , options: options
+            };
+
+        args = _parseSeparatedList(',', '\\', true, text);
+        if(!args.length)
+            throw new Error('StackedOutlineContent: Can\'t find a content '
+                                            + 'argument in "'+text+'"');
+
+        content = _parseSeparatedList(':', '\\', true, args[0]);
+        if(content.length !== 2)
+            throw new Error('StackedOutlineContent: content must have two '
+                                    + 'items but has: ' + content.length);
+        result.before = content[0];
+        result.after = content[1];
+
+        if(args[1]) {
+            optionsList = _parseSeparatedList(':', '\\', true, args[0]);
+            for(i=0,l=optionsList.length;i<l;i+=2)
+                options[optionsList[i]] = optionsList[i+1];
+        }
+        return result;
+    }
+
+    function _getStackedOutlineBox(text, contentSetup) {
+        // jshint unused:vars
+        var setup = _parseStackedOutlineContent(text);
+        return ['box', [
+              ['glyph', setup.after, {style: 'highlighted'}]
+            , ['glyph', setup.before, {style: 'muted'}]
+            ]
+          , setup.options
+        ];
+    }
+
+    function _getStackedWebfontBox(text, contentSetup) {
+        var features = _getFontFeatureSettings(contentSetup.features);
+        return ['box', [
+              ['text', text, {style: 'highlighted', features: features}]
+            , ['text', text, {style: 'muted'}]
+            ]
+        ];
+    }
+
+    /**
+     * <div class="mdlfs-feature-display__item__content_stacked"></div>
+     *
+     * FeatureItems of `type` "stacked" can use `behavior`
+     * with following values:
+     *
+     * "webfont": draws text as webfont
+     *        - applies features, kerning
+     *        - limited glyph alignment control, because we can't do it
+     *          without the side bearing, i.e. using the pure outlines.
+     *        - example: "l"
+     * "mixed" (default): decides per content
+     *      "webfont!", "w!": at the beginning of a content
+     *                 interprets it as a webfont content.
+     *                 example: "webfont l"
+     *      (default): no marking makes it a "webfont"
+     *      "outline!" "w!" at the beginning of a content
+     *                 makes it an outline content.
+     *                 example: "outline l:l.ss02, align:left"
+     * "outline": draws glyphs as outlines
+     *          - no kerning, features etc.
+     *          - better glyph alignment control
+     *          - needs more information
+     *         example: "l:l.ss02;align: left"
+     *
+     *  [{
+     *      type: "stacked"
+     *    , features: ["ss01", "ss02", "ss03", "ss04"]
+     *    , content: ["G", "g", "R", "l", "outline! l:l.ss02, align:left"]
+     *    , behavior: 'mixed'
+     *  }
+     *  ]
+     */
+    _p._stackedTypeFactory = function(contentSetup, contentTemplate, fontIndex) {
+        var content = typeof contentSetup.content === 'string'
+                    ? [contentSetup.content]
+                    : contentSetup.content
+          , boxes = [], text
+          , instructions = ['layout', boxes]
+          , i, l
+          , contentBehavior, behavior
+          , box
+          ;
+        // build a stacked setup
+        // 'mixed'|'webfont'|'outline'|falsy
+        contentBehavior = contentSetup.behavior || 'mixed';
+        if(!(contentBehavior in {'mixed': true, 'webfont': true, 'outline': true}))
+            throw new Error('Unknown "stacked" content behavior "' + behavior + '"');
+
+        for(i=0,l=content.length;i<l;i++) {
+            if(contentBehavior === 'mixed') {
+                behavior = _getStackedBehavior(content[i]);
+                text = behavior[1];
+                behavior = behavior[0];
+            }
+            else {
+                text = content[i];
+                behavior = contentBehavior;
+            }
+
+            switch(behavior) {
+                case('outline'):
+                    box =_getStackedOutlineBox(text, contentSetup);
+                    break;
+                case('webfont'):
+                    /* falls through */
+                default:
+                    box = _getStackedWebfontBox(text, contentSetup);
+                    break;
+            }
+            boxes.push(box);
+        }
+
+        // return {
+        //      element: aDOMElement
+        //    , onHasDocument: function(){/*...*/}
+        // }
+        return this._renderSVG(instructions, fontIndex);
+    };
+
+    _p._contentFactories = {
+        stacked: '_stackedTypeFactory'
+      , text: '_textTypeFactory'
+    };
+
+    _p._getContentFactory = function(contentSetup) {
+        var factory = this._contentFactories[contentSetup.type];
+        if(typeof factory === 'string')
+            factory = this[factory];
+        if(!factory)
+            throw new Error('FeatureDisplay: Factory for "'
+                                + contentSetup.type + '" is not implemented.');
+        return factory;
+    };
+
+    _p._runContentFactory = function(contentSetup, contentTemplate, fontIndex) {
+        var factory = this._getContentFactory(contentSetup);
+        return factory.call(this, contentSetup, contentTemplate, fontIndex);
+    };
+
+    function getMarkerComments(markerContent, element, first) {
+        var i, l, childNode
+          , marker = markerContent.trim()
+          , result = first ? null : []
+          ;
+        // Get all the special comments: <!-- {markercontent} -->
+        for(i=0,l=element.childNodes.length;i<l;i++) {
+            childNode = element.childNodes[i];
+            if(!(childNode.nodeType === 8 //Node.COMMENT_NODE == 8
+                           && childNode.textContent.trim() === marker))
+                continue;
+            if(first)
+                return childNode;
+            else
+                result.push(childNode);
+        }
+        // null if first is truish
+        return result;
+    }
+
+    _p._makeElementFromBluePrint = function(bluePrintNode) {
+        // Could be done once for the blueprint node,
+        // But to much caching can cause maintenance trouble as well.
+        var element = bluePrintNode.cloneNode(true)
+          , contentTemplates = Object.create(null)
+          , templateElements
+          , contentTypes = {
+                text: this._options.itemContentTextClass
+              , stacked: this._options.itemContentStackedClass
+            }
+          , key
+          , templates = [], i, l
+          , contentContainer
+          ;
+
+        // get content templates
+        for(key in contentTypes) {
+            templateElements = element.getElementsByClassName(
+                                                        contentTypes[key]);
+            // use the last found element
+            if(templateElements.length)
+                contentTemplates[key] = templateElements[templateElements.length-1];
+
+            Array.prototype.push.apply(templates, templateElements);
+        }
+
+        // delete all template children
+        for(i=0,l=templates.length;i<l;i++) {
+            if(templates[i].parentNode)
+                templates[i].parentNode.removeChild(templates[i]);
+        }
+
+        if(this._options.itemContentContainerClass) {
+            contentContainer = element.getElementsByClassName(
+                            this._options.itemContentContainerClass)[0];
+        }
+        contentContainer = contentContainer || element;
+
+        return {
+            element: element
+          , contentTemplates: contentTemplates
+                          // <!-- contents -->
+          , insertionMarker: getMarkerComments('contents', contentContainer, true)
+        };
+    };
+
+    _p._buildFeatureItem = function(setup, bluePrintNode, fontIndex) {
+        var elementData = this._makeElementFromBluePrint(bluePrintNode)
+          , element = elementData.element
+          , contents = []
+          , item = {
+                element:element
+              , contents: contents
+            }
+          , i,l, contentSetup, contentTemplate, contentItem
+          , contentsFragment = this._container.ownerDocument.createDocumentFragment()
+          ;
+        if('removeClasses' in setup)
+            this._applyClasses(element, setup.removeClasses, true);
+        if('addClasses' in setup)
+            this._applyClasses(element, setup.addClasses);
+
+        domTool.mapToClass(element, this._options.itemTagNameClass, function(item, i) {
+            /*jshint unused:vars*/
+            item.textContent = setup.features.join(', ');
+        }, this, true);
+
+        domTool.mapToClass(element, this._options.itemFriendlyNameClass, function(item, i) {
+            /*jshint unused:vars*/
+            item.textContent = 'friendlyName' in setup
+                  ? setup.friendlyName
+                  : setup.features.map(function(tag) {
+                        return OTFeatureInfo.getFeature(tag).friendlyName;
+                    }).join('/')
+                  ;
+        }, this, true);
+
+        for(i=0,l=setup.contents.length;i<l;i++) {
+            contentSetup = setup.contents[i];
+            contentTemplate = elementData.contentTemplates[contentSetup.type];
+            if(!contentTemplate)
+                continue;
+            contentItem = this._runContentFactory(contentSetup
+                                            , contentTemplate, fontIndex);
+            contentsFragment.appendChild(contentItem.element);
+            contents.push(contentItem);
+        }
+        if(contents.length) {
+            if(elementData.insertionMarker)
+                elementData.insertionMarker
+                           .parentNode
+                           .insertBefore(contentsFragment, elementData.insertionMarker);
+            else
+                element.appendChild(contentsFragment);
+        }
+        return item;
+    };
+
+    _p._buildFeatureItems = function (featureItem, fontIndex) {
+        var i, l
+          , originalBluePrintNode, bluePrintNode, item
+          , elements = []
+          ;
+
+        for(i=0,l=this._bluePrintNodes.length;i<l;i++) {
+            originalBluePrintNode = this._bluePrintNodes[i][0];
+            bluePrintNode = this._bluePrintNodes[i][1];
+            item = this._buildFeatureItem(featureItem, bluePrintNode
+                                                            , fontIndex);
+            if(!item.contents.length)
+                continue;
+            // insert at blueprint node position
+            originalBluePrintNode.parentNode.insertBefore(item.element
+                                                , originalBluePrintNode);
+            for(i=0,l=item.contents.length;i<l;i++) {
+                if(item.contents[i].onHasDocument)
+                    // so the item can gather actual size information, i.e.
+                    // some svg based contents need this
+                    item.contents[i].onHasDocument();
+            }
+            elements.push(item.element);
+        }
+        return elements;
+    };
+
+    _p._buildFeatures = function(featureItems, fontIndex) {
+        var i, l, featureItem, elements = [];
+        for (i=0,l=featureItems.length;i<l;i++) {
+            featureItem = featureItems[i];
+            Array.prototype.push.apply(elements,
+                           this._buildFeatureItems(featureItem, fontIndex));
+        }
+        return elements;
+    };
+
+    return FeatureDisplay;
+});
+
+define('specimenTools/widgets/FilesDrop',[
+], function(
+) {
+    "use strict";
+
+    /**
+     * FilesDrop provides a drop zone and on-click-upload interface for
+     * files.
+     *
+     * The `handleFiles` argument is a function with the argument: aFileList
+     * where FileList is a https://developer.mozilla.org/en-US/docs/Web/API/FileList
+     *
+     * If `handleFiles.needsPubSub` is truish, the function is called with
+     * the arguments: pubsub, aFileList
+     *
+     * The function `loadFontsFromFileInput` of the `loadFonts` is made as
+     * a `handleFiles` function for this case, also with needsPubSub = true.
+     */
+    function FilesDrop(container, pubSub, handleFiles) {
+        this._container = container;
+        this._pubSub = pubSub;
+        this._makeFileInput(
+            handleFiles.needsPubSub
+                    ? handleFiles.bind(null, this._pubSub)
+                    : handleFiles
+            , container);
+    }
+
+    var _p = FilesDrop.prototype;
+
+    _p._makeFileInput = function (handleFiles, element) {
+        var hiddenFileInput = element.ownerDocument.createElement('input');
+        hiddenFileInput.setAttribute('type', 'file');
+        hiddenFileInput.setAttribute('multiple', 'multiple');
+        hiddenFileInput.style.display = 'none'; // can be hidden, no problem
+
+        // for the file dialogue
+        function fileInputChange(e) {
+            /*jshint validthis:true, unused:vars*/
+            handleFiles(this.files);
+        }
+        function forwardClick(e) {
+            /*jshint unused:vars*/
+            // forward the click => opens the file dialogue
+            hiddenFileInput.click();
+        }
+
+        // for drag and drop
+        function noAction(e) {
+            e.stopPropagation();
+            e.preventDefault();
+        }
+        function drop(e) {
+            e.stopPropagation();
+            e.preventDefault();
+            handleFiles(e.dataTransfer.files);
+        }
+
+        hiddenFileInput.addEventListener('change', fileInputChange);
+        element.addEventListener('click', forwardClick);
+        element.addEventListener("dragenter", noAction);
+        element.addEventListener("dragover", noAction);
+        element.addEventListener("drop", drop);
+    };
+
+    return FilesDrop;
+});
+
+define('specimenTools/widgets/LoadProgressIndicator',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+
+    /**
+     * LoadProgressIndicator visualizes the progress of the loading of the
+     * font files.
+     * It also applies CSS-classes to its container element to help styling
+     * the document while loading the fonts.
+     *
+     * Before loading, no CSS-Classes are set by this widget.
+     * While loading the fonts `loadingClass` is set to the container.
+     * When loading is finished `loadedClass` is set to the container and
+     * `loadingClass` is removed.
+     *
+     * So, when `loadedClass` is present, the specimen content can be shown
+     * and when none of these classes or `loadingClass` are present a progress
+     * indicator window can be shown.
+     *
+     * Child elements with the CSS-Class configured at `progressBarClass`
+     * will either get their `element.style.width` set to "{percent}%"
+     * or the configurable method at `setProgressBar` will be called
+     * like this: `setProgressBar.call(widgetInstance, element, percent)`.
+     *
+     * Child elements with the CSS-Class configured at `percentIndicatorClass`
+     * will have their element.textContent set to: "{percent} %"
+     *
+     * Child elements with the CSS-Class configured at `taskIndicatorClass`
+     * will have their element.innerHTML set to: "<em>{task}:</em> {fontFileName}"
+     *
+     * The idea is to initialize this widget on the <body> element.
+     */
+    function LoadProgressIndicator(container, pubSub, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+
+        this._pubSub.subscribe('prepareFont', this._onPrepareFont.bind(this));
+        this._pubSub.subscribe('loadFont', this._onLoadFont.bind(this));
+        this._pubSub.subscribe('allFontsLoaded', this._onAllFontsLoaded.bind(this));
+
+        this._numAllFonts = null;
+        this._fontsLoaded = 0;
+
+        this._elements = {
+            progressBar: this._container.getElementsByClassName(this._options.progressBarClass)
+          , percentIndicator: this._container.getElementsByClassName(this._options.percentIndicatorClass)
+          , taskIndicator: this._container.getElementsByClassName(this._options.taskIndicatorClass)
+        };
+    }
+
+    var _p = LoadProgressIndicator.prototype = Object.create(Parent.prototype);
+
+    LoadProgressIndicator.defaultOptions = {
+        loadedClass: 'load-progress_loaded'
+      , loadingClass: 'load-progress_loading'
+      , progressBarClass: 'load-progress__progress-bar'
+      , setProgressBar: function(element, percent) {
+            element.style.width = percent + '%';
+        }
+      , percentIndicatorClass: 'load-progress__percent'
+      , taskIndicatorClass: 'load-progress__task'
+    };
+
+    _p._updateProgress = function(label, fontIndex, fontFileName) {
+        var percent, i, l;
+
+        percent = Math.round(this._fontsLoaded /this._numAllFonts * 10000) / 100;
+
+        for(i=0,l=this._elements.taskIndicator.length;i<l;i++)
+            this._elements.taskIndicator[i].innerHTML = [
+                                '<em>', label, '</em> ',(
+                                fontFileName.lastIndexOf('/') === -1
+                                    ? fontFileName
+                                    : '…' + fontFileName.slice(fontFileName.lastIndexOf('/'))
+                                )].join('');
+
+        for(i=0,l=this._elements.percentIndicator.length;i<l;i++)
+            this._elements.percentIndicator[i].textContent = percent + ' %';
+
+        for(i=0,l=this._elements.progressBar.length;i<l;i++)
+            this._options.setProgressBar.call(this, this._elements.progressBar[i], percent);
+    };
+
+    _p._onPrepareFont = function(fontIndex, fontFileName, numAllFonts) {
+        if(this._numAllFonts === null) {
+            this._applyClasses(this._container, this._options.loadingClass);
+            this._applyClasses(this._container, this._options.loadedClass, true);
+            this._numAllFonts = numAllFonts;
+            this._numAllFonts = numAllFonts;
+        }
+        this._updateProgress('Requesting:', fontIndex, fontFileName);
+    };
+
+    _p._onLoadFont = function (fontIndex, fontFileName, font) {
+        /*jshint unused: vars*/
+        this._fontsLoaded += 1;
+        this._updateProgress('Loaded:', fontIndex, fontFileName);
+    };
+
+    _p._onAllFontsLoaded = function(numAllFonts) {
+        /*jshint unused: vars*/
+        this._applyClasses(this._container, this._options.loadedClass);
+        this._applyClasses(this._container, this._options.loadingClass, true);
+    };
+
+    return LoadProgressIndicator;
+});
+
+define('specimenTools/widgets/PerFont',[
+    'specimenTools/_BaseWidget'
+  , 'specimenTools/services/dom-tool'
+], function(
+    Parent
+  , domTool
+) {
+    "use strict";
+
+    /**
+     * PerFont clones blueprint elements with the CSS-class `{bluePrintNodeClass}`
+     * once nodes per loaded font file and applies the style for the font
+     * to elements marked with CSS-class `{currentFontClass}`.
+     * Elements marked with CSS-class `{fontDataClass}` behave similar
+     * to the host elements of the widget `GenericFontData`. The DOM-attribute
+     * "data-getter" is also used in this context.
+     *
+     * The font files are ordered by: FamilyName, Weight, Style (normal < italic)
+     */
+    function PerFont(container, pubSub, fontsData, webFontProvider, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontsData;
+        this._webFontProvider = webFontProvider;
+        this._pubSub.subscribe('allFontsLoaded', this._onAllFontsLoaded.bind(this));
+        this._contentElements = [];
+        this._bluePrintNodes = this._getBluePrintNodes();
+    }
+
+
+    var _p = PerFont.prototype = Object.create(Parent.prototype);
+    _p.constructor = PerFont;
+
+    PerFont.defaultOptions = {
+          bluePrintNodeClass: 'per-font__item-blueprint'
+        , itemClass: 'per-font__item'
+        , fontDataClass:  'per-font__data'
+        , currentFontClass:  'per-font__current-font'
+    };
+
+    _p._getBluePrintNodes = function() {
+        var nodes = this._container.getElementsByClassName(
+                                    this._options.bluePrintNodeClass)
+          , i, l, node
+          , result = []
+          ;
+        for(i=0,l=nodes.length;i<l;i++) {
+            // I expect the blueprint class to be "display: none"
+            node = nodes[i].cloneNode(true);
+            result.push([nodes[i], nodes[i].parentNode, node]);
+            node.style.display = null;
+            this._applyClasses(node, this._options.bluePrintNodeClass, true);
+            this._applyClasses(node, this._options.itemClass);
+        }
+        return result;
+    };
+
+    _p._defaultGetValue  = function(item, fontIndex) {
+        var _getter, getter;
+        getter = _getter = item.getAttribute('data-getter');
+        if(getter.indexOf('get') !== 0)
+            getter = ['get', getter[0].toUpperCase(), getter.slice(1)].join('');
+
+        if(!(getter in this._fontsData) || typeof this._fontsData[getter] !== 'function')
+            throw new Error('Unknown getter "' + _getter + '"'
+                        + (getter !== _getter
+                                    ? '(as "' + getter + '")'
+                                    : '')
+                        +'.');
+        return this._fontsData[getter](fontIndex);
+    };
+
+    _p._makeRotationItem = function(bluePrintNode, index) {
+        var item = bluePrintNode.cloneNode(false)
+          , rotationContent = []
+          , rotationContents = [rotationContent]
+          , childNode
+          , i, l, rotationIndex
+          ;
+        // Get all the rotation contents
+        // a special comment: <!-- rotate -->
+        // is used to separate the rotation contents
+        for(i=0,l=bluePrintNode.childNodes.length;i<l;i++) {
+            childNode = bluePrintNode.childNodes[i];
+            if(childNode.nodeType === 8 //Node.COMMENT_NODE == 8
+                           && childNode.textContent.trim() === 'rotate') {
+                rotationContent = [];
+                rotationContents.push(rotationContent);
+                continue;
+            }
+
+            rotationContent.push(childNode);
+        }
+
+        // apply rotationContent
+        rotationIndex = index % rotationContents.length;
+        rotationContent = rotationContents[rotationIndex];
+        for(i=0,l=rotationContent.length;i<l;i++)
+            item.appendChild(rotationContent[i].cloneNode(true));
+        return item;
+    };
+
+    _p._createItem = function(index, bluePrintNode, fontIndex) {
+        var item = bluePrintNode.hasAttribute('data-per-font-rotate')
+                        ? this._makeRotationItem(bluePrintNode, index)
+                        : bluePrintNode.cloneNode(true)
+                        ;
+
+        domTool.mapToClass(item, this._options.currentFontClass, function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+           this._webFontProvider.setStyleOfElement(fontIndex, item);
+        }, this, true);
+
+        domTool.mapToClass(item, this._options.fontDataClass, function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            item.textContent = this._defaultGetValue(item, fontIndex);
+        }, this, true);
+
+        return item;
+    };
+
+    _p._createItems = function(index, fonts) {
+        // create new _contentElements
+        var i, l, originalBluePrintNode, itemParentContainer
+          , bluePrintNode, item, fontIndex
+          , items = []
+          ;
+        for(i=0,l=this._bluePrintNodes.length;i<l;i++) {
+            originalBluePrintNode = this._bluePrintNodes[i][0];
+            itemParentContainer = this._bluePrintNodes[i][1];
+            bluePrintNode = this._bluePrintNodes[i][2];
+
+            if(bluePrintNode.hasAttribute('data-reverse-font-order'))
+                fontIndex = fonts[fonts.length - 1 - index];
+            else
+                fontIndex = fonts[index];
+
+
+            item = this._createItem(index, bluePrintNode, fontIndex);
+            if(originalBluePrintNode !== null)
+                itemParentContainer.insertBefore(item, originalBluePrintNode);
+            else
+                itemParentContainer.appendChild(item);
+            items.push(item);
+        }
+        return items;
+    };
+
+    _p._onAllFontsLoaded = function(numberAllFonts) {
+        //jshint unused:vars
+        var fonts = this._fontsData.getFontIndexesInFamilyOrder()
+          , items, i, l
+          ;
+
+        for(i=this._contentElements.length-1;i>=0;i--)
+            this._contentElements[i].parentNode.removeChild(this._contentElements[i]);
+
+        for(i=0,l=fonts.length;i<l;i++) {
+            items = this._createItems(i, fonts);
+            Array.prototype.push.apply(this._contentElements, items);
+        }
+    };
+
+
+    return PerFont;
+});
+
+define('specimenTools/widgets/Diagram',[
+    'specimenTools/_BaseWidget'
+  , 'specimenTools/services/svgDrawing/DiagramRenderer'
+], function(
+    Parent
+  , DiagramRenderer
+) {
+    "use strict";
+
+    /**
+     * This is a stub!
+     *
+     * The aim of the Diagram widget is to enable the rendering of SVG
+     * based diagrams to illustrate certain aspects of the font.
+     * Examples are right now a rather generic x-height diagram and a
+     * rather specific `stylisticSets` diagram, that renders two glyph
+     * alternates on top of each other.
+     * Eventually, a small domain specific language or something similar
+     * should be available to describe such diagrams, so that it is easy
+     * for a designer or a specialized tool, to create these diagrams
+     * for specific fonts.
+     */
+
+    function Diagram(container, pubSub, fontsData, webFontProvider, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontsData;
+        this._webFontProvider = webFontProvider;
+        this._svg = null;
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+    }
+
+    var _p = Diagram.prototype = Object.create(Parent.prototype);
+    _p.constructor = Diagram;
+
+    Diagram.defaultOptions = {
+        glyphClass: 'diagram__glyph'
+      , ylineClass: 'diagram__yline'
+      , boxClass: 'diagram__box'
+      , layoutClass: 'diagram__layout'
+      , textClass: 'diagram__text'
+    };
+
+    var instructions = {
+        xHeight: ['box',
+            [
+                ['layout', [
+                        ['glyph', 'x', {style: 'highlighted'}]
+                      , ['glyph', 'X', {style: 'normal'}]
+                    ]
+                  , {spacing: 40}
+                ]
+              , ['yline', 'baseLine', {style: 'normal', insert: 0}]// 0 = insert as first element, -1 = insert as last element
+              , ['yline', 'xHeight', {style: 'highlighted', insert: 0}]
+            ]
+          , {
+                minLeftSideBearing: 50
+              , minRightSideBearing: 50
+            }
+        ]
+      , stylisticSets: ['layout',
+            [
+                ['box', [
+                        ['glyph', 'G.ss04', {style: 'highlighted'}]
+                      , ['glyph',  'G', {style: 'muted'}]
+                    ]
+                  , {align: 'left'}
+                ]
+              , ['box', [
+                        ['glyph', 'g.ss01', {style: 'highlighted'}]
+                      , ['glyph',  'g', {style: 'muted'}]
+                    ]
+                  , {align: 'right'}
+                ]
+              , ['box', [
+                        ['glyph', 'R.ss03', {style: 'highlighted'}]
+                      , ['glyph',  'R', {style: 'muted'}]
+                    ]
+                  , {align: 'left'}
+                ]
+              , ['box', [
+                        ['glyph', 'l.ss02', {style: 'highlighted'}]
+                      , ['glyph',  'l', {style: 'muted'}]
+                    ]
+                  , {align: 'left'}
+                ]
+            ]
+        ]
+      , basicLines: function() {
+            /* jshint validthis:true */
+            var text = this._container.hasAttribute('data-text-content')
+                ?  this._container.getAttribute('data-text-content')
+                : 'Hamburger'
+                ;
+            return ['box',
+                [
+                    ['text', text, {align: 'center', style: 'normal'}]
+                  , ['yline', 'baseLine', {style: 'normal', insert: 0}]// 0 = insert as first element, -1 = insert as last element
+                  , ['yline', 'xHeight', {style: 'normal', insert: 0}]
+                  , ['yline', 'capHeight', {style: 'normal', insert: 0}]
+                  , ['yline', 'descender', {style: 'normal', insert: 0}]
+                ]
+              , {
+                    minLeftSideBearing: 350
+                  , minRightSideBearing: 350
+                }
+            ];
+        }
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        var instructionsKey = this._container.getAttribute('data-diagram-name')
+          , instructionSet = instructions[instructionsKey]
+          , result
+          , optionKeys = {
+                ascent: 'data-diagram-ascent'
+               , descent: 'data-diagram-descent'
+               , height: 'data-diagram-height'
+            }
+          , k
+          , options = Object.create(null)
+          , renderer
+          ;
+        if(this._svg)
+            this._container.removeChild(this._svg);
+
+        if(typeof instructionSet === 'function')
+            instructionSet = instructionSet.call(this);
+        if(!instructionSet)
+            return;
+
+        renderer = new DiagramRenderer(
+              this._container.ownerDocument
+            , this._fontsData
+            , this._webFontProvider
+            , this._options
+        );
+
+        for(k in optionKeys)
+            if(this._container.hasAttribute(optionKeys[k]))
+                options[k] = parseFloat(this._container.getAttribute(optionKeys[k]));
+        result = renderer.render(instructionSet, fontIndex, options);
+        this._svg = result.element;
+        this._container.appendChild(this._svg);
+        result.onHasDocument();
+    };
+
+    return Diagram;
+});
+
+define('specimenTools/widgets/CurrencySymbols',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+    /*jshint esnext:true*/
+
+    /**
+     * Fill container with sample texts that display all currency
+     * symbols available in the font.
+     *
+     * The sample texts for each currency are taken from
+     *      1. 2he dictionary `options.symbolTexts` if `(int) charcode` is
+     *         a key in it.
+     *      2. The 3rd item in the symbols entry in the `options.symbols`
+     *         array, if present (should be authored by upstream to ptovide
+     *         reasonable defaults).
+     *      3. `options.fallbackSymbolText`
+     *
+     * In a sample text, the "$" char will be replaced by the element containing
+     * the symbol.
+     *
+     * Each symbol sample will be in a span with the class `sampleClass`.
+     * Within a sample element spans with `symbolClass` will contain the
+     * symbol character and spans with `textClass` will contain the
+     * rest of the sample text.
+     */
+    function CurrencySymbols(container, pubSub, fontData, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontData;
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+    }
+
+    var _p = CurrencySymbols.prototype = Object.create(Parent.prototype);
+    _p.constructor = CurrencySymbols;
+
+    CurrencySymbols.defaultOptions = {
+        symbols: [
+                    [0x0024, 'DOLLAR SIGN', '$18.9']
+                  , [0x00A2, 'CENT SIGN', '$99']
+                  , [0x00A3, 'POUND SIGN' , '$68']
+                  , [0x00A4, 'CURRENCY SIGN', '1$']
+                  , [0x00A5, 'YEN SIGN', '$998,000.15']
+                  , [0x058F, 'ARMENIAN DRAM SIGN']
+                  , [0x060B, 'AFGHANI SIGN']
+                  , [0x09F2, 'BENGALI RUPEE MARK']
+                  , [0x09F3, 'BENGALI RUPEE SIGN']
+                  , [0x09FB, 'BENGALI GANDA MARK']
+                  , [0x0AF1, 'GUJARATI RUPEE SIGN']
+                  , [0x0BF9, 'TAMIL RUPEE SIGN']
+                  , [0x0E3F, 'THAI CURRENCY SYMBOL BAHT']
+                  , [0x17DB, 'KHMER CURRENCY SYMBOL RIEL']
+                  , [0x20A0, 'EURO-CURRENCY SIGN']
+                  , [0x20A1, 'COLON SIGN']
+                  , [0x20A2, 'CRUZEIRO SIGN']
+                  , [0x20A3, 'FRENCH FRANC SIGN']
+                  , [0x20A4, 'LIRA SIGN']
+                  , [0x20A5, 'MILL SIGN']
+                  , [0x20A6, 'NAIRA SIGN']
+                  , [0x20A7, 'PESETA SIGN']
+                  , [0x20A8, 'RUPEE SIGN']
+                  , [0x20A9, 'WON SIGN']
+                  , [0x20AA, 'NEW SHEQEL SIGN']
+                  , [0x20AB, 'DONG SIGN']
+                  , [0x20AC, 'EURO SIGN', '$75']
+                  , [0x20AD, 'KIP SIGN']
+                  , [0x20AE, 'TUGRIK SIGN']
+                  , [0x20AF, 'DRACHMA SIGN']
+                  , [0x20B0, 'GERMAN PENNY SIGN']
+                  , [0x20B1, 'PESO SIGN']
+                  , [0x20B2, 'GUARANI SIGN']
+                  , [0x20B3, 'AUSTRAL SIGN']
+                  , [0x20B4, 'HRYVNIA SIGN']
+                  , [0x20B5, 'CEDI SIGN']
+                  , [0x20B6, 'LIVRE TOURNOIS SIGN']
+                  , [0x20B7, 'SPESMILO SIGN']
+                  , [0x20B8, 'TENGE SIGN']
+                  , [0x20B9, 'INDIAN RUPEE SIGN']
+                  , [0x20BA, 'TURKISH LIRA SIGN']
+                  , [0x20BB, 'NORDIC MARK SIGN']
+                  , [0x20BC, 'MANAT SIGN']
+                  , [0x20BD, 'RUBLE SIGN']
+                  , [0x20BE, 'LARI SIGN']
+                  , [0xA838, 'NORTH INDIC RUPEE MARK']
+                  , [0xFDFC, 'RIAL SIGN']
+                  , [0xFE69, 'SMALL DOLLAR SIGN']
+                  , [0xFF04, 'FULLWIDTH DOLLAR SIGN']
+                  , [0xFFE0, 'FULLWIDTH CENT SIGN']
+                  , [0xFFE1, 'FULLWIDTH POUND SIGN']
+                  , [0xFFE5, 'FULLWIDTH YEN SIGN']
+                  , [0xFFE6, 'FULLWIDTH WON SIGN']
+                    // not in the currency symbol
+                    // LATIN SMALL LETTER F WITH HOOK
+                    // alternative name is FLORIN SIGN
+                  , [0x00192, 'FLORIN SIGN', '$32']
+        ]
+      , symbolTexts: {}
+      , sampleClass: 'currency-symbols__sample'
+      , symbolClass: 'currency-symbols__sample-symbol'
+      , textClass: 'currency-symbols__sample-text'
+      , fallbackSymbolText: '$13.99'
+    };
+
+    _p._makeSample = function(charcode, char, options) {
+        var name = options[1]
+          , sample = this._container.ownerDocument.createElement('span')
+          , sampleText = charcode in this._options.symbolTexts
+                    ?  this._options.symbolTexts[charcode]
+                    : (options[2] || this._options.fallbackSymbolText)
+          , i, l, last, text, symbol
+          ;
+        sampleText = sampleText.split('$');
+        sample.setAttribute('title', [name, ' (u', charcode.toString('16')
+                                                        , ')'].join(''));
+        this._applyClasses(sample, this._options.sampleClass);
+
+        l=sampleText.length;
+        last = l-1;
+        for(i=0;i<l;i++) {
+            if(sampleText[i] !== '') {
+                // if it were an empty string, it would be a placeholder
+                // for the symbol at the beginning or end of the string
+                // or for multiple occurrences next to each other in the
+                // middle.
+                text = this._container.ownerDocument.createElement('span');
+                text.textContent = sampleText[i];
+                this._applyClasses(text, this._options.textClass);
+                sample.appendChild(text);
+            }
+
+            if(i >= last)
+                continue;
+            // Put a symbol between all text pieces.
+            symbol = this._container.ownerDocument.createElement('span');
+            symbol.textContent = char;
+            this._applyClasses(symbol, this._options.symbolClass);
+            sample.appendChild(symbol);
+        }
+        return sample;
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        var i, l, options, charcode, char, sample
+          , font = this._fontsData.getFont(fontIndex)
+          ;
+        // empty this._container
+        while(this._container.childNodes.length)
+            this._container.removeChild(this._container.lastChild);
+
+        for(i=0,l=this._options.symbols.length;i<l;i++) {
+            options = this._options.symbols[i];
+            charcode = options[0];
+            char = String.fromCodePoint(charcode);
+
+            if(!font.charToGlyphIndex(char))// 0 or null
+                // the symbol is not in the font
+                continue;
+
+            sample = this._makeSample(charcode, char, options);
+            this._container.appendChild(sample);
+            this._container.appendChild(
+                        this._container.ownerDocument.createTextNode(' '));
+        }
+    };
+
+    return CurrencySymbols;
+});
+
+define('specimenTools/widgets/FontLister',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+
+    /**
+     * Very basic <select> interface to switch between all loaded fonts.
+     * See FamilyChooser for a more advanced interface.
+     */
+
+    function FontLister(container, pubSub, fontData, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontData;
+
+        this._elements = [];
+        this._selectContainer = this._container.ownerDocument.createElement('select');
+        this._selectContainer.addEventListener('change', this._selectFont.bind(this));
+        this._selectContainer.enabled = false;
+        this._container.appendChild(this._selectContainer);
+
+        this._pubSub.subscribe('allFontsLoaded', this._onAllFontsLoaded.bind(this));
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+    }
+    var _p = FontLister.prototype = Object.create(Parent.prototype);
+    _p.constructor = FontLister;
+
+    FontLister.defaultOptions = {
+        order: 'load' // OR: 'family'
+    };
+
+    _p._onActivateFont = function (fontIndex) {
+        var i,l
+          , options = this._selectContainer.children
+          , option
+          ;
+        for(i=0,l=options.length;i<l;i++) {
+            option = options[i];
+            option.selected = option.value == fontIndex;
+        }
+    };
+
+    _p._onAllFontsLoaded = function() {
+        var fonts
+          , i, l, option, fontIndex
+          ;
+
+        switch(this._options.order){
+            case 'family':
+                fonts = this._fontsData.getFontIndexesInFamilyOrder();
+            case 'load':
+                /* falls through */
+            default:
+                fonts = this._fontsData.getFontIndexes();
+        }
+
+        for(i=0,l=fonts.length;i<l;i++) {
+            fontIndex = fonts[i];
+            option = this._selectContainer.ownerDocument.createElement('option');
+            option.textContent = [
+                        this._fontsData.getFamilyName(fontIndex)
+                      , this._fontsData.getStyleName(fontIndex)
+                      ].join(' ');
+
+            option.value = fontIndex;
+            this._elements.push(option);
+            this._selectContainer.appendChild(option);
+        }
+        this._selectContainer.enabled = true;
+    };
+
+    _p._selectFont = function(event) {
+        this._pubSub.publish('activateFont', event.target.value);
+    };
+
+    return FontLister;
+});
+
+define('specimenTools/widgets/DragScroll',[
+    'specimenTools/_BaseWidget'
+], function(
+    Parent
+) {
+    "use strict";
+
+    function DragScroll(container, pubSub, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+
+        this._container.addEventListener('mousedown', this._initDrag.bind(this));
+        this._container.addEventListener('touchstart', this._initDrag.bind(this));
+
+        this.__endDrag = this._endDrag.bind(this);
+        this.__performMove = this._performMove.bind(this);
+        this.__move = this._move.bind(this);
+        this._startPos = null;
+        this._lastPos = null;
+        this._requestID = null;
+    }
+
+    var _p = DragScroll.prototype = Object.create(Parent.prototype);
+    _p.constructor = DragScroll;
+
+    DragScroll.defaultOptions = {
+    };
+
+    _p._initDrag = function(event) {
+        if('touches' in event)
+            event = event.touches[0];
+        this._startPos = {x: event.screenX, y:event.screenY};
+        this._container.ownerDocument.addEventListener('mouseup', this.__endDrag);
+        this._container.ownerDocument.addEventListener('touchend', this.__endDrag);
+        this._container.ownerDocument.addEventListener('mousemove', this.__move);
+        this._container.ownerDocument.addEventListener('touchmove', this.__move);
+    };
+
+    _p._endDrag =function() {
+        this._container.ownerDocument.removeEventListener('mouseup', this.__endDrag);
+        this._container.ownerDocument.removeEventListener('touchend', this.__endDrag);
+        this._container.ownerDocument.removeEventListener('mousemove', this.__move);
+        this._container.ownerDocument.removeEventListener('touchmove', this.__move);
+        this._startPos = null;
+        this._lastPos = null;
+        if(this._requestID !== null) {
+            window.cancelAnimationFrame(this._requestID);
+            this._requestID = null;
+        }
+    };
+
+    _p._performMove = function() {
+        this._container.scrollLeft = this._container.scrollLeft + this._startPos.x - this._lastPos.x;
+        this._container.scrollTop =  this._container.scrollTop + this._startPos.y - this._lastPos.y;
+        this._requestID = null;
+    }
+
+    _p._move = function(event) {
+        if('touches' in event)
+            event = event.touches[0];
+        if(this._lastPos !== null)
+            this._startPos = this._lastPos;
+        this._lastPos = {x: event.screenX, y:event.screenY};
+        // throttle
+        if(this._requestID === null)
+            this._requestID = window.requestAnimationFrame(this.__performMove);
+    };
+
+    return DragScroll;
+});
+
+define('specimenTools/widgets/CharSetInfo',[
+    'specimenTools/_BaseWidget'
+  , 'specimenTools/services/dom-tool'
+], function(
+    Parent
+  , domTool
+) {
+    "use strict";
+
+    /* jshint esnext:true*/
+
+    function CharSetInfo(container, pubSub, fontsData, webFontProvider, options) {
+        Parent.call(this, options);
+        this._container = container;
+        this._pubSub = pubSub;
+        this._fontsData = fontsData;
+        this._webFontProvider = webFontProvider;
+        this._pubSub.subscribe('activateFont', this._onActivateFont.bind(this));
+
+        this._bluePrintNodes = this._getBluePrintNodes(
+                                this._options.bluePrintNodeClass, true);
+
+        this._createdElements = null;
+    }
+    var _p = CharSetInfo.prototype = Object.create(Parent.prototype);
+    _p.constructor = CharSetInfo;
+
+    CharSetInfo.defaultOptions = {
+        isLax: false
+      , bluePrintNodeClass: 'charset-info__item-blueprint'
+      , itemContentContainerClass: 'charset-info__item-content-container'
+      , itemClass: 'charset-info__item'
+      , itemCharsetNameClass: 'charset-info__item__charset-name'
+      , itemLanguageClass: 'charset-info__item__language'
+      , itemIncludedCharsetClass: 'charset-info__item__included-charset'
+      , itemSampleCharClass: 'charset-info__item__sample-char'
+    };
+
+
+    _p._getBluePrintNodes = function(className) {
+        var nodes = this._container.getElementsByClassName(className)
+          , i, l, node
+          , result = []
+          ;
+
+        if(nodes.length) {
+            for(i=0,l=nodes.length;i<l;i++) {
+                // I expect the blueprint class to be "display: none"
+                node = nodes[i].cloneNode(true);
+                node.style.display = null;
+                this._applyClasses(node, className, true);
+                result.push([nodes[i], node]);
+            }
+        }
+        return result;
+    };
+
+    _p._renderCharSetInfo = function(fontIndex, bluePrintNode, charSetInfo
+                                                                , isLax) {
+        /*jshint unused:vars*/
+        var element = bluePrintNode.cloneNode(true);
+
+        // once per found item
+        domTool.mapToClass(element, this._options.itemCharsetNameClass
+                                                    , function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            item.textContent = charSetInfo.name;
+        }, this, false);
+
+        // repeated for each included charset per found item
+        domTool.mapToClass(element, this._options.itemIncludedCharsetClass
+                                                    , function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            // no need for deep cloning, we'll set newNode.textContent
+            var j, l, newNode;
+            for(j=0,l=charSetInfo.includedCharSets.length;j<l;j++) {
+                newNode = item.cloneNode(false);
+                newNode.style.display = null;
+                newNode.textContent = charSetInfo.includedCharSets[j];
+                item.parentNode.insertBefore(newNode, item);
+            }
+            item.parentNode.removeChild(item);
+        }, this, false);
+
+        // repeated for each language per found item
+        domTool.mapToClass(element, this._options.itemLanguageClass
+                                                    , function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            // no need for deep cloning, we'll set newNode.textContent
+            var filter2key = {
+                    'own-languages': 'ownLanguages'
+                  , 'inherited-languages': 'inheritedLanguages'
+                  , 'all-languages': 'allLanguages'
+                }
+              , filter, langsKey, j, l, newNode, languages
+              ;
+            filter = item.getAttribute('data-filter');
+            filter = filter in filter2key ? filter : 'all-languages';
+            langsKey =  filter2key[filter];
+            languages = charSetInfo[langsKey];
+
+            for(j=0,l=languages.length;j<l;j++) {
+                newNode = item.cloneNode(false);
+                newNode.style.display = null;
+                newNode.textContent = languages[j];
+                item.parentNode.insertBefore(newNode, item);
+            }
+            item.parentNode.removeChild(item);
+        }, this, false);
+
+        // repeated for each sample char per found item
+        domTool.mapToClass(element, this._options.itemSampleCharClass
+                                                    , function(item, i) {
+            /*jshint unused:vars, validthis:true*/
+            // no need for deep cloning, we'll set newNode.textContent
+            var j, l, newNode
+              , laxSkipped = charSetInfo.laxSkipped.length
+                            ? new Set(charSetInfo.laxSkipped)
+                            : null
+              ;
+            for(j=0,l=charSetInfo.charset.length;j<l;j++) {
+                // In lax mode, we must skip chars that are not in the
+                // font to prevent tofu or printer's pie here.
+                if(laxSkipped && laxSkipped.has(charSetInfo.charset.codePointAt(j)))
+                    continue;
+                newNode = item.cloneNode(false);
+                newNode.style.display = null;
+                newNode.textContent = charSetInfo.charset[j];
+                this._webFontProvider.setStyleOfElement(fontIndex, newNode);
+                item.parentNode.insertBefore(newNode, item);
+            }
+            item.parentNode.removeChild(item);
+        }, this, false);
+
+        return element;
+    };
+
+
+    _p._renderToBlueprintNode = function(fontIndex, insertionMarker
+                                        , bluePrintNode, data, isLax) {
+        var created = []
+          , element
+          , i, l
+          ;
+
+        for(i=0,l=data.length;i<l;i++) {
+            element = this._renderCharSetInfo(fontIndex, bluePrintNode, data[i], isLax);
+            // insert at blueprint node position
+            insertionMarker.parentNode.insertBefore(element
+                                                    , insertionMarker);
+            created.push(element);
+        }
+        return created;
+    };
+
+    _p._render = function (fontIndex, data, isLax) {
+        var i, l, insertionMarker, bluePrintNode
+          , result
+          , created = []
+          ;
+        for(i=0,l=this._bluePrintNodes.length;i<l;i++) {
+            insertionMarker = this._bluePrintNodes[i][0];
+            bluePrintNode = this._bluePrintNodes[i][1];
+            result = this._renderToBlueprintNode(fontIndex, insertionMarker
+                                            , bluePrintNode, data, isLax);
+            Array.prototype.push.apply(created, result);
+        }
+        return created;
+    };
+
+    _p._onActivateFont = function(fontIndex) {
+        var isLax, func, data, i, l;
+        if(this._createdElements !== null) {
+            for(i=0,l=this._createdElements.length;i<l;i++)
+                this._createdElements[i].parentNode
+                                .removeChild(this._createdElements[i]);
+            this._createdElements = null;
+        }
+        isLax = this._options.isLax
+                    || this._container.hasAttribute('data-coverage-lax');
+        if(this._container.hasAttribute('data-charset-full'))
+            func = 'getFullCharSetsInfo'
+        else
+            func = isLax
+                ? 'getCharSetsInfoLax'
+                : 'getCharSetsInfoStrict'
+                ;
+        data = this._fontsData[func](fontIndex);
+        this._createdElements = this._render(fontIndex, data, isLax);
+    };
+
+    return CharSetInfo;
+});
+
+define('main',[
+    'specimenTools/loadFonts'
+  , 'specimenTools/initDocumentWidgets'
+  , 'specimenTools/services/PubSub'
+  , 'specimenTools/services/FontsData'
+  , '!require/text!specimenTools/services/languageCharSets.json'
+  , '!require/text!specimenTools/services/googleFontsCharSets.json'
+  , 'specimenTools/services/WebfontProvider'
+  , 'specimenTools/widgets/GlyphTables'
+  , 'specimenTools/widgets/FamilyChooser'
+  , 'specimenTools/widgets/GenericFontData'
+  , 'specimenTools/widgets/CurrentWebFont'
+  , 'specimenTools/widgets/TypeTester'
+  , 'specimenTools/widgets/FeatureDisplay'
+  , 'specimenTools/widgets/FilesDrop'
+  , 'specimenTools/widgets/LoadProgressIndicator'
+  , 'specimenTools/widgets/PerFont'
+  , 'specimenTools/widgets/Diagram'
+  , 'specimenTools/widgets/CurrencySymbols'
+  , 'specimenTools/widgets/FontLister'
+  , 'specimenTools/widgets/DragScroll'
+  , 'specimenTools/widgets/CharSetInfo'
+], function(
+    loadFonts
+  , initDocumentWidgets
+  , PubSub
+  , FontsData
+  , languageCharSetsJson
+  , googleFontsCharSetsJson
+  , WebFontProvider
+  , GlyphTables
+  , FamilyChooser
+  , GenericFontData
+  , CurrentWebFont
+  , TypeTester
+  , FeatureDisplay
+  , FilesDrop
+  , LoadProgressIndicator
+  , PerFont
+  , Diagram
+  , CurrencySymbols
+  , FontLister
+  , DragScroll
+  , CharSetInfo
+) {
+    "use strict";
+    /*globals window */
+    function main() {
+        var fontSpecimenConfig = window.fontSpecimenConfig
+          , componentHandler = window.componentHandler
+          // TODO: assert fontSpecimenConfig and componentHandler are there
+          , options = {
+                glyphTables: {
+                    glyphTable: {
+                        glyphClass: 'mdlfs-glyph-table__glyph'
+                      , glyphActiveClass: 'mdlfs-glyph-table__glyph_active'
+                    }
+                }
+              , familyChooser: {
+                    italicSwitchContainerClasses: ['mdl-switch', 'mdl-js-switch', 'mdl-js-ripple-effect', 'mdlfs-family-switcher__italic-switch']
+                  , italicSwitchCheckboxClasses: ['mdl-switch__input']
+                  , italicSwitchLabelClasses: ['mdl-switch__label']
+                  , setItalicSwitch: function setItalicSwitch(italicSwitch, enabled, checked) {
+                        var fallback;
+                        if(!italicSwitch.container.MaterialSwitch) {
+                            fallback = this.constructor.defaultOptions.setItalicSwitch;
+                            fallback.call(this, italicSwitch, enabled, checked);
+                            return;
+                        }
+                        italicSwitch.container.MaterialSwitch[enabled ? 'enable' : 'disable']();
+                        italicSwitch.container.MaterialSwitch[checked ? 'on' : 'off']();
+                    }
+                  , weightButtonClasses: 'mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-family-switcher__button'
+                  , weightButtonActiveClass: 'mdl-button--colored'
+                }
+              , typeTester: {
+                      slider_default_min: 10
+                    , slider_default_max: 128
+                    , slider_default_value: 32
+                    , slider_default_step: 1
+                    , slider_default_unit: 'px'
+                    , slider_default_class: 'mdl-slider mdl-js-slider'
+                    , sliderControlsClass: 'mdlfs-type-tester__slider'
+                    , labelControlsClass: 'mdlfs-type-tester__label'
+                    , optionalFeaturesControlsClass: 'mdlfs-type-tester__features--optional'
+                    , defaultFeaturesControlsClass: 'mdlfs-type-tester__features--default'
+                    , contentContainerClass: 'mdlfs-type-tester__content'
+                    , setCssValueToInput: function(input, value) {
+                            if('MaterialSlider' in input)
+                                input.MaterialSlider.change(value);
+                            else
+                                input.value = value;
+                      }
+                     , optionalFeatureButtonClasses:  'mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-type-tester__feature-button'
+                     , defaultFeatureButtonClasses: 'mdl-button mdl-js-button mdl-js-ripple-effect mdl-button--raised mdlfs-type-tester__feature-button'
+                     , featureButtonActiveClass: 'mdl-button--colored'
+                     , activateFeatureControls: function(elements) {
+                        componentHandler.upgradeElements(elements);
+                    }
+
+                }
+              , fontData: {}
+              , featureDisplay: {
+                    itemTagClassPrefix: 'mdlfs-feature-display__item-tag_'
+                  , bluePrintNodeClass: 'mdlfs-feature-display__item-blueprint'
+                  , itemBeforeClass: 'mdlfs-feature-display__item__before'
+                  , itemChangeIndicatorClass: 'mdlfs-feature-display__item__change-indicator'
+                  , itemContentContainerClass: 'mdlfs-feature-display__item-content-container'
+                   // used to be: itemAfterClass: 'mdlfs-feature-display__item__after'
+                  , itemAppliedClass: 'mdlfs-feature-display__item__applied'
+                  , itemTagNameClass: 'mdlfs-feature-display__item__tag-name'
+                  , itemFriendlyNameClass: 'mdlfs-feature-display__item__friendly-name'
+                  , highlightClasses: 'mdlfs-feature-display__item_highlight'
+                  , tabularClasses: 'mdlfs-feature-display__item_tabular'
+                  , itemContentTextClass: 'mdlfs-feature-display__item__content-text'
+                  , itemContentStackedClass: 'mdlfs-feature-display__item__content-stacked'
+                  , itemContentStackedElementClassPrefix: 'mdlfs-feature-display__content-stacked__'
+                    // an array or null
+                  , feaureItemsSetup: [
+                        {
+                            friendlyName: 'Stylistic Alternates'
+                          , weight: '-10'
+                          , removeClasses: ['mdl-cell--4-col', 'mdl-cell--order-3', 'mdl-cell--4-col-tablet']
+                          , addClasses: ['mdl-cell--6-col', 'mdl-cell--order-1', 'mdl-cell--12-col-tablet']
+                          , contents: [
+                                {
+                                    type: 'stacked'
+                                  , features: ['ss01', 'ss02', 'ss03', 'ss04']
+                                  , content: ['G', 'g', 'R'
+                                              , 'outline! l:l.ss02, align:left'
+                                              // This is not very well fit for the widget I think.
+                                              // , 'outline! IJ:IJ.ss05, align:left'
+                                              ]
+                                  , behavior: 'mixed'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.99'
+                          , contents: [
+                                {
+                                    type: 'text'
+                                  , features: 'smcp'
+                                  , content: 'F*ashion* W*eek*'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.98'
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'tnum'
+                                , behavior: 'tabular'
+                                , content: '35.92604187'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.97'
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'swsh'
+                                , content: '*A*f*t*e*r* *M*us*ty*'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.96'
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'pnum'
+                                , content: '35.92604187'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.96'
+                          , addClasses: 'mdlfs-feature-display__item__content_inline'
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'titl'
+                                , behavior: 'show-before'
+                                , content: '*Ä*'
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'titl'
+                                , behavior: 'show-before'
+                                , content: '*Ö*'
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'titl'
+                                , behavior: 'show-before'
+                                , content: '*Ü*'
+                                }
+                            ]
+                        }
+                      , {
+                            weight: '-9.95'
+                          , addClasses: [
+                                  'mdlfs-feature-display__item__content_inline'
+                              , 'mdlfs-feature-display__item__content_inline-no-gap'
+                            ]
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'sups'
+                                , content: 'H*2*O '
+                                , featuresOnHighlights: true
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'subs'
+                                , content: '(Z*9*'
+                                , featuresOnHighlights: true
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'sups'
+                                , content: 'X*6*'
+                                , featuresOnHighlights: true
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'subs'
+                                , content: 'W*3*)'
+                                , featuresOnHighlights: true
+                                }
+                            ]
+                        }
+                        , {
+                            weight: '-9.94'
+                          , addClasses: 'mdlfs-feature-display__item__content_inline'
+                          , contents: [
+                                {
+                                  type: 'text'
+                                , features: 'frac'
+                                , behavior: 'show-before'
+                                , content: '*1/2*'
+                                }
+                              , {
+                                  type: 'text'
+                                , features: 'frac'
+                                , behavior: 'show-before'
+                                , content: '*4/5*'
+                                }
+                            ]
+                        }
+                      , {
+                          contents: [
+                                {
+                                  type: 'text'
+                                , features: 'ordn'
+                                , behavior: 'show-before'
+                                , content: '*1a* vez; *5o* ano'
+                                }
+                            ]
+                        }
+                    ]
+                    // "complement" (default): use default feature items if
+                    //        no item for a feature is in feaureItemsSetup
+                    // true/truish: use all default feature items
+                    // false/falsy: don't use any default feature items
+                    // Todo: could also be a list of feature-tags for which default
+                    // items should be added, if available
+                    //, useDefaultFeatureItems: 'complement'
+                }
+              , loadProgressIndicator: {
+                    loadedClass: 'mdlfs-load-progress_loaded'
+                  , loadingClass: 'mdlfs-load-progress_loading'
+                  , progressBarClass: 'mdlfs-load-progress__progress-bar'
+                  , setProgressBar: function(element, percent) {
+                        if(element.MaterialProgress)
+                        element.MaterialProgress.setProgress(percent);
+                    }
+                  , percentIndicatorClass: 'mdlfs-load-progress__percent'
+                  , taskIndicatorClass: 'mdlfs-load-progress__task'
+                }
+              , perFont: {
+                    itemClass: 'mdlfs-per-font__item'
+                  , bluePrintNodeClass: 'mdlfs-per-font__item-blueprint'
+                  , fontDataClass:  'mdlfs-per-font__data'
+                  , currentFontClass:  'mdlfs-per-font__current-font'
+                }
+              , diagram: {
+                    glyphClass: 'mdlfs-diagram__glyph'
+                  , ylineClass: 'mdlfs-diagram__yline'
+                  , boxClass: 'mdlfs-diagram__box'
+                  , layoutClass: 'mdlfs-diagram__layout'
+                  , textClass: 'mdlfs-diagram__text'
+                }
+              , currencySymbols: {
+                     sampleClass: 'mdlfs-currency-symbols__sample'
+                   , symbolClass: 'mdlfs-currency-symbols__sample-symbol'
+                   , textClass: 'mdlfs-currency-symbols__sample-text'
+                }
+              , fontLister: {
+
+                }
+              , charsetInfo: {
+                     bluePrintNodeClass: 'mdlfs-charset-info__item-blueprint'
+                   , itemContentContainerClass: 'mdlfs-charset-info__item-content-container'
+                   , itemClass: 'mdlfs-charset-info__item'
+                   , itemCharsetNameClass: 'mdlfs-charset-info__item__charset-name'
+                   , itemLanguageClass: 'mdlfs-charset-info__item__language'
+                   , itemIncludedCharsetClass: 'mdlfs-charset-info__item__included-charset'
+                   , itemSampleCharClass: 'mdlfs-charset-info__item__sample-char'
+                }
+            }
+          , pubsub = new PubSub()
+          , factories, containers
+          , fontsData = new FontsData(pubsub, {
+                  useLaxDetection: true
+                , languageCharSets: JSON.parse(languageCharSetsJson)
+                , charSets: JSON.parse(googleFontsCharSetsJson)
+                })
+          , webFontProvider = new WebFontProvider(window, pubsub, fontsData)
+          ;
+
+        //if(fontSpecimenConfig.widgetOptions)
+        //    var result = {};
+        //    for(k in fontSpecimenConfig.widgetOptions)
+        //        if(!(k in options))
+        //            options[k] =
+        //
+
+        factories = [
+            ['mdlfs-family-switcher', FamilyChooser, fontsData, options.familyChooser]
+          , ['mdlfs-glyph-table', GlyphTables, options.glyphTables]
+          , ['mdlfs-font-data', GenericFontData, fontsData,  options.fontData]
+          , ['mdlfs-current-font', CurrentWebFont, webFontProvider]
+          , ['mdlfs-type-tester', TypeTester, fontsData, options.typeTester]
+          , ['mdlfs-feature-display', FeatureDisplay, fontsData, webFontProvider, options.featureDisplay]
+          , ['mdlfs-fonts-drop', FilesDrop, loadFonts.fromFileInput]
+          , ['mdlfs-load-progress', LoadProgressIndicator, options.loadProgressIndicator]
+          , ['mdlfs-per-font', PerFont, fontsData, webFontProvider, options.perFont]
+          , ['mdlfs-diagram', Diagram, fontsData, webFontProvider, options.diagram]
+          , ['mdlfs-currency-symbols', CurrencySymbols, fontsData, options.currencySymbols]
+          , ['mdlfs-font-select', FontLister, fontsData, options.fontLister]
+          , ['mdlfs-drag-scroll', DragScroll]
+          , ['mdlfs-charset-info', CharSetInfo, fontsData, webFontProvider, options.charsetInfo]
+        ];
+
+        containers = initDocumentWidgets(window.document, factories, pubsub);
+        pubsub.subscribe('allFontsLoaded', function() {
+            // Init newly built MDL elements
+            // componentHandler from material design lit is expected to be loaded
+            // by now, though, there's no guarantee for this!
+            // maybe mdl has an AMD interface? or at least a callback when
+            // it is loaded.
+            componentHandler.upgradeElements(containers);
+            pubsub.publish('activateFont', 0);
+        });
+
+        if(fontSpecimenConfig.fontFiles)
+            loadFonts.fromUrl(pubsub, fontSpecimenConfig.fontFiles);
+        else if(fontSpecimenConfig.loadFromFileInput) {
+            // pass, the document should have a FilesDrop widget or similar
+        }
+    }
+
+    return main;
+});
+
+define('init',["main"], function(main) {main();});
+
+require(["init"]);

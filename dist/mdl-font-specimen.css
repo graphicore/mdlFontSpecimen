@@ -294,6 +294,39 @@ html * {
 
 }
 
+
+.mdlfs-charset-info__data-container {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.mdlfs-charset-info__item__sample-char {
+    display: inline-block;
+    font-size: 2em;
+    line-height: 1.1em;
+    padding: 0 0 .7em 0;
+    margin: 0;
+}
+
+.mdlfs-charset-info__item__included-charset,
+.mdlfs-charset-info__item__language {
+    display: inline;
+
+}
+
+.mdlfs-charset-info__item__included-charset::after,
+.mdlfs-charset-info__item__language::after{
+    content: ", ";
+}
+
+.mdlfs-charset-info__item__included-charset:last-child::after,
+.mdlfs-charset-info__item__language:last-child::after{
+    content: "";
+}
+
+
+
 /* some grid overrides, but kept minimal, only for classes used by us */
 @media (min-width: 840px) and (max-width: 1024px) {
   .mdl-cell--4-col,
