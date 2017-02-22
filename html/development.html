@@ -30,6 +30,22 @@
         , '../html/assets/worksans/WorkSans-ExtraLight.ttf'
         , '../html/assets/worksans/WorkSans-Medium.ttf'
         , '../html/assets/worksans/WorkSans-Thin.ttf'
+
+        //  '../html/assets/muli/Muli-Regular.ttf'
+        //, '../html/assets/muli/Muli-Black.ttf'
+        //, '../html/assets/muli/Muli-BlackItalic.ttf'
+        //, '../html/assets/muli/Muli-Bold.ttf'
+        //, '../html/assets/muli/Muli-BoldItalic.ttf'
+        //, '../html/assets/muli/Muli-ExtraBold.ttf'
+        //, '../html/assets/muli/Muli-ExtraBoldItalic.ttf'
+        //, '../html/assets/muli/Muli-ExtraLight.ttf'
+        //, '../html/assets/muli/Muli-ExtraLightItalic.ttf'
+        //, '../html/assets/muli/Muli-Italic.ttf'
+        //, '../html/assets/muli/Muli-Light.ttf'
+        //, '../html/assets/muli/Muli-LightItalic.ttf'
+        //, '../html/assets/muli/Muli-SemiBold.ttf'
+        //, '../html/assets/muli/Muli-SemiBoldItalic.ttf'
+
     ];
 
     require.config({baseUrl: '../lib'});
@@ -161,6 +177,45 @@
   </div>
 
 
+</div>
+
+<div class="mdl-grid mdlfs-charset-info" data-coverage-lax>
+    <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Char Sets</h2>
+    </div>
+    <div class="mdl-cell
+                mdl-cell--12-col
+                mdlfs-charset-info__item-blueprint
+                mdlfs-charset-info__item
+                mdlfs-charset-info__item-content-container
+              "
+        style="display:none">
+        <h4 class="mdlfs-charset-info__item__charset-name"></h4>
+        <div><em>Languages supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
+           <li class="mdlfs-charset-info__item__language"
+               data-filter="own-languages"
+               style="display:none"></li>
+        </ul></div>
+        <div><em>Languages supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+            data-filter="inherited-languages"
+            style="display:none"></li>
+        </ul></div>
+        <!--
+        <div><em>All supported languages:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+                style="display:none"></li>
+        </ul></div>
+        -->
+        <div><em>Charsets included by this charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__included-charset"
+                style="display:none"></li>
+        </ul></div>
+        <div><em>Charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__sample-char"
+                style="display:none"></li>
+        </ul></div>
+    </div>
 </div>
 
 <div class="mdl-grid mdlfs-per-font">

@@ -40,7 +40,15 @@
 <div class="mdlfs-main mdlfs-content">
 
   <div class="mdlfs-font-select"></div>
-    <p>
+
+  <p>
+    <em>FontInfo uses Lax coverage detection:</em>
+    <strong class="mdlfs-font-data"
+         data-getter="UseLaxDetection"></strong>
+  </p>
+
+
+  <p>
     <em>Size of Glyph-Set</em>
     <strong class="mdlfs-font-data"
          data-getter="NumberGlyphs"></strong>
@@ -53,16 +61,66 @@
   </p>
 
   <p>
-    <em>All (laxly) Supported Languages</em>
+    <em>All Supported Languages</em>
     <strong class="mdlfs-font-data"
          data-getter="SupportedLanguages"></strong>
   </p>
+
+  <p>
+    <em># Supported Languages via Char Sets</em>
+    <strong class="mdlfs-font-data"
+         data-getter="NumberSupportedLanguagesByCharSets"></strong> (laxly)
+  </p>
+
+  <p>
+    <em>Supported Languages via Char Sets</em>
+    <strong class="mdlfs-font-data"
+         data-getter="SupportedLanguagesByCharSets"></strong>
+  </p>
+
 
   <div class="mdlfs-language-info" data-coverage-lax>
     <h3>Lax CLDR</h3></div>
 
   <div class="mdlfs-language-info">
     <h3>Strict CLDR</h3></div>
+
+<div class="mdlfs-charset-info" data-charset-full>
+    <h3>Language support by all available Char Sets</h3>
+    <div class="mdlfs-charset-info__item-blueprint
+                mdlfs-charset-info__item
+                mdlfs-charset-info__item-content-container
+              "
+        style="display:none">
+        <h4 class="mdlfs-charset-info__item__charset-name"></h4>
+        <div><em>Languages supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
+           <li class="mdlfs-charset-info__item__language"
+               data-filter="own-languages"
+               style="display:none"></li>
+        </ul></div>
+        <div><em>Languages supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+            data-filter="inherited-languages"
+            style="display:none"></li>
+        </ul></div>
+        <!--
+        <div><em>All supported languages:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+                style="display:none"></li>
+        </ul></div>
+        -->
+        <div><em>Charsets included by this charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__included-charset"
+                style="display:none"></li>
+        </ul></div>
+        <!--
+        <div><em>Charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__sample-char"
+                style="display:none"></li>
+        </ul></div>
+        -->
+    </div>
+</div>
 
 </div>
 </body>
