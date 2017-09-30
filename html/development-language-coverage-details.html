@@ -92,7 +92,7 @@
   <div class="mdlfs-language-info">
     <h3>Strict CLDR</h3></div>
 
-<div class="mdlfs-charset-info" data-charset-full>
+<div class="mdlfs-charset-info" data-coverage-lax>
     <h3>Language support by all available Char Sets</h3>
     <div class="mdlfs-charset-info__item-blueprint
                 mdlfs-charset-info__item
@@ -100,11 +100,57 @@
               "
         style="display:none">
         <h4 class="mdlfs-charset-info__item__charset-name"></h4>
+
+
+        <div>
+            <p>
+            The font supports
+            <span class="mdlfs-charset-info__item__language"
+                  data-filter="#own-covered-languages"
+                  style="display:none">
+            </span>/<span
+             class="mdlfs-charset-info__item__language"
+                  data-filter="#own-languages"
+                  style="display:none"></span>
+            languages of the charset and a total of
+            <span class="mdlfs-charset-info__item__language"
+                  data-filter="#all-covered-languages"
+                  style="display:none"> by inheritance.
+            </span>
+
+            </p>
+
+            <p>
+            The font covers
+            <span class="mdlfs-charset-info__item__language"
+                  data-filter="#percent-charset-coverge"
+                  style="display:none"></span>
+            % glyphs of this charset.
+            </p>
+        </div>
+
+        <h4>Actually by the font supported languages of this charset</h4>
+
+        <div><em>Languages of this charset supported by the font:</em><ul class="mdlfs-charset-info__data-container">
+           <li class="mdlfs-charset-info__item__language"
+               data-filter="own-covered-languages"
+               style="display:none"></li>
+        </ul></div>
+
+        <div><em>Languages supported by inheritance by the font:</em><ul class="mdlfs-charset-info__data-container">
+           <li class="mdlfs-charset-info__item__language"
+               data-filter="inherited-covered-languages"
+               style="display:none"></li>
+        </ul></div>
+
+        <h4>Possible supported languages of this charset by a font</h4>
+
         <div><em>Languages supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
            <li class="mdlfs-charset-info__item__language"
                data-filter="own-languages"
                style="display:none"></li>
         </ul></div>
+
         <div><em>Languages supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
             <li class="mdlfs-charset-info__item__language"
             data-filter="inherited-languages"
@@ -128,6 +174,7 @@
         -->
     </div>
 </div>
+
 
 </div>
 </body>

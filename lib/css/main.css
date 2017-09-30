@@ -309,19 +309,19 @@ html * {
     margin: 0;
 }
 
-.mdlfs-charset-info__item__included-charset,
-.mdlfs-charset-info__item__language {
+li.mdlfs-charset-info__item__included-charset,
+li.mdlfs-charset-info__item__language {
     display: inline;
 
 }
 
-.mdlfs-charset-info__item__included-charset::after,
-.mdlfs-charset-info__item__language::after{
+li.mdlfs-charset-info__item__included-charset::after,
+li.mdlfs-charset-info__item__language::after{
     content: ", ";
 }
 
-.mdlfs-charset-info__item__included-charset:last-child::after,
-.mdlfs-charset-info__item__language:last-child::after{
+li.mdlfs-charset-info__item__included-charset:last-child::after,
+li.mdlfs-charset-info__item__language:last-child::after{
     content: "";
 }
 
