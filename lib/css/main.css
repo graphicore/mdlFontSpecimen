@@ -301,6 +301,11 @@ html * {
     list-style: none;
 }
 
+.mdlfs-charset-info__item {
+    padding: .5em;
+    margin-bottom: 3em;
+}
+
 .mdlfs-charset-info__item__sample-char {
     display: inline-block;
     font-size: 2em;
@@ -340,4 +345,14 @@ li.mdlfs-charset-info__item__language:last-child::after{
 @media (min-width: 480px) and (max-width: 730px) {
   .mdl-cell--4-col-tablet.mdl-cell--4-col-tablet {
      width: calc(100% - 16px) }
+}
+
+todo::before{
+    content: "TODO: ";
+}
+
+todo{
+    background: salmon;
+    font-weight: bold;
+    color: white;
 }
