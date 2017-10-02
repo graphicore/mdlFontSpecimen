@@ -39,7 +39,9 @@ The `npm install` is only needed to run the build script. See also [Install for 
 ~$ cd mdlFontSpecimen
 ~/mdlFontSpecimen$ npm install
 ~/mdlFontSpecimen$ bower install
-~/mdlFontSpecimen$ ./bin/build lib/ dist/
+~/mdlFontSpecimen$ ./bin/build lib/main.js dist/mdl-font-specimen.js
+~/mdlFontSpecimen$ ./bin/build lib/inspect-main.js dist/inspect-main.js
+
 ```
 
 ## <a name="install_dev">Install for Development</a>
