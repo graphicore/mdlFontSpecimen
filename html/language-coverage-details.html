@@ -38,88 +38,62 @@
 </div>
 
 <div class="mdlfs-interface-controller-templates" style="display:none">
-    <!--
-        this contains normal mdlfs items, but not initialized
-        instead we can create and destroy them on or own schedule;
-        via mdlfs-interface-controller
-    -->
-    <strong class="mdlfs-font-data"
-        data-widget-key="test"
-        data-target-marker="test-widget"
-        data-getter="NumberGlyphs"></strong>
-</div>
+  <!--
+      this contains normal mdlfs items, but not initialized
+      instead we can create and destroy them on or own schedule;
+      via mdlfs-interface-controller
+  -->
 
-<div class="mdlfs-main mdlfs-content mdlfs-interface-controller">
-  <div class="mdlfs-font-select"></div>
+  <div data-widget-key="general-info"
+       data-target-marker="general-info">
+    <p>
+      <strong class="mdlfs_if-lax-detection mdlfs-lax-charlist"></strong>
+      <br />
+      <span class="mdlfs_if-lax-detection">
+      These are characters that appear in the CLDR data as needed for
+      some languages, but we decided that they are not exactly needed
+      for language support. Don't just trust this list blindly and if
+      something is terribly wrong for a language, please complain!
+      </span>
+    </p>
 
-  <p>
-    <todo>Toggle Lax coverage? Better formatted details</todo><br />
-    <em>Lax coverage</em>
-    <strong class="mdlfs-font-data"
-         data-getter="UseLaxDetection"></strong>
-    <br />
-    These are characters that appear in the CLDR data as needed for
-    some languages, but we decided that they are not exactly needed
-    for language support. Don't just trust this list blindly and if
-    something is terribly wrong for a language, please complain!
-  </p>
-
-  <p>
-    <em>Size of Glyph-Set</em>
-    <strong class="mdlfs-font-data"
-         data-getter="NumberGlyphs"></strong>
-    <em>Supported Languages </em>
-    <strong class="mdlfs-font-data"
-         data-getter="NumberSupportedLanguages"></strong>
-    (laxly):
-    <!-- a list of all supported languages-->
-    <strong class="mdlfs-font-data"
-         data-getter="SupportedLanguages"></strong>
-  </p>
-<!--
-  <p>
-    <em># Supported Languages via Char Sets</em>
-    <todo>clarify what this does mean! I think:<br />
-    It get's All Supported Languages, then gets all charsets these languages
-    are in, then gets all languages supported by the charsets. But, since the
-    char sets can support more languages than the font, this can show languages
-    whose support is not backed by our cldr based language detection... yes
-    this uses eventually ownLanguages of all charsets that contain at least
-    one of the covered languages.<br />
-    Thus, this info is rather a "WOULD BE NICE" if All Supported Languages
-    would be like this ...
-    </todo>
-    <strong class="mdlfs-font-data"
-         data-getter="NumberSupportedLanguagesByCharSets"></strong> (laxly)
-  </p>
-
-  <p>
-    <em>Supported Languages via Char Sets</em>
-    <todo>see above</todo>
-    <strong class="mdlfs-font-data"
-         data-getter="SupportedLanguagesByCharSets"></strong>
-  </p>
--->
-
-  <!-- insert: language-info -->
-<!--
-    insert when coverage is lax, remove when strict, default is lax following the UseLaxDetection switch!
--->
-  <div class="mdlfs-language-info" data-coverage-lax>
-    <h3>Font Coverage Info</h3>
-    <todo>Add filters: by percent (min, max) maybe other filters later if requested?</todo><br />
-    <todo>Make the ul a table. a row contains just the numbers but has a drilldown-button for the charcodes. drilldown inserts a new row below</todo>
+    <p>
+      <em>Size of Glyph-Set</em>
+      <strong class="mdlfs-font-data"
+           data-getter="NumberGlyphs"></strong>
+      <em>Supported Languages </em>
+      <strong class="mdlfs-font-data"
+           data-getter="NumberSupportedLanguages"></strong>
+      <span class="mdlfs_if-lax-detection">(laxly)</span>:
+      <!-- a list of all supported languages-->
+      <strong class="mdlfs-font-data"
+           data-getter="SupportedLanguages"></strong>
+    </p>
   </div>
 
-<!--
-  insert when coverage is strict, remove when lax
-  <div class="mdlfs-language-info">
-    <h3>Strict CLDR</h3></div>
--->
 
+  <div class="mdlfs-coverage-info"
+    data-widget-key="coverage-info"
+    data-target-marker="coverage-info"
+    >
+    <h3>Font Coverage Info</h3>
+    <!-- Slider with Starting Value -->
+    <label class="mdlfs-coverage-info_filter mdlfs-coverage-info_filter-max">
+        top clipping filter <span class="value"></span> %
+        <input class="mdl-slider mdl-js-slider" type="range"
+                min="0" max="100" value="100" tabindex="0" step="0.01">
+    </label>
+    <label class="mdlfs-coverage-info_filter mdlfs-coverage-info_filter-min">
+        bottom clipping filter <span class="value"></span> %
+        <input class="mdl-slider mdl-js-slider" type="range"
+                min="0" max="100" value="0" tabindex="1" step="0.01">
+    </label>
+  </div>
 
-  <!-- insert: charset-info -->
-  <div class="mdlfs-charset-info" data-coverage-lax>
+  <div class="mdlfs-charset-info"
+    data-widget-key="charset-info"
+    data-target-marker="charset-info"
+    >
     <h3>Charset Info</h3>
     <div class="mdlfs-charset-info__item-blueprint
                 mdlfs-charset-info__item
@@ -212,6 +186,19 @@
         -->
     </div>
   </div>
+</div>
+
+<div class="mdlfs-main mdlfs-content mdlfs-interface-controller">
+  <div class="mdlfs-font-select"></div>
+
+  <label class="mdlfs-interface-controller_switch-lax mdl-switch mdl-js-switch mdl-js-ripple-effect">
+    <input type="checkbox" class="mdl-switch__input" checked>
+    <span class="mdl-switch__label">use lax coverage</span>
+  </label>
+
+  <!-- insert: general-info -->
+  <!-- insert: coverage-info -->
+  <!-- insert: charset-info -->
 
 </div>
 </body>
