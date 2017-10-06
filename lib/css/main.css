@@ -347,6 +347,32 @@ li.mdlfs-charset-info__item__language:last-child::after{
      width: calc(100% - 16px) }
 }
 
+.mdlfs-coverage-info_filter .mdl-slider__container{
+    width: 50em;
+}
+
+.mdlfs-coverage-info_data-table {
+    width: 100%;
+}
+
+.mdlfs-coverage-info_data-table th:first-child {
+    width: 20em;
+    vertical-align: top;
+    white-space: normal;
+}
+
+.mdlfs-coverage-info_data-table td {
+    white-space: normal
+}
+
+.mdlfs_if-lax-detection {
+    display: none;
+}
+
+.mdlfs-interface-controller-is_lax .mdlfs_if-lax-detection {
+    display: initial;
+}
+
 todo::before{
     content: "TODO: ";
 }
