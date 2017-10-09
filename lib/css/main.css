@@ -314,6 +314,12 @@ html * {
     margin: 0;
 }
 
+.mdlfs-coverage-info_missing-switch {
+    width: auto;
+    margin-left: 1em;
+    margin-right: 1em;
+}
+
 li.mdlfs-charset-info__item__included-charset,
 li.mdlfs-charset-info__item__language {
     display: inline;
@@ -350,6 +356,26 @@ li.mdlfs-charset-info__item__language:last-child::after{
 .mdlfs-coverage-info_filter .mdl-slider__container{
     width: 50em;
 }
+
+
+.mdlfs-coverage-info_filter .mdl-slider__container .slider-ticks {
+    position: absolute;
+    margin: 0 26px;
+    left: 0;
+    top: 0;
+    width: calc(100% - 52px);
+    z-index: 0;
+}
+.mdlfs-coverage-info_filter .mdl-slider__container .slider-tick {
+    width: 2px;
+    height: 10px;
+    background: lightgray;
+    position: absolute;
+    top: 0;
+    /* left: 50%; set by application! */
+    margin-left: -1px;
+}
+
 
 .mdlfs-coverage-info_data-table {
     width: 100%;
