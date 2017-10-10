@@ -1,0 +1,343 @@
+@import './mdlfs-glyph-table.css';
+
+html * {
+    font-family: 'Roboto Mono', monospace;
+}
+
+
+/* only if we use mdlfs-load-progress */
+.mdlfs-load-progress .mdlfs-load-progress__load-indicator {
+    display: none;
+}
+.mdlfs-load-progress_loading .mdlfs-load-progress__load-indicator {
+    display: block;
+}
+
+.mdlfs-load-progress_loaded .mdlfs-load-progress__screen {
+    display: none;
+}
+
+.mdlfs-load-progress .mdlfs-main {
+    display: none;
+}
+.mdlfs-load-progress_loaded .mdlfs-main {
+    display: block;
+}
+
+.mdlfs-load-progress__screen {
+    width: 75%;
+    max-width: 500px;
+    margin: 5em auto 0 auto;
+
+}
+
+
+.mdlfs-content {
+    margin: 0 auto;
+    width: calc(100% - 6em);
+    max-width: 1900px;
+}
+
+.mdlfs-main-title {
+    font-size: 14em;
+}
+
+.mdlfs-header-diagram {
+   margin-left: -3em;
+   overflow: hidden;
+   /* .mdlfs-content has 3em margin to each side, thus 6 em here */
+   width: calc(100% + 6em);
+   /* show the decender line */
+   padding-bottom: 3px;
+   /* now element.scrollLeft = 100 can be set on mouse moves, to move the svg*/
+}
+.mdlfs-diagram svg {
+    overflow: visible
+}
+
+@media (max-width: 1024px) {
+    .mdlfs-x-height-diagram {
+        /* Here the mdl-cell adds 16px margin on each side and the grid as well*/
+        margin-left: calc( -3em - 16px);
+        width: calc(100% + 6em + 32px);
+    }
+}
+
+@media (max-width: 480px) {
+    .mdlfs-content {
+        width: calc(100% - 2em);
+    }
+    .mdlfs-header-diagram {
+        margin-left: -1em;
+        width: calc(100% + 2em);
+    }
+    .mdlfs-x-height-diagram {
+        /* Here the mdl-cell adds 16px margin on each side and the grid as well*/
+        margin-left: calc( -1em - 16px);
+        width: calc(100% + 2em + 32px);
+    }
+}
+
+.mdlfs-alphabet-sample * {
+    font:inherit;
+    /*so it breaks at each glyph if needed*/
+    display: inline-block;
+}
+
+
+.mdlfs-drag-scroll {
+    overflow: hidden; /* could also be scroll */
+}
+
+.mdlfs-drag-scroll_running_text > * {
+    min-width: 1700px;
+}
+@media (max-width: 1699px) {
+    .mdlfs-drag-scroll {
+         cursor: move;
+        -webkit-touch-callout: none; /* iOS Safari */
+          -webkit-user-select: none; /* Chrome/Safari/Opera */
+           -khtml-user-select: none; /* Konqueror */
+             -moz-user-select: none; /* Firefox */
+              -ms-user-select: none; /* Internet Explorer/Edge */
+                  user-select: none; /* Non-prefixed version, currently
+                                        not supported by any browser */
+    }
+
+    .mdlfs-header-diagram svg {
+        /*
+        Using just "min-height: 350px" failed in Chrome, but with the
+        media query we are coming close to that effect
+        */
+        height: 350px;
+    }
+}
+
+.mdlfs-diagram__text_normal,
+.mdlfs-diagram__glyph_normal,
+.mdlfs-feature-display__content-stacked__text_normal,
+.mdlfs-feature-display__content-stacked__glyph_normal {
+    fill: black;
+    stroke: none;
+    opacity: .8;
+}
+
+.mdlfs-diagram__text_highlighted,
+.mdlfs-diagram__glyph_highlighted,
+.mdlfs-feature-display__content-stacked__text_highlighted,
+.mdlfs-feature-display__content-stacked__glyph_highlighted {
+    fill: #ff5252;
+    stroke: none;
+}
+
+.mdlfs-diagram__text_muted,
+.mdlfs-diagram__glyph_muted,
+.mdlfs-feature-display__content-stacked__text_muted,
+.mdlfs-feature-display__content-stacked__glyph_muted {
+    fill: none;
+    stroke: black;
+    stroke-width: 4;
+    opacity: .8;
+}
+
+.mdlfs-feature-display__item__content-text {
+    font-size: 3em;
+    line-height: normal;
+}
+
+.mdlfs-feature-display__item_highlight,
+.mdlfs-feature-display__item_tabular {
+    font: inherit;
+}
+.mdlfs-feature-display__item__applied .mdlfs-feature-display__item_highlight {
+    color: #ff5252;
+}
+.mdlfs-feature-display__item_tabular {
+    display: inline-block;
+    border-right: 2px solid #ff5252;
+    margin-right: -2px;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__content {
+    display: inline;
+    margin-right: .5em;
+}
+
+.mdlfs-feature-display__item__content_inline-no-gap
+            .mdlfs-feature-display__item__content {
+    margin-right: 0;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__applied {
+    display: inline;
+}
+
+.mdlfs-feature-display__item__content_inline
+            .mdlfs-feature-display__item__change-indicator {
+    display: none;
+}
+
+
+.mdlfs-diagram__yline{
+    stroke-width: 4;
+}
+
+.mdlfs-diagram__yline_normal {
+    stroke: black;
+    opacity: .8;
+}
+
+.mdlfs-diagram__yline_highlighted {
+    stroke: #ff5252;
+}
+
+.mdlfs-section__separator {
+    border-top: 5px dotted black;
+    position: relative;
+    text-align: center;
+}
+.mdlfs-section__title {
+    background: white none repeat scroll 0 0;
+    display: inline-block;
+    font-size: 1.5em;
+    margin: 0;
+    padding: 0 1em;
+    position: relative;
+    top: -1.2em;
+    line-height: 2em;
+    text-transform: uppercase;
+}
+
+.mdlfs-card__title {
+    font-size: 1.5em;
+}
+
+.mdlfs-styles-list {
+    font-size: 4em;
+    line-height: 1.1em;
+    list-style: none;
+    padding: 0;
+}
+
+.mdlfs-currency-symbols * {
+    font-family: inherit;
+}
+
+.mdlfs-currency-symbols {
+    font-size: 5em;
+    line-height: normal;
+}
+@media (max-width: 730px) {
+    .mdlfs-currency-symbols {
+        font-size: 3em;
+    }
+}
+.mdlfs-currency-symbols__sample-symbol {
+    color:  #ff5252;
+}
+
+
+/* only if we use mdlfs-load-progress */
+.mdlfs-load-progress .mdlfs-load-progress__load-indicator {
+    display: none;
+}
+.mdlfs-load-progress_loading .mdlfs-load-progress__load-indicator {
+    display: block;
+}
+
+.mdlfs-load-progress_loading .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-load-progress__screen {
+    display: none;
+}
+
+.mdlfs-load-progress .mdlfs-main {
+    display: none;
+}
+.mdlfs-load-progress_loaded .mdlfs-main {
+    display: block;
+}
+
+.mdlfs-load-progress__screen {
+    width: 75%;
+    max-width: 500px;
+    margin: 5em auto 0 auto;
+
+}
+
+.mdlfs-fonts-drop {
+    background-color: #EEE;
+    padding: .5em;
+    cursor: pointer;
+    width: 100%;
+}
+
+.mdlfs-load-progress__task{
+    font-size: 1.5em;
+    margin: 1em 0;
+}
+.mdlfs-load-progress__task {
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.mdlfs-fonts-drop:hover {
+    box-shadow: 0 8px 10px 1px rgba(0, 0, 0, 0.14), 0 3px 14px 2px rgba(0, 0, 0, 0.12), 0 5px 5px -3px rgba(0, 0, 0, 0.2);
+    -webkit-transition: box-shadow .5s;
+    transition: box-shadow .5s;
+    transition-timing-function: easeOutCirc;
+    -webkit-transition-timing-function: easeOutCirc;
+
+}
+
+
+.mdlfs-charset-info__data-container {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.mdlfs-charset-info__item__sample-char {
+    display: inline-block;
+    font-size: 2em;
+    line-height: 1.1em;
+    padding: 0 0 .7em 0;
+    margin: 0;
+}
+
+.mdlfs-charset-info__item__included-charset,
+.mdlfs-charset-info__item__language {
+    display: inline;
+
+}
+
+.mdlfs-charset-info__item__included-charset::after,
+.mdlfs-charset-info__item__language::after{
+    content: ", ";
+}
+
+.mdlfs-charset-info__item__included-charset:last-child::after,
+.mdlfs-charset-info__item__language:last-child::after{
+    content: "";
+}
+
+
+
+/* some grid overrides, but kept minimal, only for classes used by us */
+@media (min-width: 840px) and (max-width: 1024px) {
+  .mdl-cell--4-col,
+  .mdl-cell--4-col-desktop.mdl-cell--4-col-desktop {
+     width: calc(50% - 16px); }
+  .mdl-cell--6-col,
+  .mdl-cell--6-col-desktop.mdl-cell--6-col-desktop {
+     width: calc(100% - 16px) }
+}
+
+@media (min-width: 480px) and (max-width: 730px) {
+  .mdl-cell--4-col-tablet.mdl-cell--4-col-tablet {
+     width: calc(100% - 16px) }
+}

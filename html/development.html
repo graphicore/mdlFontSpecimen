@@ -1,0 +1,302 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MDL Font Specimen | for development</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
+    <link rel="stylesheet" href="../lib/css/main.css">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-sham.min.js"></script> -->
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/json3/3.3.2/json3.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-sham.min.js"></script> -->
+
+
+    <script src="../lib/bower_components/material-design-lite/material.js"></script>
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+    fontSpecimenConfig = {}
+    fontSpecimenConfig.fontFiles = [
+         '../html/assets/worksans/WorkSans-Regular.ttf'
+        , '../html/assets/worksans/WorkSans-Black.ttf'
+        , '../html/assets/worksans/WorkSans-Bold.ttf'
+        , '../html/assets/worksans/WorkSans-Light.ttf'
+        , '../html/assets/worksans/WorkSans-SemiBold.ttf'
+        , '../html/assets/worksans/WorkSans-ExtraBold.ttf'
+        , '../html/assets/worksans/WorkSans-ExtraLight.ttf'
+        , '../html/assets/worksans/WorkSans-Medium.ttf'
+        , '../html/assets/worksans/WorkSans-Thin.ttf'
+
+        //  '../html/assets/muli/Muli-Regular.ttf'
+        //, '../html/assets/muli/Muli-Black.ttf'
+        //, '../html/assets/muli/Muli-BlackItalic.ttf'
+        //, '../html/assets/muli/Muli-Bold.ttf'
+        //, '../html/assets/muli/Muli-BoldItalic.ttf'
+        //, '../html/assets/muli/Muli-ExtraBold.ttf'
+        //, '../html/assets/muli/Muli-ExtraBoldItalic.ttf'
+        //, '../html/assets/muli/Muli-ExtraLight.ttf'
+        //, '../html/assets/muli/Muli-ExtraLightItalic.ttf'
+        //, '../html/assets/muli/Muli-Italic.ttf'
+        //, '../html/assets/muli/Muli-Light.ttf'
+        //, '../html/assets/muli/Muli-LightItalic.ttf'
+        //, '../html/assets/muli/Muli-SemiBold.ttf'
+        //, '../html/assets/muli/Muli-SemiBoldItalic.ttf'
+
+    ];
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['main'], function(main) {
+            main();
+        });
+    });
+    </script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdlfs-content mdlfs-main">
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--3-col">
+    Typeface /<br />
+    <span class="mdlfs-font-data" data-getter="FamilyName"></span>
+    <!--<div class="mdlfs-font-select"></div>-->
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    First Release /<br />
+    June 2014<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Latest Release /<br />
+    June 2016<br />
+    by Wei Huang
+  </div>
+
+  <div class="mdl-cell mdl-cell--3-col">
+    Links /<br />
+    <a href="#">Google Fonts Specimen</a><br />
+    <a href="#">Github Page</a>
+  </div>
+</div>
+
+<div
+    class="mdlfs-header-diagram
+           mdlfs-diagram
+           mdlfs-drag-scroll"
+    data-diagram-name="basicLines"
+    data-text-content="Hamburger"
+    data-diagram-ascent="800"
+    ></div>
+
+<div class="mdl-grid">
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title"><span class="mdlfs-font-data" data-getter="StyleName"></span> 60pt/72pt</h3>
+    <p class="mdlfs-current-font mdlfs-alphabet-sample"
+       style="font-size: 60pt; line-height: 72pt;">
+    <span>ABC</span><span>DEF</span><span>GHI</span><span>JKL</span><span>MNO</span><span>PQR</span><span>STU</span><span>VWX</span><span>YZ</span><br />
+    <span>abc</span><span>def</span><span>ghi</span><span>jkl</span><span>mno</span><span>pqr</span><span>stu</span><span>vwx</span><span>yz</span><br />
+    <span>012</span><span>345</span><span>67</span><span>89</span></p>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col mdl-cell--12-col-tablet">
+    <h3 class="mdlfs-card__title">x-height</h3>
+    <div class="mdlfs-x-height-diagram mdlfs-diagram"
+         data-diagram-name="xHeight"
+         data-diagram-ascent="800"
+         data-diagram-descent="5"
+         ></div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col">
+    <h3 class="mdlfs-card__title">Styles</h3>
+    <ul class="mdlfs-styles-list mdlfs-per-font">
+          <li class="mdlfs-per-font__item-blueprint" style="display:none">
+          <span class="mdlfs-per-font__current-font mdlfs-per-font__data" data-getter="StyleName"></span>
+      </li>
+    </ul>
+  </div>
+
+</div>
+
+<div class="mdl-grid mdlfs-feature-display">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">OpenType Features</h2>
+  </div>
+
+  <div class="mdl-cell mdl-cell--6-col
+              mdl-cell--12-col-tablet
+              mdl-cell--order-2">
+    <h3 class="mdlfs-card__title">Currencies</h3>
+    <div class="mdlfs-currency-symbols mdlfs-current-font"></div>
+  </div>
+
+
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--order-3
+              mdl-cell--4-col-tablet
+              mdlfs-feature-display__item-blueprint
+              mdlfs-feature-display__item
+              mdlfs-feature-display__item-content-container
+              "
+       style="display:none">
+    <h3 class="mdlfs-card__title mdlfs-feature-display__item__friendly-name"></h3>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-text"><!--
+        no whitespace
+        BEGIN: removed if not in `show-before` mode
+        --><div class="mdlfs-feature-display__item__before"></div><!--
+
+        --><div class="material-icons
+                    mdlfs-feature-display__item__change-indicator">arrow_downward</div><!--
+        no whitespace
+        END: removed
+        --><div class="mdlfs-feature-display__item__applied"></div><!--
+        no whitespace
+    --></div>
+    <div class="mdlfs-feature-display__item__content
+                mdlfs-feature-display__item__content-stacked"></div>
+
+    <!-- contents -->
+  </div>
+
+
+</div>
+
+<div class="mdl-grid mdlfs-charset-info" data-coverage-lax>
+    <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Char Sets</h2>
+    </div>
+    <div class="mdl-cell
+                mdl-cell--12-col
+                mdlfs-charset-info__item-blueprint
+                mdlfs-charset-info__item
+                mdlfs-charset-info__item-content-container
+              "
+        style="display:none">
+        <h4 class="mdlfs-charset-info__item__charset-name"></h4>
+        <div><em>Languages supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
+           <li class="mdlfs-charset-info__item__language"
+               data-filter="own-languages"
+               style="display:none"></li>
+        </ul></div>
+        <div><em>Languages supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+            data-filter="inherited-languages"
+            style="display:none"></li>
+        </ul></div>
+        <!--
+        <div><em>All supported languages:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+                style="display:none"></li>
+        </ul></div>
+        -->
+        <div><em>Charsets included by this charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__included-charset"
+                style="display:none"></li>
+        </ul></div>
+        <div><em>Charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__sample-char"
+                style="display:none"></li>
+        </ul></div>
+    </div>
+</div>
+
+<div class="mdl-grid mdlfs-per-font">
+  <div class="mdl-cell mdl-cell--12-col mdlfs-section__separator">
+      <h2 class="mdlfs-section__title">Paragraph</h2>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title">45pt / 48pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
+    <p style="font-size:45pt ;line-height:48pt">
+      <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
+            style="display:none"
+            data-per-font-rotate
+            data-reverse-font-order>
+        As I went on, still gaining velocity, the
+        palpitation of night and day merged
+        into one continuous greyness;
+        <!-- rotate -->
+        the sky took on a wonderful deepness of blue,
+        a splendid luminous color like that of
+        early twilight;
+        <!-- rotate -->
+        the jerking sun became
+        a streak of fire, a brilliant arch, in
+        space; the moon a fainter fluctuating band;
+      </span>
+    </p>
+    </div>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col">
+    <h3 class="mdlfs-card__title">24pt / 32pt</h3>
+    <div class="mdlfs-drag-scroll mdlfs-drag-scroll_running_text">
+    <p style="font-size:24pt ;line-height:32pt;">
+      <span class="mdlfs-per-font__item-blueprint mdlfs-per-font__current-font"
+            style="display:none"
+            data-per-font-rotate
+            data-reverse-font-order>
+        As I went on, still gaining velocity, the
+        palpitation of night and day merged
+        into one continuous greyness;
+        <!-- rotate -->
+        the sky took on a wonderful deepness of blue,
+        a splendid luminous color like that of
+        early twilight;
+        <!-- rotate -->
+        the jerking sun became
+        a streak of fire, a brilliant arch, in
+        space; the moon a fainter fluctuating band;
+      </span>
+    </p>
+    </div>
+  </div>
+
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdl-cell--7-col-tablet
+              mdlfs-per-font__item-blueprint"
+       style="display:none"
+       data-reverse-font-order>
+    <h3 class="mdlfs-card__title">
+        <span class="mdlfs-per-font__data"
+              data-getter="StyleName"></span>, 14pt / 24pt
+    </h3>
+    <p class="mdlfs-per-font__current-font"
+      style="font-size:14pt ;line-height:24pt;">
+    <!--  The Time Machine by H.G. Wells; Chapter 3 -->
+    As I went on, still gaining velocity, the
+    palpitation of night and day merged
+    into one continuous greyness; the sky
+    took on a wonderful deepness of blue,
+    a splendid luminous color like that of
+    early twilight; the jerking sun became
+    a streak of fire, a brilliant arch, in
+    space; the moon a fainter fluctuating band;
+    </p>
+  </div>
+
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "name": "mdl-font-specimen",
+  "version": "1.0.0",
+  "description": "Font specimen widgets for Material Design Lite.",
+  "main": "dist/mdl-font-specimen.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/graphicore/mdlFontSpecimen.git"
+  },
+  "author": "Lasse Fister <commander@graphicore.de>",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/graphicore/mdlFontSpecimen/issues"
+  },
+  "homepage": "https://github.com/graphicore/mdlFontSpecimen",
+  "devDependencies": {
+    "almond": "^0.3.3",
+    "commander": "git://github.com/graphicore/commander.js.git#atem-integration",
+    "requirejs": "^2.3.2"
+  }
+}

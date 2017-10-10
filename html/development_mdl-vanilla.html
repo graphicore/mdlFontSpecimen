@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MDL Font Specimen | for development</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link rel="stylesheet" href="../lib/css/vanilla-mdl.css">
+    <script src="../lib/bower_components/material-design-lite/material.js"></script>
+
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+    fontSpecimenConfig = {}
+    fontSpecimenConfig.fontFiles = [
+        '../lib/bower_components/specimen-tools/assets/fonts/Jura-Medium.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-Bold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-ExtraBold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/MontserratAlternates-ExtraLight.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Montserrat-Thin.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Bold.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Light.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Medium.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Quicksand-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/Pacifico-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/VT323-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-ThinItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Thin.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-SemiBoldItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Regular.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-LightItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Light.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Italic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-BoldItalic.ttf'
+      , '../lib/bower_components/specimen-tools/assets/fonts/JosefinSans-Bold.ttf'
+    ];
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['main'], function(main) {
+            main();
+        });
+    });
+    </script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdl-layout mdl-js-layout mdlfs-main">
+  <header class="mdl-layout__header">
+    <div class="mdl-layout-icon"></div>
+    <div class="mdl-layout__header-row">
+      <span class="mdl-layout__title">Simple Layout</span>
+      <div class="mdl-layout-spacer"></div>
+      <nav class="mdl-navigation">
+        <a class="mdl-navigation__link" href="#">Nav link 1</a>
+        <a class="mdl-navigation__link" href="#">Nav link 2</a>
+        <a class="mdl-navigation__link" href="#">Nav link 3</a>
+      </nav>
+    </div>
+  </header>
+
+<div class="mdlfs-content">
+
+<div class="mdl-grid mdlfs-feature-display">
+
+  <div class="mdl-card mdl-cell mdl-cell--4-col mdl-shadow--2dp">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+        <span class="mdl-card__title-text  mdlfs-font-data mdlfs-font-data--big-fact"
+            data-getter="NumberGlyphs"
+        ></span>
+    </div>
+    <div class="mdl-card__supporting-text">
+        Size of Glyph-Set
+    </div>
+  </div>
+
+  <div class="mdl-card mdl-cell mdl-cell--4-col mdl-shadow--2dp">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+        <span class="mdl-card__title-text  mdlfs-font-data mdlfs-font-data--big-fact"
+            data-getter="NumberSupportedLanguages"
+        ></span>
+    </div>
+    <div class="mdl-card__supporting-text">
+        Supported Languages
+    </div>
+  </div>
+
+  <div class="mdl-card mdl-cell mdl-cell--4-col mdl-shadow--2dp">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+        <h2 class="mdl-card__title-text">All Supported Languages</h2>
+    </div>
+    <div class="mdl-card__supporting-text mdlfs-font-data mdlfs-font"
+         data-getter="SupportedLanguages"
+    ></div>
+  </div>
+
+  <div class="mdl-cell
+              mdl-cell--4-col
+              mdlfs-feature-display__item-blueprint
+              mdlfs-feature-display__item"
+       style="display:none">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+      <div class="mdl-card__title-text mdlfs-feature-display__item-content-container">
+        <h2>Feature: <span class="mdlfs-feature-display__item__tag-name"></span></h2>
+
+        <div class="mdlfs-feature-display__item__content
+                    mdlfs-feature-display__item__content-text"><!--
+            no whitespace
+            BEGIN: removed if not in `show-before` mode
+            --><div class="mdlfs-feature-display__item__before"></div><!--
+
+            --><div class="material-icons
+                        mdlfs-feature-display__item__change-indicator">arrow_downward</div><!--
+            no whitespace
+            END: removed
+            --><div class="mdlfs-feature-display__item__applied"></div><!--
+            no whitespace
+        --></div>
+        <div class="mdlfs-feature-display__item__content
+                  mdlfs-feature-display__item__content-stacked"></div>
+
+        <!-- contents -->
+      </div>
+    </div>
+    <div class="mdl-card__supporting-text mdlfs-feature-display__item__friendly-name"></div>
+  </div>
+
+  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col">
+    <div class="mdl-card__title mdl-color--accent mdl-color-text--accent-contrast">
+     <h2 class="mdl-card__title-text">Choose a Font</h2>
+    </div>
+    <div class="mdl-card__actions  mdlfs-family-switcher"></div>
+  </div>
+
+  <div class="mdl-card mdl-shadow--4dp mdl-cell mdl-cell--12-col mdlfs-type-tester">
+    <div class="mdl-card__title mdl-color--primary mdl-color-text--primary-contrast">
+     <h2 class="mdl-card__title-text">Test the Font</h2>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Default Features</h5>
+      <div class="mdlfs-type-tester__features--default"></div>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Optional Features</h5>
+      <div class="mdlfs-type-tester__features--optional"></div>
+    </div>
+
+    <div class="mdl-card__actions">
+      <h5>Font size: <span class="mdlfs-type-tester__label" data-target-property="font-size"></span></h5>
+      <div class="mdlfs-type-tester__slider" data-target-property="font-size"></div>
+    </div>
+
+    <span class="mdl-card__supporting-text mdlfs-current-font mdlfs-type-tester__content" contenteditable="true">
+    TYPE HERE …<br />
+    Web typography refers to the use of fonts on the World Wide Web. When
+    HTML was first created, font faces and styles were controlled exclusively
+    by the settings of each Web browser. There was no mechanism for individual
+    Web pages to control font display until Netscape introduced the &lt;font&gt;
+    tag in 1995, which was then standardized in the HTML 3.2 specification.
+    However, the font specified by the tag had to be installed on the user's
+    computer or a fallback font, such as a browser's default sans-serif or
+    monospace font, would be used. The first Cascading Style Sheets specification
+    was published in 1996 and provided the same capabilities.
+    </span>
+    <small class="mdl-card__supporting-text"><a href="https://en.wikipedia.org/wiki/Web_typography">Source: Wikipedia</a></small>
+  </div>
+
+  <div class="mdl-cell mdl-cell--12-col mdlfs-glyph-table"></div>
+</div>
+
+</div>
+</div>
+</body>
+</html>

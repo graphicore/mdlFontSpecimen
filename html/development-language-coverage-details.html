@@ -1,0 +1,213 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MDL Font Specimen | drop fonts</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../lib/bower_components/material-design-lite/material.css">
+    <link href="https://fonts.googleapis.com/css?family=Roboto+Mono:400,400i" rel="stylesheet">
+    <link rel="stylesheet" href="../lib/css/main.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es5-shim/4.5.7/es5-sham.min.js"></script> -->
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/json3/3.3.2/json3.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-shim.min.js"></script>
+    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/es6-shim/0.34.2/es6-sham.min.js"></script> -->
+
+    <script src="../lib/bower_components/material-design-lite/material.js"></script>
+    <script src="../lib/bower_components/requirejs/require.js"></script>
+    <script>
+    fontSpecimenConfig = {
+        loadFromFileInput: true
+    };
+
+    require.config({baseUrl: '../lib'});
+    require(['bootstrap'], function(bootstrap) {
+        var r = bootstrap(require);
+        r(['inspect-main'], function(main) {
+            main();
+        });
+    });
+    </script>
+</head>
+<body class="mdlfs-load-progress">
+
+<div class="mdlfs-load-progress__screen">
+    <div class="mdlfs-fonts-drop">
+      <h3>Drop font files here or click.</h3>
+      <p>The fonts will stay on your computer and are processed locally in the browser.</p>
+      <p><strong>They will NOT be uploaded to any server or be send away otherwise.</strong></p>
+    </div>
+    <div class="mdlfs-load-progress__load-indicator">
+        <p class="mdlfs-load-progress__task"></p>
+        <p><em>Loaded: </em><span class="mdlfs-load-progress__percent"></span></p>
+        <div class="mdl-progress mdl-js-progress mdlfs-load-progress__progress-bar"></div>
+    </div>
+</div>
+
+<div class="mdlfs-interface-controller-templates" style="display:none">
+  <!--
+      this contains normal mdlfs items, but not initialized
+      instead we can create and destroy them on or own schedule;
+      via mdlfs-interface-controller
+  -->
+
+  <div data-widget-key="general-info"
+       data-target-marker="general-info">
+    <p>
+      <strong class="mdlfs_if-lax-detection mdlfs-lax-charlist"></strong>
+      <br />
+      <span class="mdlfs_if-lax-detection">
+      These are characters that appear in the CLDR data as needed for
+      some languages, but we decided that they are not exactly needed
+      for language support. Don't just trust this list blindly and if
+      something is terribly wrong for a language, please complain!
+      </span>
+    </p>
+
+    <p>
+      <em>Size of Glyph-Set</em>
+      <strong class="mdlfs-font-data"
+           data-getter="NumberGlyphs"></strong>
+      <em>Supported Languages </em>
+      <strong class="mdlfs-font-data"
+           data-getter="NumberSupportedLanguages"></strong>
+      <span class="mdlfs_if-lax-detection">(laxly)</span>:
+      <!-- a list of all supported languages-->
+      <strong class="mdlfs-font-data"
+           data-getter="SupportedLanguages"></strong>
+    </p>
+  </div>
+
+
+  <div class="mdlfs-coverage-info"
+    data-widget-key="coverage-info"
+    data-target-marker="coverage-info"
+    >
+    <h3>Font Coverage Info</h3>
+    <!-- Slider with Starting Value -->
+    <label class="mdlfs-coverage-info_filter mdlfs-coverage-info_filter-max">
+        top clipping filter <span class="value"></span> %
+        <input data-sleeper-classes="mdl-slider mdl-js-slider" type="range"
+                min="0" max="100" value="100" tabindex="0" step="0.01">
+    </label>
+    <label class="mdlfs-coverage-info_filter mdlfs-coverage-info_filter-min">
+        bottom clipping filter <span class="value"></span> %
+        <input data-sleeper-classes="mdl-slider mdl-js-slider" type="range"
+                min="0" max="100" value="0" tabindex="1" step="0.01">
+    </label>
+
+  </div>
+
+  <div class="mdlfs-charset-info"
+    data-widget-key="charset-info"
+    data-target-marker="charset-info"
+    >
+    <h3>Charset Info</h3>
+    <div class="mdlfs-charset-info__item-blueprint
+                mdlfs-charset-info__item
+                mdlfs-charset-info__item-content-container
+                mdl-shadow--2dp
+              "
+        style="display:none">
+        <h4 class="mdlfs-charset-info__item__charset-name"></h4>
+        <div>
+            <p>
+            The font supports
+            <strong>
+            <span class="mdlfs-charset-info__item__language"
+                  data-filter="#own-covered-languages"
+                  style="display:none">
+            </span> of <span
+             class="mdlfs-charset-info__item__language"
+                  data-filter="#own-languages"
+                  style="display:none"></span>
+            </strong>
+            direct languages of this charset and
+            <strong class="mdlfs-charset-info__item__language"
+                  data-filter="#all-covered-languages"
+                  style="display:none">
+            </strong>
+            languages including inherited languages.
+
+            <br />
+            The font covers
+            <strong>
+            <span class="mdlfs-charset-info__item__language"
+                  data-filter="#percent-charset-coverge"
+                  style="display:none"></span>
+            %</strong> glyphs of this charset.
+            </p>
+        </div>
+
+        <div data-sleeper-classes="mdl-tabs mdl-js-tabs mdl-js-ripple-effect">
+          <div data-sleeper-classes="mdl-tabs__tab-bar">
+              <a href="#" data-tab-id="font" data-sleeper-classes="mdl-tabs__tab is-active">by font</a>
+              <a href="#" data-tab-id="charset"  data-sleeper-classes="mdl-tabs__tab">complete charset</a>
+          </div>
+
+          <div data-sleeper-classes="mdl-tabs__panel is-active" data-tab-id="font">
+            <h4>Languages supported by this charset and the font (intersection)</h4>
+
+            <div><em>Supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
+               <li class="mdlfs-charset-info__item__language"
+                   data-filter="own-covered-languages"
+                   style="display:none"></li>
+            </ul></div>
+
+            <div><em>Supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
+               <li class="mdlfs-charset-info__item__language"
+                   data-filter="inherited-covered-languages"
+                   style="display:none"></li>
+            </ul></div>
+          </div>
+          <div data-sleeper-classes="mdl-tabs__panel" data-tab-id="charset">
+            <h4>Languages supported by this charset</h4>
+
+            <div><em>Supported directly by this charset:</em><ul class="mdlfs-charset-info__data-container">
+               <li class="mdlfs-charset-info__item__language"
+                   data-filter="own-languages"
+                   style="display:none"></li>
+            </ul></div>
+
+            <div><em>Supported by inheritance:</em><ul class="mdlfs-charset-info__data-container">
+                <li class="mdlfs-charset-info__item__language"
+                data-filter="inherited-languages"
+                style="display:none"></li>
+            </ul></div>
+          </div>
+        </div>
+        <!--
+        <div><em>All supported languages:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__language"
+                style="display:none"></li>
+        </ul></div>
+        -->
+        <div><em>Charsets included by this charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__included-charset"
+                style="display:none"></li>
+        </ul></div>
+        <!--
+        <div><em>Charset:</em><ul class="mdlfs-charset-info__data-container">
+            <li class="mdlfs-charset-info__item__sample-char"
+                style="display:none"></li>
+        </ul></div>
+        -->
+    </div>
+  </div>
+</div>
+
+<div class="mdlfs-main mdlfs-content mdlfs-interface-controller">
+  <div class="mdlfs-font-select"></div>
+
+  <label class="mdlfs-interface-controller_switch-lax mdl-switch mdl-js-switch mdl-js-ripple-effect">
+    <input type="checkbox" class="mdl-switch__input" checked>
+    <span class="mdl-switch__label">use lax coverage</span>
+  </label>
+
+  <!-- insert: general-info -->
+  <!-- insert: coverage-info -->
+  <!-- insert: charset-info -->
+
+</div>
+</body>
+</html>

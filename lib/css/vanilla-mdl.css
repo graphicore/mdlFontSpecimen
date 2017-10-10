@@ -1,0 +1,150 @@
+@import './mdlfs-glyph-table.css';
+
+/* only if we use mdlfs-load-progress */
+.mdlfs-load-progress .mdlfs-load-progress__load-indicator {
+    display: none;
+}
+.mdlfs-load-progress_loading .mdlfs-load-progress__load-indicator {
+    display: block;
+}
+
+.mdlfs-load-progress_loading .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-fonts-drop,
+.mdlfs-load-progress_loaded .mdlfs-load-progress__screen {
+    display: none;
+}
+
+.mdlfs-load-progress .mdlfs-main {
+    display: none;
+}
+.mdlfs-load-progress_loaded .mdlfs-main {
+    display: block;
+}
+
+.mdlfs-load-progress__screen {
+    width: 75%;
+    max-width: 500px;
+    margin: 5em auto 0 auto;
+
+}
+
+.mdlfs-fonts-drop {
+    background-color: #EEE;
+    padding: .5em;
+    cursor: pointer;
+    width: 100%;
+}
+
+.mdlfs-load-progress__task{
+    font-size: 1.5em;
+    margin: 1em 0;
+}
+.mdlfs-load-progress__task {
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.mdlfs-fonts-drop:hover {
+    box-shadow: 0 8px 10px 1px rgba(0, 0, 0, 0.14), 0 3px 14px 2px rgba(0, 0, 0, 0.12), 0 5px 5px -3px rgba(0, 0, 0, 0.2);
+    -webkit-transition: box-shadow .5s;
+    transition: box-shadow .5s;
+    transition-timing-function: easeOutCirc;
+    -webkit-transition-timing-function: easeOutCirc;
+
+}
+
+.mdlfs-content{
+    width: 100%;
+    max-width: 1248px; /* FIXME: what actually? */
+    margin: 0 auto;
+
+}
+
+.mdlfs-font-data--big-fact {
+    text-align: center;
+    font-size: 10em;
+    line-height: 1em;
+    display: block;
+    width: 100%;
+}
+
+.mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__applied,
+.mdlfs-feature-display__item__change-indicator {
+    text-align: center;
+    display: block;
+}
+
+.mdlfs-feature-display__item_highlight,
+.mdlfs-feature-display__item_tabular {
+    font: inherit;
+}
+
+.mdlfs-feature-display__item_tabular {
+    display: inline-block;
+    border-right: 2px solid rgb(255,64,129);
+    margin-right: -2px;
+}
+
+.mdlfs-feature-display__item__applied
+  .mdlfs-feature-display__item_highlight {
+    color: rgb(255,64,129);
+}
+
+.mdlfs-feature-display__item__before,
+.mdlfs-feature-display__item__applied {
+    font-size: 1.7em;
+}
+
+.mdlfs-feature-display__item__change-indicator {
+    font-size: 1.5em;
+    font-weight: normal;
+}
+
+.mdlfs-feature-display .mdl-card__title-text {
+    display: block;
+    width: 100%;
+}
+.mdlfs-feature-display .mdl-card__title-text h2{
+    font-size: inherit;
+    margin: inherit;
+}
+
+.mdlfs-feature-display__content-stacked__text_normal,
+.mdlfs-feature-display__content-stacked__glyph_normal {
+    fill: black;
+    stroke: none;
+    opacity: .8;
+}
+
+.mdlfs-feature-display__content-stacked__text_highlighted,
+.mdlfs-feature-display__content-stacked__glyph_highlighted {
+    fill: white;
+    stroke: none;
+}
+
+.mdlfs-feature-display__content-stacked__text_muted,
+.mdlfs-feature-display__content-stacked__glyph_muted {
+    fill: none;
+    stroke: rgb(255,64,129);
+    stroke-width: 4;
+}
+
+
+.mdlfs-current-font {
+    font-size: 1.6em;
+    line-height: normal;
+}
+
+.mdlfs-family-switcher__italic-switch {
+    margin-bottom: .5em;
+}
+
+.mdlfs-type-tester__feature-button,
+.mdlfs-family-switcher__button {
+    margin-right: .5em;
+    margin-bottom: .5em;
+}
+.mdlfs-family-switcher__button:last-child {
+    margin-right: 0;
+}

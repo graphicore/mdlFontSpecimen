@@ -1,0 +1,158 @@
+.mdlfs-glyph-table__glyph {
+    box-sizing: border-box;
+    display: inline-block;
+}
+
+.mdlfs-glyph-table__glyph svg {
+    width: 100%;
+    display: block;
+    overflow: visible;
+}
+
+
+.mdlfs-glyph-table__glyph {
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+}
+
+.mdlfs-glyph-table__glyph.mdlfs-glyph-table__glyph_active {
+    position: relative;
+    overflow: visible;
+}
+
+
+.mdlfs-glyph-table__glyph:hover {
+  /*.mdl-shadow--2dp*/
+  box-shadow: 0 2px 2px 0 rgba(0, 0, 0, 0.14), 0 3px 1px -2px rgba(0, 0, 0, 0.2), 0 1px 5px 0 rgba(0, 0, 0, 0.12);
+}
+
+.mdlfs-glyph-table__glyph.mdlfs-glyph-table__glyph_active svg {
+    width: 500%;
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    background: #fff;
+    margin-right: -200%;
+    margin-bottom: -200%;
+    z-index: 1;
+    /* === .mdl-shadow--8dp */
+    box-shadow: 0 8px 10px 1px rgba(0, 0, 0, 0.14), 0 3px 14px 2px rgba(0, 0, 0, 0.12), 0 5px 5px -3px rgba(0, 0, 0, 0.2);
+
+    -webkit-transition: width .5s, margin .5s, box-shadow .5s;
+    transition: width .5s, margin .5s, box-shadow .5s;
+    transition-timing-function: easeOutCirc;
+    -webkit-transition-timing-function: easeOutCirc;
+}
+
+
+
+
+/* FIXME: glyph table column setup was not a design choice, just made for development */
+/* default-widest 16 items */
+
+@media (min-width: 700px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 16);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(16n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(16n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(16n+15).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(16n+16).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+
+}
+
+@media (max-width: 700px) and (min-width: 600px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 12);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(12n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(12n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(12n+11).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(12n+12).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+
+}
+@media (max-width: 600px) and (min-width: 500px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 10);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(10n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(10n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(10n+9).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(10n+10).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+}
+@media (max-width: 500px) and (min-width: 400px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 8);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(8n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(8n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(8n+7).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(8n+8).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+}
+@media (max-width: 400px) and (min-width: 300px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 6);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(6n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(6n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(6n+5).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(6n+6).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+}
+@media (max-width: 300px) {
+    .mdlfs-glyph-table__glyph {
+        width: calc(100% / 5);
+    }
+    .mdlfs-glyph-table__glyph:nth-child(5n+1).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -400%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(5n+2).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -300%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(5n+4).mdlfs-glyph-table__glyph_active svg {
+        margin-right: -100%;
+    }
+    .mdlfs-glyph-table__glyph:nth-child(5n+5).mdlfs-glyph-table__glyph_active svg {
+        margin-right: 0%;
+    }
+}
